@@ -10,7 +10,7 @@ from enum import Enum
 from inspect import isawaitable
 
 from core.crypto import h
-from core.limits import MAX_ROOT_BYTES, PayloadTooLarge
+from core.limits import MAX_FACT_BYTES, PayloadTooLarge
 from core.shape import FACT_TS_MAX, valid_fid
 
 from .carrier import ACK as CARRIER_ACK
@@ -23,10 +23,11 @@ from .delivery import (
     PushAccepted,
     PushInvalidEndpoint,
     PushUnregistered,
-    derive_awaited,
+    derive,
     request_for,
 )
 from .hints import decode_hint, materialize_hint
+from .forest import CurrentRepository
 from .discovery import (
     PENDING_CURRENT,
     PENDING_NONCURRENT,
@@ -75,14 +76,14 @@ def carrier_disposition(result):
 class NotificationWorker:
     """Derive current recipients and attempt FCM for one historical hint.
 
-    ``current_root(workspace)`` and ``fetch(workspace, oid)`` are deliberately
-    read-only.  A deployment adapter may bind them to S3, R2, or a full peer;
-    no SQL projection or RepositoryApplier callback is involved.
+    ``current_repository(workspace)`` reconstructs one ephemeral validated
+    view from current writer heads. A deployment may bind its reads to S3,
+    R2, or a full peer; no SQL projection or global content root is involved.
     """
 
     def __init__(
-            self, current_root, fetch, push_node_secret, provider, now_ms):
-        if not callable(current_root) or not callable(fetch) \
+            self, current_repository, push_node_secret, provider, now_ms):
+        if not callable(current_repository) \
                 or not callable(getattr(provider, "send", None)) \
                 or not callable(now_ms):
             raise TypeError("notification worker dependency")
@@ -92,8 +93,7 @@ class NotificationWorker:
             raise TypeError("push node secret key") from error
         if not valid_fid(public):
             raise ValueError("push node secret key")
-        self.current_root = current_root
-        self.fetch = fetch
+        self.current_repository = current_repository
         self.secret = push_node_secret
         self.provider = provider
         self.now_ms = now_ms
@@ -104,16 +104,15 @@ class NotificationWorker:
         if not isinstance(hint, PublicationHint):
             return WorkerResult(TERMINAL, reason="invalid-hint")
         try:
-            root = await _resolve(self.current_root(hint.workspace))
+            current = await _resolve(
+                self.current_repository(hint.workspace))
+            if not isinstance(current, CurrentRepository):
+                raise TypeError("notification current repository")
             now = await _resolve(self.now_ms())
             if type(now) is not int or not 0 <= now <= FACT_TS_MAX:
                 raise ValueError("notification clock")
-            intents = await derive_awaited(
-                hint,
-                lambda oid: self.fetch(hint.workspace, oid),
-                root,
-                push_node=self.push_node,
-            )
+            intents = derive(
+                hint, current.view, push_node=self.push_node)
         except InvalidPublicationHint:
             return WorkerResult(TERMINAL, reason="invalid-hint")
         except Exception:
@@ -162,18 +161,21 @@ async def _process(reference, notification_state, worker):
     if not callable(read):
         raise TypeError("notification carrier handler")
     try:
-        raw = await _resolve(read(
-            "obj/" + reference.root_oid, MAX_ROOT_BYTES))
+        raws = []
+        for event in reference.events:
+            raw = await _resolve(read(
+                "obj/" + event.oid, MAX_FACT_BYTES))
+            if raw is None or not isinstance(raw, bytes):
+                return WorkerResult(RETRY, reason="state-event-missing")
+            raws.append(raw)
     except PayloadTooLarge:
-        return WorkerResult(RETRY, reason="oversized-state-root")
+        return WorkerResult(RETRY, reason="oversized-state-event")
     except Exception:
         return WorkerResult(RETRY, reason="state-unavailable")
-    if raw is None or not isinstance(raw, bytes):
-        return WorkerResult(RETRY, reason="state-root-missing")
     try:
-        hint = materialize_hint(reference, raw)
+        hint = materialize_hint(reference, raws)
     except (TypeError, ValueError):
-        return WorkerResult(RETRY, reason="invalid-state-root")
+        return WorkerResult(RETRY, reason="invalid-state-event")
     return await worker.process(hint)
 
 

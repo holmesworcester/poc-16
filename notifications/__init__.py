@@ -4,7 +4,6 @@ from .delivery import (
     NotificationIntent,
     PublicationHint,
     derive,
-    derive_awaited,
     seal_target,
     trigger_for,
 )
@@ -22,7 +21,6 @@ __all__ = (
     "WorkerResult",
     "carrier_disposition",
     "derive",
-    "derive_awaited",
     "handle_carrier_delivery",
     "seal_target",
     "trigger_for",

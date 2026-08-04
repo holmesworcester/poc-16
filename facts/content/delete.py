@@ -3,7 +3,7 @@
 The proposal binds the target's canonical key, its exact ref, and the SELF
 selector named by the target family's policy.  OWNER and ADMIN are ordinary
 offer/need paths: OWNER compares durable member principals (so sibling devices
-share ownership), while ADMIN requires an admin offer for the signing key.
+share ownership), while ADMIN requires an admin offer for the device's owner.
 """
 
 from core.fact import Fact, Need
@@ -18,6 +18,7 @@ from core.suppression import (
 )
 from .. import _policy
 from .._commands import offer_source, publish
+from .._identity import actor_needs
 from ..auth import signature
 
 TAG = "delete"
@@ -25,42 +26,45 @@ POLICY = _policy.FamilyPolicy()
 
 
 # SHAPE
-def delete(workspace, pk, target_key, mode, ts, owner=None):
+def delete(
+        workspace, pk, target_key, mode, ts, owner=None, actor=None):
     """Exact target address + selector token + hard target dependency."""
     target = fid_of(target_key)
     owner = pk if owner is None else owner
+    actor = pk if actor is None else actor
     return Fact(
         TAG, ts,
         [
             action(_policy.CONTENT_DELETE, SELF, target_key),
             ["ref", TARGET, target],
         ],
-        {"pk": pk, "owner": owner, "mode": mode}, workspace)
+        {"actor": actor, "mode": mode, "owner": owner, "pk": pk},
+        workspace,
+    )
 
 
 # NEEDS — OWNER and ADMIN are distinct conjunctive authority modes.
 def needs(f):
     pk = f.body.get("pk", "")
-    authority = "member" if f.body.get("mode") == _policy.OWNER else "admin"
-    owner = f.body.get("owner", "")
-    return (
-        Need("author", "author", f.fid, pk),
-        Need(
-            "actor_authority", authority, pk,
-            owner if authority == "member" else None),
-    )
+    actor = f.body.get("actor", "")
+    required = actor_needs(f, pk, actor)
+    if f.body.get("mode") == _policy.ADMIN:
+        required += (Need("actor_admin", "admin", actor),)
+    return required
 
 
 # VALIDATE
 def validate(f, ctx):
     try:
         import facts  # function-local: the router imports this package
-        if set(f.body) != {"pk", "owner", "mode"}:
+        if set(f.body) != {"actor", "mode", "owner", "pk"}:
             return False
-        pk, owner, mode = f.body["pk"], f.body["owner"], f.body["mode"]
-        if not isinstance(pk, str) or not isinstance(owner, str) \
+        pk, actor = f.body["pk"], f.body["actor"]
+        owner, mode = f.body["owner"], f.body["mode"]
+        if not all(isinstance(value, str) for value in (pk, actor, owner)) \
                 or mode not in {
-                _policy.OWNER, _policy.ADMIN}:
+                    _policy.OWNER, _policy.ADMIN} \
+                or mode == _policy.OWNER and actor != owner:
             return False
         ((name, target),) = f.refs()
         target_fact = ctx.fact_of(target)
@@ -84,7 +88,7 @@ def validate(f, ctx):
             return False
 
         return is_deletion(f) and f == delete(
-            f.ws, pk, target_key, mode, f.ts, owner)
+            f.ws, pk, target_key, mode, f.ts, owner, actor)
     except (KeyError, IndexError, TypeError, ValueError):
         return False
 
@@ -116,17 +120,20 @@ def remove(node, workspace, target, ts=None):
     secret, public = node.identity(workspace)
     with node.lock:
         target_principal = victim.body.get(policy.owner_field, "")
-        actor_member, _ = member_source(
-            node, workspace, public, target_principal)
-        mode = _policy.OWNER if actor_member is not None else _policy.ADMIN
+        actor_member, actor = member_source(node, workspace, public)
+        if actor_member is None:
+            raise ValueError("publishing device is not owned by a member")
+        mode = _policy.OWNER \
+            if actor == target_principal else _policy.ADMIN
         if mode == _policy.ADMIN and offer_source(
-                node, workspace, "admin", public) is None:
+                node, workspace, "admin", actor) is None:
             raise ValueError("only the owner or an admin may delete this fact")
     item = delete(
-        workspace, public, victim.key, mode, ts, target_principal)
-    return publish(node, workspace, item,
-                   signature.signature(secret, public, item, ts),
-                   role="member" if mode == _policy.OWNER else "admin")
+        workspace, public, victim.key, mode, ts, target_principal, actor)
+    return publish(
+        node, workspace, item,
+        signature.signature(secret, public, item, ts),
+    )
 
 
 # QUERIES — none: deletion is visible only as the victim's absence.

@@ -6,7 +6,13 @@ import pytest
 
 from adapters.r2 import R2BindingStore
 from core.crypto import h
-from core.limits import PayloadTooLarge
+from core.limits import (
+    DIRECT_STREAM_CHUNK_BYTES,
+    MAX_DIRECT_OBJECT_BYTES,
+    MAX_OBJECT_BYTES,
+    MAX_ROOT_BYTES,
+    PayloadTooLarge,
+)
 from core.object_store import (
     ABSENT,
     CREATED,
@@ -16,9 +22,9 @@ from core.object_store import (
     RetryableStoreError,
     STALE,
     StoreError,
+    async_store,
     ensure_object_async,
 )
-from core.repository_applier import async_store
 
 
 class R2Object:
@@ -26,10 +32,60 @@ class R2Object:
         self.key, self.value, self.etag = key, value, etag
         self.size = len(value)
         self.array_calls = 0
+        self.body = Stream((value,))
 
     async def arrayBuffer(self):
         self.array_calls += 1
         return self.value
+
+
+class StreamResult:
+    def __init__(self, done, value=None):
+        self.done, self.value = done, value
+
+
+class Reader:
+    def __init__(self, chunks):
+        self.chunks = iter(chunks)
+        self.released = False
+
+    async def read(self):
+        try:
+            return StreamResult(False, next(self.chunks))
+        except StopIteration:
+            return StreamResult(True)
+
+    def releaseLock(self):
+        self.released = True
+
+
+class Stream:
+    def __init__(self, chunks):
+        self.reader = Reader(chunks)
+
+    def getReader(self):
+        return self.reader
+
+
+class VirtualObject:
+    def __init__(self, size, *, delivered=None):
+        self.size = size
+        remaining = size if delivered is None else delivered
+
+        def chunks():
+            chunk = b"x" * DIRECT_STREAM_CHUNK_BYTES
+            while remaining_chunks[0]:
+                take = min(remaining_chunks[0], len(chunk))
+                remaining_chunks[0] -= take
+                yield chunk[:take]
+
+        remaining_chunks = [remaining]
+        self.body = Stream(chunks())
+        self.array_calls = 0
+
+    async def arrayBuffer(self):  # pragma: no cover - direct copy must stream
+        self.array_calls += 1
+        raise AssertionError("direct R2 pile read buffered ArrayBuffer")
 
 
 @dataclass
@@ -106,19 +162,33 @@ def test_native_r2_preserves_opaque_tokens_and_conditional_outcomes():
     bucket, store = Bucket(), R2BindingStore(Bucket())
     bucket = store.bucket
 
-    assert run(store.read_versioned("root")) is ABSENT
-    created = run(store.cas("root", ABSENT, b"root-1"))
+    assert run(store.read_versioned("removal")) is ABSENT
+    created = run(store.cas("removal", ABSENT, b"removal-1"))
     assert isinstance(created, Applied)
     assert created.token.value == "opaque-r2-1"
-    pair = run(store.read_versioned("root"))
-    assert pair.value == b"root-1"
+    pair = run(store.read_versioned("removal"))
+    assert pair.value == b"removal-1"
     assert pair.token == created.token
     assert pair.token.value != h(pair.value)
 
-    assert run(store.cas("root", ABSENT, b"loser")) is STALE
-    replaced = run(store.cas("root", pair.token, b"root-2"))
+    assert run(store.cas("removal", ABSENT, b"loser")) is STALE
+    replaced = run(store.cas("removal", pair.token, b"removal-2"))
     assert isinstance(replaced, Applied)
-    assert run(store.get("root")) == b"root-2"
+    assert run(store.get("removal")) == b"removal-2"
+
+
+def test_native_r2_layout_reads_use_the_semantic_object_limit():
+    bucket, store = Bucket(), R2BindingStore(Bucket())
+    bucket = store.bucket
+    key = "layouts/" + "/".join(
+        ("0" * 64, "1" * 64, "0000000000000001"))
+    value = b"l" * (MAX_ROOT_BYTES + 1)
+    physical = key
+    bucket.data[physical] = value
+    bucket.etags[physical] = bucket._token()
+
+    assert run(store.get(key)) == value
+    assert run(store.read_versioned(key)).value == value
 
 
 def test_native_r2_immutable_create_collision_is_verified():
@@ -229,14 +299,14 @@ def test_native_r2_list_rejects_unbounded_unique_cursors():
 
 @pytest.mark.parametrize(
     "etag", (None, "", 'W/"weak"', 7, False, object()))
-def test_native_r2_rejects_unusable_root_etag(etag):
+def test_native_r2_rejects_unusable_removal_etag(etag):
     bucket = Bucket()
-    bucket.data["root"] = b"root"
-    bucket.etags["root"] = etag
+    bucket.data["removal"] = b"removal"
+    bucket.etags["removal"] = etag
     store = R2BindingStore(bucket)
 
     with pytest.raises(StoreError, match="no usable strong ETag"):
-        run(store.read_versioned("root"))
+        run(store.read_versioned("removal"))
 
     class ResultWithoutToken(Bucket):
         async def put(self, key, value, **options):
@@ -244,7 +314,7 @@ def test_native_r2_rejects_unusable_root_etag(etag):
 
     with pytest.raises(StoreError, match="no usable strong ETag"):
         run(R2BindingStore(ResultWithoutToken()).cas(
-            "root", ABSENT, b"candidate"))
+            "removal", ABSENT, b"candidate"))
 
 
 def test_native_r2_never_maps_throttle_or_transport_to_stale():
@@ -256,17 +326,17 @@ def test_native_r2_never_maps_throttle_or_transport_to_stale():
     bucket = store.bucket
     bucket.fail = Error(429)
     with pytest.raises(RetryableStoreError):
-        run(store.cas("root", ABSENT, b"x"))
+        run(store.cas("removal", ABSENT, b"x"))
 
     bucket.fail = Error(503)
     with pytest.raises(OutcomeUnknown):
-        run(store.cas("root", ABSENT, b"x"))
+        run(store.cas("removal", ABSENT, b"x"))
 
 
 def test_native_r2_guards_authoritative_mutations_and_prefixes():
     store = R2BindingStore(Bucket(), "tenant")
     with pytest.raises(ValueError, match="conditional"):
-        run(store.put("root", b"x"))
+        run(store.put("removal", b"x"))
     with pytest.raises(ValueError, match="not deletable"):
         run(store.delete("obj/" + "0" * 64))
     with pytest.raises(ValueError, match="key"):
@@ -295,12 +365,51 @@ def test_native_r2_bounded_read_rejects_known_oversize_before_allocation():
     assert over.array_calls == 0
 
 
+def test_native_r2_direct_pile_copy_streams_the_exact_protocol_maximum():
+    obj = VirtualObject(MAX_DIRECT_OBJECT_BYTES)
+
+    class One:
+        async def get(self, _key):
+            return obj
+
+    chunks = []
+    total = run(R2BindingStore(One()).copy_pile_object(
+        h(b"virtual maximum pile"), MAX_DIRECT_OBJECT_BYTES,
+        lambda chunk: chunks.append(len(chunk))))
+
+    assert total == MAX_DIRECT_OBJECT_BYTES == sum(chunks)
+    assert max(chunks) == DIRECT_STREAM_CHUNK_BYTES
+    assert obj.array_calls == 0
+    assert obj.body.reader.released
+
+
+def test_native_r2_direct_pile_copy_rejects_one_over_and_short_stream():
+    oversized = VirtualObject(MAX_OBJECT_BYTES + 1)
+    short = VirtualObject(4, delivered=3)
+    responses = iter((oversized, short, None))
+
+    class Sequence:
+        async def get(self, _key):
+            return next(responses)
+
+    store = R2BindingStore(Sequence())
+    with pytest.raises(PayloadTooLarge, match="byte limit"):
+        run(store.copy_pile_object(
+            h(b"oversized pile"), MAX_OBJECT_BYTES, lambda _chunk: None))
+    with pytest.raises(StoreError, match="size mismatch"):
+        run(store.copy_pile_object(
+            h(b"short pile"), MAX_OBJECT_BYTES, lambda _chunk: None))
+    assert short.body.reader.released
+    assert run(store.copy_pile_object(
+        h(b"missing pile"), MAX_OBJECT_BYTES, lambda _chunk: None)) is None
+
+
 def test_native_r2_missing_size_fails_before_allocation():
     class One:
         async def get(self, _key):
             return obj
 
-    obj = R2Object("obj/legacy", b"abcde", "legacy")
+    obj = R2Object("obj/opaque", b"abcde", "opaque")
     del obj.size
 
     with pytest.raises(StoreError, match="no size"):

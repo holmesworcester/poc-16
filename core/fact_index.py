@@ -4,6 +4,22 @@ This module is deliberately storage-free.  Both the disposable SQLite client
 projection and the authenticated repository compiler consume this exact
 function, so adding a fact family cannot create two indexing definitions.
 """
+from typing import NamedTuple
+
+
+class IndexPosting(NamedTuple):
+    kind: str
+    k0: str
+    k1: str
+    fid: str
+
+
+class PostingPage(NamedTuple):
+    rows: tuple[IndexPosting, ...]
+    cursor: str | None
+    pages_read: int
+
+
 TYPE_INDEX = "fact.type"
 KEY_INDEX = "fact.key"
 REF_INDEX = "fact.ref"

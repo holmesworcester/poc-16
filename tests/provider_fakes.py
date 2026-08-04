@@ -120,6 +120,7 @@ class FakeS3Client:
     def head_object(self, **request):
         key = request["Key"]
         with self.bucket.lock:
+            self.bucket._record(self.actor, "head", key, None)
             if key not in self.bucket.data:
                 raise ProviderError(404, "NotFound")
             return {"ETag": self.bucket.tokens[key]}
@@ -192,9 +193,38 @@ class R2Object:
     def __init__(self, key, value, etag):
         self.key, self.value, self.etag = key, value, etag
         self.size = len(value)
+        self.body = _R2Stream(value)
 
     async def arrayBuffer(self):
         return self.value
+
+
+class _R2ReadResult:
+    def __init__(self, done, value=None):
+        self.done, self.value = done, value
+
+
+class _R2Reader:
+    def __init__(self, value):
+        self.value = value
+        self.done = False
+
+    async def read(self):
+        if self.done:
+            return _R2ReadResult(True)
+        self.done = True
+        return _R2ReadResult(False, self.value)
+
+    def releaseLock(self):
+        pass
+
+
+class _R2Stream:
+    def __init__(self, value):
+        self.value = value
+
+    def getReader(self):
+        return _R2Reader(self.value)
 
 
 class OneShotAsyncBarrier:

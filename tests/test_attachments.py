@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 import facts
-from core.close import decode_pile
+from tests.util import signed_pile_facts
 from core.kernel import drain, validate
 from facts import _bao
 from facts.content import file as files, file_slice as slices
@@ -71,17 +71,18 @@ def test_send_emits_descriptor_then_one_independent_closed_pile_per_slice(
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     raw_piles = []
-    receive = node.receive_pile
+    publish = node.publish_closed
 
-    def observed(ws, member, raw):
-        raw_piles.append(raw)
-        return receive(ws, member, raw)
+    def observed(ws, closures):
+        raw_piles.extend(
+            node.sender(ws).pack(closure) for closure in closures)
+        return publish(ws, closures)
 
-    monkeypatch.setattr(node, "receive_pile", observed)
+    monkeypatch.setattr(node, "publish_closed", observed)
     fid = send_bytes(
         node, workspace, "separate.bin",
         random.Random(1).randbytes(_bao.WIDTH + 9), ts=2)
-    streams = [decode_pile(raw, workspace) for raw in raw_piles]
+    streams = [signed_pile_facts(raw, workspace) for raw in raw_piles]
 
     assert len(streams) == 3
     assert all(validate(stream, workspace) for stream in streams)
@@ -107,13 +108,14 @@ def test_independent_slice_piles_make_partial_progress(tmp_path, monkeypatch):
     source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     raw_piles = []
-    receive = source.receive_pile
+    publish = source.publish_closed
 
-    def observed(ws, member, raw):
-        raw_piles.append(raw)
-        return receive(ws, member, raw)
+    def observed(ws, closures):
+        raw_piles.extend(
+            source.sender(ws).pack(closure) for closure in closures)
+        return publish(ws, closures)
 
-    monkeypatch.setattr(source, "receive_pile", observed)
+    monkeypatch.setattr(source, "publish_closed", observed)
     send_bytes(
         source, workspace, "partial.bin", b"x" * (_bao.WIDTH + 1), ts=2)
 
@@ -196,13 +198,14 @@ def test_hosted_kernel_admits_slice_without_importing_native_bao(tmp_path):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     raw_piles = []
-    receive = node.receive_pile
+    publish = node.publish_closed
 
-    def observed(ws, member, raw):
-        raw_piles.append(raw)
-        return receive(ws, member, raw)
+    def observed(ws, closures):
+        raw_piles.extend(
+            node.sender(ws).pack(closure) for closure in closures)
+        return publish(ws, closures)
 
-    node.receive_pile = observed
+    node.publish_closed = observed
     send_bytes(node, workspace, "hosted.bin", b"hosted proof", ts=2)
     pile = raw_piles[-1]
     script = f"""
@@ -214,10 +217,10 @@ class BlockBao(importlib.abc.MetaPathFinder):
         if fullname == 'tinyp2p_bao':
             raise ModuleNotFoundError('blocked', name=fullname)
 sys.meta_path.insert(0, BlockBao())
-from core.close import decode_pile
+from tests.util import signed_pile_facts
 from core.kernel import validate
 raw = base64.b64decode({base64.b64encode(pile).decode()!r})
-assert validate(decode_pile(raw, {workspace!r}), {workspace!r})
+assert validate(signed_pile_facts(raw, {workspace!r}), {workspace!r})
 """
     result = subprocess.run(
         [sys.executable, "-c", script], cwd=ROOT,
@@ -331,7 +334,7 @@ def test_selected_save_fetches_only_that_descriptor_and_one_slice_at_a_time(
     }
     fetched = []
     projection = node.sql(workspace)
-    strict_fact = projection.fact
+    strict_fact = projection.fact_of
     strict_payload = slices.payload
 
     def observed_fact(fid):
@@ -348,7 +351,7 @@ def test_selected_save_fetches_only_that_descriptor_and_one_slice_at_a_time(
         consumed += 1
         return strict_payload(fact, descriptor)
 
-    monkeypatch.setattr(projection, "fact", observed_fact)
+    monkeypatch.setattr(projection, "fact_of", observed_fact)
     monkeypatch.setattr(slices, "payload", observed_payload)
     monkeypatch.setattr(
         _bao, "verify",

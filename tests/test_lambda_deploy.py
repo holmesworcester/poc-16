@@ -1,4 +1,5 @@
 """AWS Function URL packaging around the real database-free gateway."""
+import asyncio
 import base64
 import importlib.util
 import json
@@ -14,10 +15,19 @@ import facts
 import pytest
 
 from adapters.s3 import S3Config
-from core.close import encode_pile
+from core import peer_capability
+from core.access import AccessGate
 from core.crypto import h, unseal
 from core.grants import check_token
-from core.limits import MAX_MINT_REQUEST_BYTES
+from core.head_permit import (
+    decode as decode_head_permit,
+    encode as encode_head_permit,
+)
+from core.limits import (
+    MAX_HEAD_PERMIT_BYTES,
+    MAX_MINT_REQUEST_BYTES,
+    PAGE_BATCH,
+)
 from full_peer.node import FullPeer
 from deploy.aws_lambda import app
 from deploy.aws_lambda.config import (
@@ -29,8 +39,10 @@ from deploy.aws_lambda.config import (
     MAX_LOG_METHOD_CHARS,
     MAX_LOG_PATH_CHARS,
     MAX_LOG_RECORD_BYTES,
+    MAX_CONTROL_REQUEST_BYTES,
     MAX_QUERY_BYTES,
     MAX_QUERY_FIELDS,
+    MAX_READINESS_RESPONSE_BYTES,
     MAX_STORE_PREFIX_LENGTH,
     PREFIX_PATTERN,
     SDK_CLEANUP_MARGIN_SECONDS,
@@ -40,17 +52,48 @@ from deploy.aws_lambda.config import (
     validate_sdk_budget,
 )
 from deploy.aws_lambda.s3_bucket_policy import policy
-from core.http import AsyncFromSyncReader, HttpGate, Response
+from core.http import (
+    AsyncFromSyncReader,
+    HttpGate,
+    MAX_HEAD_CONTROL_REQUEST_BYTES,
+    encode_head_commit_request,
+    encode_head_permit_request,
+    Response,
+)
 from core.object_store import (
     MAX_INVITE_ID_BYTES,
     MAX_LOGICAL_KEY_BYTES,
     MAX_PROVIDER_KEY_BYTES,
+    REMOVAL_ROOT_KEY,
+    STALE,
 )
-from deploy.python_role_modules import REPOSITORY_READER_CORE_MODULES
-from facts.auth import request
+from deploy.python_role_modules import HOSTED_GATE_CORE_MODULES
+from core.suppression_tree import decode_root
+from core.writer_head import (
+    PendingHeadSlot,
+    decode_slot_state,
+    writer_store_binding,
+)
+from core.writer_repository import OpaqueHeadGate, WriterLog
+from facts.auth.removal import removal
+from facts.auth.removal_path_request import removal_path_request
+from facts.auth.signature import signature
+from facts.content.message import message
+from core.store import FsStore
+from tests.test_access_gate import (
+    access_proof,
+    head_proof as current_head_proof,
+    path_proof,
+    signed,
+)
+from tests.test_removal_state import world as removal_world
 
 ROOT = Path(__file__).resolve().parents[1]
 LAMBDA = ROOT / "deploy" / "aws_lambda"
+
+
+def run(awaitable):
+    return asyncio.run(awaitable)
 
 
 def event(
@@ -108,21 +151,86 @@ def world(tmp_path):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     now = 100
-    pile = encode_pile(request.payload(
-        node, workspace, "sync", now + 60_000, now))
-    app._gateway_cache = HttpGate(
-        AsyncFromSyncReader(node.store(workspace)),
-        workspace, b"s" * 32, lambda: now)
+    root = node.fact_of(workspace, workspace)
+    secret, member = node.identity(workspace)
+    gate = AccessGate(workspace, node.store(workspace))
+    assert run(gate.state.bootstrap(
+        signed(secret, member, root, (root,)))).status in {"applied", "noop"}
+    path = run(gate.removal_path(
+        path_proof(secret, member, root, (root,)), now))
+    pile = access_proof(secret, member, root, (root,), path)
+    app._gateway_cache = local_gateway(node, workspace, now)
     return node, workspace, now, pile
 
 
-def mint(node, workspace, pile):
-    request_body = json.dumps({
+def local_gateway(node, workspace, now):
+    store = AsyncFromSyncReader(node.store(workspace))
+    gate = AccessGate(workspace, store)
+    heads = OpaqueHeadGate(store, gate.authorize_head)
+
+    async def commit_permit(permit, proposed, secret):
+        return await gate.commit_head_permit(
+            heads, permit, proposed, secret)
+
+    return HttpGate(
+        store,
+        workspace,
+        b"s" * 32,
+        lambda: now,
+        head_advance=heads.advance,
+        head_permit_issue=gate.issue_head_permit,
+        head_permit_commit=commit_permit,
+        permit_secret=b"p" * 32,
+        mint_authorize=gate.authorize_access,
+        path_authorize=gate.removal_path,
+        removal_bootstrap=gate.state.bootstrap,
+        sync_profile=peer_capability.OWNER,
+    )
+
+
+class StaleRemovalOnceStore(FsStore):
+    """Exercise one provider CAS loss without inventing another protocol."""
+
+    def __init__(self, root):
+        super().__init__(root)
+        self.fail_removal_once = False
+        self.page_reads = []
+        self.calls = []
+
+    def get_bounded(self, key, maximum):
+        self.calls.append(("get", key))
+        return super().get_bounded(key, maximum)
+
+    def read_versioned(self, key):
+        self.calls.append(("read_versioned", key))
+        return super().read_versioned(key)
+
+    def put_if_absent(self, key, value):
+        self.calls.append(("put_if_absent", key))
+        return super().put_if_absent(key, value)
+
+    def cas(self, key, token, value):
+        self.calls.append(("cas", key))
+        if key == REMOVAL_ROOT_KEY and self.fail_removal_once:
+            self.fail_removal_once = False
+            return STALE
+        return super().cas(key, token, value)
+
+    def list_page(self, prefix, cursor=None, limit=PAGE_BATCH):
+        self.page_reads.append((prefix, cursor, limit))
+        return super().list_page(prefix, cursor, limit)
+
+
+def proof_body(workspace, pile):
+    return json.dumps({
         "ws": workspace,
         "pile": base64.b64encode(pile).decode(),
     }).encode()
+
+
+def mint(node, workspace, pile):
     status, _, raw = response(app.handler(
-        event("POST", "/mint", workspace, request_body), None))
+        event("POST", "/mint", workspace, proof_body(workspace, pile)), None))
     body = json.loads(raw)
     token = unseal(
         node.identity(workspace)[0],
@@ -130,35 +238,310 @@ def mint(node, workspace, pile):
     return status, body, token
 
 
-def test_lambda_mints_and_serves_authenticated_snapshot_objects(tmp_path):
+def test_lambda_permit_commits_one_terminal_self_removal_head(
+        tmp_path, monkeypatch):
+    value = removal_world()
+    store = StaleRemovalOnceStore(str(tmp_path / "repository"))
+    config = S3Config("test-bucket", "tenant")
+    monkeypatch.setattr(app, "_s3_config", lambda: config)
+    monkeypatch.setattr(
+        app, "_store", lambda _config: AsyncFromSyncReader(store))
+    monkeypatch.setattr(
+        app, "_pack_issuer", lambda _config: SimpleNamespace(
+            open_pack=lambda *_args: None,
+            open_object=lambda *_args: None,
+        ))
+    secrets = {
+        "TINYP2P_GRANT_SECRET_ARN": b"g" * 32,
+        "TINYP2P_PERMIT_SECRET_ARN": b"p" * 32,
+    }
+    monkeypatch.setattr(
+        app, "_secret", lambda name, _label: secrets[name])
+    monkeypatch.setattr(app.time, "time", lambda: 0.010)
+    monkeypatch.setenv("TINYP2P_WORKSPACE_ID", value.root.fid)
+    app._gateway_cache = None
+
+    bootstrap = signed(
+        value.founder_secret,
+        value.founder,
+        value.root,
+        (value.root,),
+    )
+    assert response(app.handler(event(
+        "POST", "/removal/bootstrap",
+        value.root.fid, bootstrap), None))[0] == 201
+    historical = path_proof(
+        value.founder_secret, value.founder,
+        value.root, (value.root,))
+    status, _, path = response(app.handler(event(
+        "POST", "/removal/path", value.root.fid,
+        proof_body(value.root.fid, historical)), None))
+    assert status == 200
+
+    current = access_proof(
+        value.founder_secret, value.founder,
+        value.root, (value.root,), path)
+    status, _, raw_mint = response(app.handler(event(
+        "POST", "/mint", value.root.fid,
+        proof_body(value.root.fid, current)), None))
+    assert status == 200
+    token = unseal(
+        value.founder_secret,
+        base64.b64decode(json.loads(raw_mint)["grant"]),
+    ).decode()
+    headers = {"Authorization": "Bearer " + token}
+    assert response(app.handler(event(
+        "POST", "/authority", value.root.fid, bootstrap,
+        headers=headers), None))[0] == 404
+
+    evicted = removal(
+        value.root.fid, value.founder, value.founder, 8)
+    evicted_sig = signature(
+        value.founder_secret, value.founder, evicted, 8)
+    control = signed(
+        value.founder_secret,
+        value.founder,
+        value.root,
+        (value.root, evicted_sig, evicted),
+    )
+    writer = WriterLog(
+        value.root.fid,
+        value.founder,
+        value.founder,
+        writer_store_binding(value.root.fid, value.founder),
+        value.founder_secret,
+        store,
+    )
+    update = run(writer.prepare(((
+        value.root, evicted_sig, evicted),
+    )))
+    run(writer.establish(update))
+    proposed = update.head_oid
+    proof = current_head_proof(
+        value.founder_secret, value.founder,
+        value.root, (value.root,), path, proposed)
+    assert response(app.handler(event(
+        "POST", "/head/" + h(b"wrong"),
+        value.root.fid, proof), None))[0] == 403
+
+    private_node = decode_root(
+        store.get("removal"), value.root.fid).root
+    assert response(app.handler(event(
+        "GET", "/obj/" + private_node, value.root.fid,
+        headers={"Authorization": "Bearer " + token}), None))[0] == 404
+
+    other = h(b"other member")
+    relabeled = removal_path_request(
+        value.root.fid, value.founder, other, 1_000, 7)
+    relabeled_sig = signature(
+        value.founder_secret, value.founder, relabeled, 7)
+    forged = signed(
+        value.founder_secret,
+        value.founder,
+        value.root,
+        (value.root, relabeled_sig, relabeled),
+    )
+    assert response(app.handler(event(
+        "POST", "/removal/path", value.root.fid,
+        proof_body(value.root.fid, forged)), None))[0] == 403
+
+    ordinary = message(
+        value.root.fid, value.founder,
+        "general", "not removal control", 9)
+    ordinary_sig = signature(
+        value.founder_secret, value.founder, ordinary, 9)
+    ordinary_pile = signed(
+        value.founder_secret,
+        value.founder,
+        value.root,
+        (value.root, ordinary_sig, ordinary),
+    )
+
+    removal_before = store.get(REMOVAL_ROOT_KEY)
+    assert response(app.handler(event(
+        "POST", "/removal/apply", value.root.fid, control,
+        headers=headers), None))[0] == 404
+    assert response(app.handler(event(
+        "POST", f"/head/{proposed}/permit", value.root.fid,
+        b"not a control-head frame"), None))[0] == 403
+    assert response(app.handler(event(
+        "POST", f"/head/{proposed}/permit", value.root.fid,
+        encode_head_permit_request(
+            proof, (ordinary_pile,))), None))[0] == 403
+    assert store.get(REMOVAL_ROOT_KEY) == removal_before
+
+    store.calls.clear()
+    permit_response = response(app.handler(event(
+        "POST", f"/head/{proposed}/permit", value.root.fid,
+        encode_head_permit_request(proof, (control,))), None))
+    assert permit_response[0] == 200
+    permit = permit_response[2]
+    assert store.get(
+        f"heads/{value.root.fid}/{value.founder}") is None
+
+    tampered = bytearray(permit)
+    tampered[len(tampered) // 2] ^= 1
+    assert response(app.handler(event(
+        "POST", f"/head/{proposed}/commit", value.root.fid,
+        encode_head_commit_request(bytes(tampered))), None))[0] \
+        == 403
+    assert store.get(REMOVAL_ROOT_KEY) == removal_before
+
+    # The retired frame could resubmit changed controls at commit time. The
+    # hard-cut route accepts only the exact issue-time authenticated permit.
+    retired_frame = encode_head_permit_request(permit, (control,))
+    assert len(retired_frame) <= MAX_HEAD_PERMIT_BYTES
+    assert response(app.handler(event(
+        "POST", f"/head/{proposed}/commit", value.root.fid,
+        retired_frame), None))[0] == 403
+    assert store.get(REMOVAL_ROOT_KEY) == removal_before
+
+    grant_signed = encode_head_permit(
+        decode_head_permit(
+            permit, secrets["TINYP2P_PERMIT_SECRET_ARN"]),
+        secrets["TINYP2P_GRANT_SECRET_ARN"],
+    )
+    assert response(app.handler(event(
+        "POST", f"/head/{proposed}/commit", value.root.fid,
+        grant_signed), None))[0] == 403
+    assert store.get(REMOVAL_ROOT_KEY) == removal_before
+
+    # A new cold Lambda sandbox can finish a permit issued by the old one: all
+    # durable authority is in S3 and the permit key is stable outside memory.
+    app._gateway_cache = None
+
+    store.fail_removal_once = True
+    assert response(app.handler(event(
+        "POST", f"/head/{proposed}/commit", value.root.fid,
+        encode_head_commit_request(permit)), None))[0] == 409
+    assert store.get(REMOVAL_ROOT_KEY) == removal_before
+    pending = decode_slot_state(store.get(
+        f"heads/{value.root.fid}/{value.founder}"))
+    assert isinstance(pending, PendingHeadSlot)
+    assert (pending.workspace, pending.device, pending.head) == (
+        value.root.fid, value.founder, proposed)
+    assert response(app.handler(event(
+        "POST", f"/head/{proposed}/commit", value.root.fid,
+        encode_head_commit_request(permit)), None))[0] == 201
+    accepted_slot = store.get(
+        f"heads/{value.root.fid}/{value.founder}")
+    assert response(app.handler(event(
+        "POST", f"/head/{proposed}/commit", value.root.fid,
+        encode_head_commit_request(permit)), None))[0] == 204
+    assert store.get(
+        f"heads/{value.root.fid}/{value.founder}") == accepted_slot
+    assert store.page_reads == []
+    update_keys = {"obj/" + oid for oid, _raw in update.objects}
+    assert all(
+        key == REMOVAL_ROOT_KEY or key.startswith("removal-node/")
+        or key == f"heads/{value.root.fid}/{value.founder}"
+        or key in update_keys
+        for _operation, key in store.calls)
+    assert not any("cursor" in key for key in store.list(""))
+
+    rejected_head = h(b"lambda head after member removal")
+    store.put_if_absent(
+        "obj/" + rejected_head, b"lambda head after member removal")
+    assert response(app.handler(event(
+        "POST", "/head/" + rejected_head, value.root.fid,
+        current_head_proof(
+            value.founder_secret, value.founder,
+            value.root, (value.root,), path, rejected_head)), None))[0] \
+        == 409
+    assert store.get(
+        f"heads/{value.root.fid}/{value.founder}") == accepted_slot
+    assert response(app.handler(event(
+        "POST", f"/head/{rejected_head}/permit", value.root.fid,
+        encode_head_permit_request(current_head_proof(
+            value.founder_secret, value.founder,
+            value.root, (value.root,), path, rejected_head),
+            (control,))), None))[0] == 409
+    stale = response(app.handler(event(
+        "POST", "/mint", value.root.fid,
+        proof_body(value.root.fid, current)), None))
+    assert stale[0] == 409
+    assert json.loads(stale[2]) == {"error": "proof_refresh_required"}
+    refreshed = response(app.handler(event(
+        "POST", "/removal/path", value.root.fid,
+        proof_body(value.root.fid, historical)), None))
+    assert refreshed[0] == 200
+    denied = access_proof(
+        value.founder_secret, value.founder,
+        value.root, (value.root,), refreshed[2])
+    assert response(app.handler(event(
+        "POST", "/mint", value.root.fid,
+        proof_body(value.root.fid, denied)), None))[0] == 403
+
+
+def test_lambda_applies_route_specific_exact_body_limits(monkeypatch):
+    workspace = "a" * 64
+    calls = []
+
+    class Probe:
+        async def handle(self, *request):
+            calls.append(request)
+            return Response(200)
+
+    app._gateway_cache = Probe()
+    monkeypatch.setenv("TINYP2P_MAX_REQUEST_BYTES", "5")
+    monkeypatch.setenv("TINYP2P_MAX_CONTROL_BYTES", "7")
+    route = "/head/" + "b" * 64 + "/commit"
+    permit_route = "/head/" + "b" * 64 + "/permit"
+
+    assert response(app.handler(event(
+        "POST", route, workspace, b"12345"), None))[0] == 200
+    assert calls[-1][-1] == b"12345"
+    assert response(app.handler(event(
+        "POST", route, workspace, b"123456"), None))[0] == 413
+    assert response(app.handler(event(
+        "POST", permit_route, workspace, b"1234567"), None))[0] == 200
+    assert response(app.handler(event(
+        "POST", permit_route, workspace, b"12345678"), None))[0] == 413
+    assert response(app.handler(event(
+        "POST", "/mint", workspace, b"12345"), None))[0] == 200
+    assert response(app.handler(event(
+        "POST", "/mint", workspace, b"123456"), None))[0] == 413
+    assert len(calls) == 3
+
+
+def test_lambda_mints_and_serves_writer_directory_objects(tmp_path):
     node, workspace, now, pile = world(tmp_path)
     status, body, token = mint(node, workspace, pile)
 
     assert status == 200
-    assert body["cap"] == "sync-v1/read"
+    assert body["cap"] == "sync-v1/owner"
     assert check_token(
         b"s" * 32, "Bearer " + token, workspace,
         trusted_now=now) == node.identity_id(workspace)
     assert check_token(
         b"s" * 32, "Bearer " + token, workspace,
         trusted_now=now, require_push=True) is None
+    assert check_token(
+        b"s" * 32, "Bearer " + token, workspace,
+        trusted_now=now, require_object_put=True) \
+        == node.identity_id(workspace)
 
     headers = {"authorization": "Bearer " + token}
-    status, root_headers, root = response(app.handler(
-        event("GET", "/root", workspace, headers=headers), None))
+    status, root_headers, raw_heads = response(app.handler(
+        event("GET", "/heads", workspace, headers=headers), None))
     assert status == 200
-    assert root == node.store(workspace).get("root")
+    heads = json.loads(raw_heads)
+    assert len(heads["heads"]) == 1
+    assert heads["heads"][0][0].startswith(
+        f"heads/{workspace}/")
     assert root_headers["Cache-Control"] == "no-store"
 
     raw = b"served through the function URL"
     node.store(workspace).put_if_absent("obj/" + h(raw), raw)
     status, _, fetched = response(app.handler(
-        event("GET", "/page/" + h(raw), workspace, headers=headers), None))
+        event("GET", "/obj/" + h(raw), workspace, headers=headers), None))
     assert (status, fetched) == (200, raw)
 
+    # Immutable creation is issued through /obj/open; the buffered mutation
+    # route is deliberately absent even when a grant is read-only.
     assert response(app.handler(
-        event("PUT", "/pile/member/fid", workspace, b"x",
-              headers=headers), None))[0] == 405
+        event("PUT", "/obj/" + h(b"x"), workspace, b"x",
+              headers=headers), None))[0] == 404
 
 
 def test_lambda_rejects_a_request_pile_from_another_workspace(tmp_path):
@@ -166,13 +549,16 @@ def test_lambda_rejects_a_request_pile_from_another_workspace(tmp_path):
     first = facts.auth.workspace.create(node, "first", ts=1)
     second = facts.auth.workspace.create(node, "second", ts=2)
     now = 100
-    pile = encode_pile(
-        request.payload(node, first, "sync", now + 60_000, now),
-        workspace=first,
-    )
-    app._gateway_cache = HttpGate(
-        AsyncFromSyncReader(node.store(second)),
-        second, b"s" * 32, lambda: now)
+    root = node.fact_of(first, first)
+    secret, member = node.identity(first)
+    first_gate = AccessGate(first, node.store(first))
+    assert run(first_gate.state.bootstrap(
+        signed(secret, member, root, (root,)))).status in {
+            "applied", "noop"}
+    path = run(first_gate.removal_path(
+        path_proof(secret, member, root, (root,)), now))
+    pile = access_proof(secret, member, root, (root,), path)
+    app._gateway_cache = local_gateway(node, second, now)
     request_body = json.dumps({
         "ws": second,
         "pile": base64.b64encode(pile).decode(),
@@ -205,11 +591,11 @@ def test_lambda_bounds_query_bytes_and_fields_before_parsing(tmp_path):
     _, workspace, _, _ = world(tmp_path)
 
     byte_over = event(
-        "GET", "/root", raw_query="x" * (MAX_QUERY_BYTES + 1))
+        "GET", "/heads", raw_query="x" * (MAX_QUERY_BYTES + 1))
     assert response(app.handler(byte_over, None))[0] == 413
 
     fields_over = event(
-        "GET", "/root",
+        "GET", "/heads",
         raw_query="&".join(
             [f"ws={workspace}"]
             + [f"k{index}=v" for index in range(MAX_QUERY_FIELDS)]))
@@ -234,13 +620,13 @@ def test_lambda_rejects_malformed_query_encoding_before_gateway_io(
     app._gateway_cache = Probe()
     for malformed in ("%", "%2", "%GG", "%FF"):
         request_event = event(
-            "GET", "/root",
+            "GET", "/heads",
             raw_query=f"ws={workspace}&bad={malformed}")
         assert response(app.handler(request_event, None))[0] == 400
     assert calls == []
 
     valid = event(
-        "GET", "/root",
+        "GET", "/heads",
         raw_query=f"ws={workspace}&ok=%E2%9C%93")
     assert response(app.handler(valid, None))[0] == 200
     assert calls[0][2]["ok"] == ["✓"]
@@ -256,7 +642,7 @@ def test_lambda_logs_handled_5xx_without_request_secrets(
 
     app._gateway_cache = Failure()
     request_event = event(
-        "GET", "/page/" + "0" * 64, workspace,
+        "GET", "/obj/" + "0" * 64, workspace,
         headers={"authorization": "Bearer top-secret-token"})
     context = SimpleNamespace(aws_request_id="request-123")
 
@@ -270,7 +656,7 @@ def test_lambda_logs_handled_5xx_without_request_secrets(
         "event": "poc16_gateway_failure",
         "kind": "gateway_response",
         "method": "GET",
-        "path": "/page/" + "0" * 64,
+        "path": "/obj/" + "0" * 64,
         "request_id": "request-123",
         "status": 503,
     }
@@ -305,15 +691,20 @@ def test_lambda_failure_telemetry_has_exact_attacker_field_bounds(caplog):
         for record in caplog.records[-2:])
 
 
-def test_lambda_cold_sandboxes_load_one_stable_external_secret(
+def test_lambda_cold_sandboxes_load_distinct_stable_external_secrets(
         tmp_path, monkeypatch):
     node, workspace, _, _ = world(tmp_path)
     calls = []
+    config = S3Config(
+        "test-bucket", "tenant", region_name="us-west-2")
 
     class Secrets:
         def get_secret_value(self, **request):
             calls.append(request)
-            return {"SecretString": "z" * 64}
+            return {"SecretString": {
+                "grant-secret": "g" * 64,
+                "permit-secret": "p" * 64,
+            }[request["SecretId"]]}
 
     class Boto:
         @staticmethod
@@ -325,19 +716,58 @@ def test_lambda_cold_sandboxes_load_one_stable_external_secret(
     monkeypatch.setitem(sys.modules, "boto3", Boto)
     monkeypatch.setattr(
         app, "_botocore_config", lambda: "bounded-botocore")
+    monkeypatch.setattr(app, "_s3_config", lambda: config)
     monkeypatch.setattr(
         app, "_store",
-        lambda: AsyncFromSyncReader(node.store(workspace)))
+        lambda value: AsyncFromSyncReader(node.store(workspace)))
+    monkeypatch.setattr(
+        app, "_pack_issuer",
+        lambda value: SimpleNamespace(
+            open_pack=lambda *_args: None,
+            open_object=lambda *_args: None,
+        ))
     monkeypatch.setenv("TINYP2P_WORKSPACE_ID", workspace)
-    monkeypatch.setenv("TINYP2P_GRANT_SECRET_ARN", "stable-secret")
+    monkeypatch.setenv("TINYP2P_GRANT_SECRET_ARN", "grant-secret")
+    monkeypatch.setenv("TINYP2P_PERMIT_SECRET_ARN", "permit-secret")
     app._gateway_cache = None
 
     first = app._gateway()
-    second = app._gateway()
+    assert app._gateway() is first
+    app._gateway_cache = None
+    restarted = app._gateway()
 
-    assert first is second
-    assert first.secret == b"z" * 64
-    assert calls == [{"SecretId": "stable-secret"}]
+    assert restarted is not first
+    assert first.secret == restarted.secret == b"g" * 64
+    assert first.permit_secret == restarted.permit_secret == b"p" * 64
+    assert first.secret != first.permit_secret
+    assert calls == [
+        {"SecretId": "grant-secret"},
+        {"SecretId": "permit-secret"},
+        {"SecretId": "grant-secret"},
+        {"SecretId": "permit-secret"},
+    ]
+
+
+def test_lambda_refuses_one_secret_for_grants_and_permits(
+        tmp_path, monkeypatch):
+    node, workspace, _, _ = world(tmp_path)
+    config = S3Config("test-bucket", "tenant")
+    monkeypatch.setattr(app, "_s3_config", lambda: config)
+    monkeypatch.setattr(
+        app, "_store",
+        lambda value: AsyncFromSyncReader(node.store(workspace)))
+    monkeypatch.setattr(
+        app, "_pack_issuer",
+        lambda value: SimpleNamespace(
+            open_pack=lambda *_args: None,
+            open_object=lambda *_args: None,
+        ))
+    monkeypatch.setattr(app, "_secret", lambda _name, _label: b"x" * 32)
+    monkeypatch.setenv("TINYP2P_WORKSPACE_ID", workspace)
+    app._gateway_cache = None
+
+    with pytest.raises(RuntimeError, match="must be distinct"):
+        app._gateway()
 
 
 def test_lambda_sdk_deadline_budget_precedes_hard_timeout(monkeypatch):
@@ -377,26 +807,30 @@ def test_lambda_stage_is_an_explicit_importable_allowlist(tmp_path):
     manage = load_manage()
     staged = manage.stage(tmp_path / "stage")
 
-    assert (staged / "core" / "repository_reader.py").is_file()
+    assert (staged / "core" / "access.py").is_file()
+    assert (staged / "core" / "removal_state.py").is_file()
     assert {
         path.name for path in (staged / "core").glob("*.py")
-    } == set(REPOSITORY_READER_CORE_MODULES)
+    } == set(HOSTED_GATE_CORE_MODULES)
     assert (staged / "facts" / "auth" / "request.py").is_file()
     assert (staged / "adapters" / "s3" / "store.py").is_file()
     assert (staged / "deploy" / "aws_lambda" / "app.py").is_file()
     assert (staged / "deploy" / "aws_lambda" / "config.py").is_file()
+    assert (staged / "deploy" / "aws_lambda" / "pack_issuer.py").is_file()
     assert (staged / "deploy" / "aws_lambda" / "sdk_smoke.py").is_file()
     assert (
         staged / "deploy" / "aws_lambda" / "s3_bucket_policy.py").is_file()
     assert not (staged / "deploy" / "upload_broker.py").exists()
     assert not (staged / "deploy" / "aws_upload_broker").exists()
     for forbidden in (
+            "authority.py",
             "catalog.py",
             "client_projection.py",
             "mint.py",
             "node.py",
             "pile_sender.py",
             "repository_applier.py",
+            "repository_reader.py",
             "store.py",
             "suppression_state.py"):
         assert not (staged / "core" / forbidden).exists()
@@ -418,7 +852,7 @@ def test_lambda_stage_is_an_explicit_importable_allowlist(tmp_path):
     )
 
 
-def test_lambda_template_is_read_only_bounded_and_reproducible():
+def test_lambda_template_bounds_direct_immutable_writes_to_obj_and_pack():
     template = (LAMBDA / "template.yaml").read_text()
     requirements = (LAMBDA / "requirements.txt").read_text()
 
@@ -428,14 +862,37 @@ def test_lambda_template_is_read_only_bounded_and_reproducible():
     assert "AuthType: NONE" in template
     assert "CodeUri: stage/" in template
     assert "secretsmanager:GetSecretValue" in template
+    assert template.count("Type: AWS::SecretsManager::Secret") == 2
+    assert "TINYP2P_GRANT_SECRET_ARN: !Ref GrantSecret" in template
+    assert "TINYP2P_PERMIT_SECRET_ARN: !Ref PermitSecret" in template
+    assert "- Sid: ReadGrantSecret" in template
+    assert "Resource: !Ref GrantSecret" in template
+    assert "- Sid: ReadPermitSecret" in template
+    assert "Resource: !Ref PermitSecret" in template
+    assert "GrantSecretArn:" in template
+    assert "PermitSecretArn:" in template
     assert "s3:GetObject" in template
-    assert "s3:PutObject" not in template
+    assert template.count("Action: s3:PutObject") == 4
     assert "s3:DeleteObject" not in template
     assert "Action: s3:ListBucket" in template
     assert "s3:prefix:" in template
-    assert '${StorePrefix}/root' in template
+    assert '${StorePrefix}/authority' not in template
+    assert '${StorePrefix}/removal' in template
+    assert '${StorePrefix}/removal-node/*' in template
+    assert '${StorePrefix}/heads/${WorkspaceId}/*' in template
+    assert '${StorePrefix}/root' not in template
     assert '${StorePrefix}/obj/*' in template
     assert '${StorePrefix}/invite/*' in template
+    assert template.count('${Prefix}/obj/*') == 2
+    assert template.count('${Prefix}/removal"') == 2
+    assert template.count('${Prefix}/removal-node/*') == 2
+    assert template.count('${Prefix}/pack/*') == 2
+    assert "s3:authType: REST-QUERY-STRING" in template
+    assert "s3:signatureversion: AWS4-HMAC-SHA256" in template
+    assert 's3:if-none-match: "false"' in template
+    assert "s3:signatureAge: 60000" in template
+    assert 'TINYP2P_PACK_TTL_SECONDS: "60"' in template
+    assert "TINYP2P_MINT_MAX_FETCH" not in template
     assert "MetricName: Url5xxCount" in template
     assert "MetricName: Errors" not in template
     assert "AlarmActions: !If" in template
@@ -454,6 +911,10 @@ def test_lambda_template_is_read_only_bounded_and_reproducible():
     assert (
         f'TINYP2P_AWS_TOTAL_ATTEMPTS: '
         f'"{SDK_TOTAL_ATTEMPTS}"') in template
+    assert (
+        f'TINYP2P_MAX_CONTROL_BYTES: '
+        f'"{MAX_CONTROL_REQUEST_BYTES}"') in template
+    assert MAX_CONTROL_REQUEST_BYTES < MAX_HEAD_CONTROL_REQUEST_BYTES
     assert f"AllowedPattern: '{BUCKET_PATTERN}'" in template
     assert f"AllowedPattern: '{PREFIX_PATTERN}'" in template
     assert f"MaxLength: {MAX_STORE_PREFIX_LENGTH}" in template
@@ -507,21 +968,62 @@ def test_cloudformation_bucket_and_prefix_constraints_refine_s3_config():
 
 def test_list_permission_is_limited_to_gateway_read_namespaces():
     template = (LAMBDA / "template.yaml").read_text()
+    parameter = template.split("HeadPageKeys:", 1)[1].split(
+        "KmsKeyArn:", 1)[0]
     block = template.split(
         "- Sid: DistinguishMissingWorkspaceKeys", 1)[1].split(
-            "- Sid: ReadRoot", 1)[0]
+        "- Sid: ReadPrivateRemovalState", 1)[0]
 
+    assert f"Default: {PAGE_BATCH}" in parameter
+    assert f"AllowedValues: [{PAGE_BATCH}]" in parameter
     assert "Action: s3:ListBucket" in block
     assert '"arn:${AWS::Partition}:s3:::${BucketName}"' in block
-    assert block.count("!Sub") == 4
-    assert '${StorePrefix}/root' in block
+    assert block.count("!Sub") == 6
+    assert '${StorePrefix}/authority' not in block
+    assert '${StorePrefix}/removal' in block
+    assert '${StorePrefix}/removal-node/*' in block
+    assert '${StorePrefix}/heads/${WorkspaceId}/*' in block
     assert '${StorePrefix}/obj/*' in block
     assert '${StorePrefix}/invite/*' in block
     assert '${StorePrefix}/*' not in block
-    assert "s3:max-keys: 1" in block
+    assert "s3:max-keys: !Ref HeadPageKeys" in block
 
 
-def test_applier_bucket_guard_denies_deletes_and_unconditional_writes():
+def test_lambda_private_removal_permissions_are_internal_and_conditional():
+    template = (LAMBDA / "template.yaml").read_text()
+    private_reads = template.split(
+        "- Sid: ReadPrivateRemovalState", 1)[1].split(
+        "- Sid: ReadWriterHeads", 1)[0]
+    ordinary_reads = template.split(
+        "- Sid: ReadImmutableObjects", 1)[1].split(
+        "- Sid: ReadImmutablePacksByScopedRequest", 1)[0]
+    private_writes = template.split(
+        "- Sid: CreatePrivateRemovalNodes", 1)[1].split(
+        "- Sid: CreateImmutablePacksByScopedRequest", 1)[0]
+    mutable_writes = template.split(
+        "- Sid: AdvanceRemovalAndOwnerHeads", 1)[1].split(
+        "- Sid: ReadGrantSecret", 1)[0]
+    public_pack_grants = "\n".join((
+        template.split(
+            "- Sid: ReadImmutablePacksByScopedRequest", 1)[1].split(
+            "- Sid: CreateImmutableObjects", 1)[0],
+        template.split(
+            "- Sid: CreateImmutablePacksByScopedRequest", 1)[1].split(
+            "- Sid: AdvanceRemovalAndOwnerHeads", 1)[0],
+    ))
+
+    assert private_reads.count('${Prefix}/removal"') == 1
+    assert private_reads.count('${Prefix}/removal-node/*') == 1
+    assert "removal" not in ordinary_reads
+    assert private_writes.count('${Prefix}/removal-node/*') == 1
+    assert 's3:if-none-match: "false"' in private_writes
+    assert mutable_writes.count('${Prefix}/removal"') == 1
+    assert '${Prefix}/removal-node/*' not in mutable_writes
+    assert "s3:if-match" not in private_writes
+    assert "removal" not in public_pack_grants
+
+
+def test_gateway_bucket_guard_denies_deletes_and_unconditional_writes():
     document = policy(
         "workspace-bucket", "tenant", profile="bucket-wide")
     statements = {
@@ -533,8 +1035,10 @@ def test_applier_bucket_guard_denies_deletes_and_unconditional_writes():
     assert set(deletion["Action"]) == {
         "s3:DeleteObject", "s3:DeleteObjectVersion"}
     authoritative_resources = [
-        "arn:aws:s3:::workspace-bucket/tenant/root",
+        "arn:aws:s3:::workspace-bucket/tenant/removal",
+        "arn:aws:s3:::workspace-bucket/tenant/heads/*",
         "arn:aws:s3:::workspace-bucket/tenant/obj/*",
+        "arn:aws:s3:::workspace-bucket/tenant/removal-node/*",
     ]
     assert deletion["Resource"] == authoritative_resources
     metadata = statements["DenyAuthoritativeMetadataMutation"]
@@ -555,11 +1059,20 @@ def test_applier_bucket_guard_denies_deletes_and_unconditional_writes():
         for statement in document["Statement"])
     assert statements["RequireImmutableObjectCreate"]["Condition"] == {
         "Null": {"s3:if-none-match": "true"}}
-    assert statements["RequireRootCompareAndSwap"]["Condition"] == {
+    assert statements["RequireImmutableObjectCreate"]["Resource"] == [
+        "arn:aws:s3:::workspace-bucket/tenant/obj/*",
+        "arn:aws:s3:::workspace-bucket/tenant/pack/*",
+        "arn:aws:s3:::workspace-bucket/tenant/removal-node/*",
+    ]
+    assert statements["RequireMutableCompareAndSwap"]["Condition"] == {
         "Null": {
             "s3:if-match": "true",
             "s3:if-none-match": "true",
         }}
+    assert statements["RequireMutableCompareAndSwap"]["Resource"] == [
+        "arn:aws:s3:::workspace-bucket/tenant/removal",
+        "arn:aws:s3:::workspace-bucket/tenant/heads/*",
+    ]
     assert statements["DenyLifecycleMutation"]["Action"] \
         == "s3:PutLifecycleConfiguration"
     guarded_actions = {
@@ -580,23 +1093,23 @@ def test_applier_bucket_guard_denies_deletes_and_unconditional_writes():
     assert guarded_actions.isdisjoint(trusted_replication_actions)
 
 
-def test_single_applier_policy_names_its_residual_trust_boundary():
-    principal = "arn:aws:iam::123456789012:role/poc16-applier"
+def test_single_gateway_policy_names_its_residual_trust_boundary():
+    principal = "arn:aws:iam::123456789012:role/poc16-gateway"
     document = policy(
         "workspace-bucket", "tenant", principal,
-        profile="single-applier")
+        profile="single-gateway")
 
     assert all(
         statement["Principal"] == {"AWS": principal}
         for statement in document["Statement"])
-    with pytest.raises(ValueError, match="does not accept one applier"):
+    with pytest.raises(ValueError, match="does not accept one gateway"):
         policy(
             "workspace-bucket", "tenant", principal,
             profile="bucket-wide")
     with pytest.raises(ValueError, match="principal"):
         policy(
             "workspace-bucket", "tenant",
-            profile="single-applier")
+            profile="single-gateway")
 
 
 def test_deploy_validates_inputs_and_requires_readiness(monkeypatch):
@@ -928,7 +1441,7 @@ def test_readiness_is_bounded_and_requires_explicit_ok(monkeypatch):
 
         @staticmethod
         def read(amount):
-            assert amount == 4097
+            assert amount == MAX_READINESS_RESPONSE_BYTES + 1
             return b'{"ok":true}'
 
     def open_request(request, timeout):

@@ -107,7 +107,7 @@ def _serve(argv):
         help="strict S3/R2 host-store JSON (default: local filesystem)")
     parser.add_argument(
         "--enable-experimental-notifications", action="store_true",
-        help="enable default-off FactTree scanning and FCM delivery")
+        help="enable default-off writer-head scanning and FCM delivery")
     parser.add_argument(
         "--notification-cadence", type=float, default=30.0,
         help="notification scan cadence in seconds (default: 30)")

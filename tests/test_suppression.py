@@ -2,7 +2,7 @@
 import facts
 import pytest
 
-from core.close import decode_pile, encode_pile
+from .util import signed_pile_facts, signed_pile_bytes
 from core.fact import Fact, from_json
 from facts.auth.signature import signature
 from facts.content.file import file
@@ -57,8 +57,8 @@ def test_suppression_marker_survives_the_wire_codec():
     deletion = Fact(
         "sample_delete", 3,
         [action(CONTENT_DELETE, SELF, target.key)], {}, WS)
-    decoded = decode_pile(
-        encode_pile([deletion], workspace=WS), WS)
+    decoded = signed_pile_facts(
+        signed_pile_bytes([deletion], workspace=WS), WS)
 
     assert decoded == [deletion]
     assert is_deletion(decoded[0])
@@ -83,7 +83,7 @@ def test_post_cutover_markerless_content_is_rejected(fact, tmp_path):
         fact.t, node.fact_of(workspace, member).ts + 1, [], body, workspace)
     proof = signature(secret, public, markerless, markerless.ts)
 
-    with pytest.raises(ValueError, match="not admitted"):
+    with pytest.raises(ValueError, match="rejected"):
         node.ingest_new(
             workspace, [proof, markerless],
             {proof.fid: [], markerless.fid: [proof.fid, member]},

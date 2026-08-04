@@ -102,21 +102,18 @@ NOTIFICATION_CORE_MODULES = (
     "crypto.py",
     "fact.py",
     "fact_index.py",
-    "fetch_budget.py",
     "http_body.py",
-    "indexes.py",
-    "ingress.py",
     "kernel.py",
     "limits.py",
     "merkle_map.py",
     "object_store.py",
-    "repository_reader.py",
-    "repository_snapshot.py",
+    "removal_path.py",
     "shape.py",
-    "snapshot.py",
     "suppression.py",
-    "validated_set.py",
-    "worker.py",
+    "suppression_tree.py",
+    "writer_head.py",
+    "writer_repository.py",
+    "writer_tree.py",
 )
 DEPLOY_FILES = (
     "deploy/__init__.py",
@@ -177,11 +174,12 @@ def verify_stage(directory):
         "adapters/aws/sqs.py",
         "adapters/gcp/firebase.py",
         "adapters/s3/store.py",
-        "core/repository_reader.py",
+        "core/writer_repository.py",
         "deploy/aws_notifications/app.py",
         "deploy/aws_notifications/secret.py",
         "facts/auth/push_endpoint.py",
         "notifications/discovery.py",
+        "notifications/forest.py",
         "notifications/hints.py",
         "notifications/worker.py",
         "requirements.txt",
@@ -408,7 +406,7 @@ def _lifecycle_prefix(rule, label):
 
 def _prefixes_overlap(rule_prefix, authoritative_prefix):
     targets = (
-        authoritative_prefix + "/root",
+        authoritative_prefix + "/cursor",
         authoritative_prefix + "/obj/",
     )
     return any(target.startswith(rule_prefix) or rule_prefix.startswith(target)

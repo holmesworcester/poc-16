@@ -31,7 +31,7 @@ from deploy.aws_notifications.config import (
     SCAN_WAKE_SCHEMA,
 )
 from deploy.aws_notifications.secret import push_node_id
-from notifications.hints import NotificationHint, encode_hint
+from notifications.hints import EventRef, NotificationHint, encode_hint
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -415,23 +415,26 @@ def _live_run(documents, calls):
     return run
 
 
-def test_stage_is_importable_and_contains_only_shared_read_side(tmp_path):
+def test_stage_is_importable_and_contains_only_shared_consumer_side(tmp_path):
     staged = manage.stage(tmp_path / "stage")
     for relative in (
             "adapters/aws/sqs.py",
             "adapters/gcp/firebase.py",
             "adapters/s3/store.py",
-            "core/repository_reader.py",
+            "core/writer_repository.py",
             "deploy/notification_launch.py",
             "deploy/aws_notifications/app.py",
             "deploy/aws_notifications/secret.py",
             "facts/auth/push_endpoint.py",
             "notifications/discovery.py",
+            "notifications/forest.py",
             "notifications/hints.py",
             "notifications/worker.py"):
         assert (staged / relative).is_file()
     for forbidden in (
             "core/repository_applier.py",
+            "core/repository_reader.py",
+            "core/repository_snapshot.py",
             "core/store.py",
             "core/grants.py",
             "core/http.py",
@@ -509,11 +512,13 @@ def test_template_keeps_roles_narrow_and_traffic_switches_non_destructive():
     assert "RedrivePolicy:" in template
 
     assert "s3:GetObject" in scanner
+    assert "s3:ListBucket" in scanner
     assert "s3:PutObject" in scanner
     assert "sqs:SendMessage" in scanner
     assert "sqs:ReceiveMessage" not in scanner
     assert "secretsmanager:GetSecretValue" not in scanner
     assert "s3:GetObject" in delivery
+    assert "s3:ListBucket" in delivery
     assert delivery.count("s3:PutObject") == 1
     assert "sqs:SendMessage" not in delivery
     assert "secretsmanager:GetSecretValue" in delivery
@@ -521,18 +526,21 @@ def test_template_keeps_roles_narrow_and_traffic_switches_non_destructive():
     assert "sqs:ReceiveMessage" in delivery
 
     for forbidden in (
-            "s3:ListBucket", "s3:DeleteObject", "AWS::S3::Bucket",
+            "s3:DeleteObject", "AWS::S3::Bucket",
             "RepositoryApplier", "full_peer", "sqlite", "FactOrder"):
         assert forbidden not in template
-    historical = delivery.split("ReadHistoricalNotificationRoot", 1)[1]
+    assert template.count("ListCanonicalWriterHeads") == 2
+    assert template.count(
+        "${CanonicalPrefix}/heads/${WorkspaceId}/*") == 4
+    historical = delivery.split("ReadPendingNotificationFacts", 1)[1]
     assert "${NotificationStatePrefix}/obj/*" in historical
     completion = historical.split("CompleteNotificationCursor", 1)[1].split(
         "ReadExactNotificationSecret", 1)[0]
     historical = historical.split("CompleteNotificationCursor", 1)[0]
     assert "s3:PutObject" not in historical
-    assert "${NotificationStatePrefix}/root" not in historical
+    assert "${NotificationStatePrefix}/cursor" not in historical
     assert "s3:PutObject" in completion
-    assert "${NotificationStatePrefix}/root" in completion
+    assert "${NotificationStatePrefix}/cursor" in completion
     assert "${NotificationStatePrefix}/obj/*" not in completion
 
 
@@ -1863,7 +1871,8 @@ def test_direct_smoke_is_independent_of_production_and_proves_acceptance(
         hint_file=str(tmp_path / "hint.json"), confirm_live_fcm=True)
     raw = encode_hint(NotificationHint(
         WORKSPACE, HINT_OWNER, GENERATION,
-        h(b"event root"), (h(b"event"),)))
+        "d" * 64, None, h(b"writer head"),
+        (EventRef(h(b"event"), h(b"event bytes")),)))
     Path(candidate.hint_file).write_bytes(raw)
     calls = []
     monkeypatch.setattr(
@@ -1924,7 +1933,8 @@ def test_direct_smoke_rejects_no_recipient_retry_and_terminal_outcomes(
         hint_file=str(tmp_path / "hint.json"), confirm_live_fcm=True)
     Path(candidate.hint_file).write_bytes(encode_hint(NotificationHint(
         WORKSPACE, HINT_OWNER, GENERATION,
-        h(b"root"), (h(b"event"),))))
+        "d" * 64, None, h(b"writer head"),
+        (EventRef(h(b"event"), h(b"event bytes")),))))
     monkeypatch.setattr(
         manage, "_owned_stack", lambda _args: stack(
             candidate, enabled=False))
@@ -1945,9 +1955,9 @@ def test_direct_smoke_and_production_defaults_are_separate():
         "deploy", "--stack-name", "stack", "--deployment-id", "deploy-id",
         "--workspace", WORKSPACE,
         "--canonical-bucket", "canonical-bucket",
-        "--canonical-prefix", "canonical/root",
+        "--canonical-prefix", "canonical/data",
         "--state-bucket", "state-bucket",
-        "--state-prefix", "notification/root",
+        "--state-prefix", "notification/state",
         "--expected-owner", ACCOUNT,
         "--notification-secret-arn", SECRET_ARN,
         "--notification-secret-version-id", SECRET_VERSION,

@@ -9,10 +9,11 @@ from core.object_store import (
     validate_key,
     validate_store_prefix,
 )
+from .listing import list_page as _list_page
 
 
 class R2ReadBindingStore:
-    """The complete implementation surface is two bounded read operations."""
+    """Bounded immutable reads plus paginated writer-head discovery."""
 
     __slots__ = ("bucket", "prefix")
 
@@ -76,6 +77,10 @@ class R2ReadBindingStore:
             raise
         except Exception as error:
             raise StoreError(f"R2 versioned read failed for {key}") from error
+
+    async def list_page(self, prefix, cursor=None, limit=256):
+        return await _list_page(
+            self.bucket, self.prefix, prefix, cursor, limit)
 
 
 __all__ = ("R2ReadBindingStore",)

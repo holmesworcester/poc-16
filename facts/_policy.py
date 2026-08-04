@@ -76,11 +76,16 @@ class SidOffer:
 
 @dataclass(frozen=True)
 class FamilyPolicy:
+    control_fact: bool = False
     suppression: tuple[SelectorRule, ...] | None = NEVER
     direct_targets: tuple[DirectTarget, ...] = ()
     owner_field: str | None = None
     authority_liveness_guards: tuple[str, ...] = ()
     principal_offers: tuple[SidOffer, ...] = ()
+    # Extra cells reserved CLEAR without making the fact itself depend on
+    # them. A direct member can reserve its primary device cell while member
+    # liveness remains independent of removal of that one device.
+    clear_offers: tuple[SidOffer, ...] = ()
     action_offers: tuple[SidOffer, ...] = ()
 
 
@@ -93,6 +98,8 @@ def validate_family_policy(policy):
     """Fail closed on every generic declaration before family registration."""
     if not isinstance(policy, FamilyPolicy):
         raise ValueError("family policy type")
+    if type(policy.control_fact) is not bool:
+        raise ValueError("control fact must be bool")
 
     selectors = policy.suppression
     if selectors is not NEVER:
@@ -170,9 +177,10 @@ def validate_family_policy(policy):
         "authority liveness guards",
     )
     principal = _offers(policy.principal_offers, "principal offers")
+    clear = _offers(policy.clear_offers, "clear offers")
     actions = _offers(policy.action_offers, "action offers")
-    if principal & actions:
-        raise ValueError("principal/action offer name conflict")
+    if (principal | clear) & actions:
+        raise ValueError("clear/action offer name conflict")
     return policy
 
 
@@ -268,13 +276,3 @@ def allows_direct_target(policy, action, selector, mode):
         and mode in row.modes
         for row in policy.direct_targets
     )
-
-
-def member_principal(ctx: FactContext, provider_fid, actor_key):
-    """Read the durable principal from one exact ``member(key, owner)`` offer."""
-    owners = {
-        owner
-        for key, owner in ctx.offers_from(provider_fid, "member")
-        if key == actor_key and owner
-    }
-    return next(iter(owners)) if len(owners) == 1 else None

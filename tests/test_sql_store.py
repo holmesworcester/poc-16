@@ -1,16 +1,16 @@
 """The one disposable SQL projection and combined generic index."""
-import json
+import asyncio
 import sqlite3
-
-import pytest
 
 import facts
 
 from core import fact_index
-from core.fact import Fact, canon, decode, encode
+from core.fact import CurrentFact, Fact, current_fact, decode, encode
 from full_peer import sql_store
 from full_peer.node import FullPeer
-from core.repository_snapshot import action_bindings
+from core.writer_repository import FactConsumer, RepositoryMirror
+from facts.auth.signature import signature
+from facts.content.message import legacy_message
 
 
 OBSOLETE_TABLES = {
@@ -24,6 +24,7 @@ OBSOLETE_TABLES = {
     "proofs",
     "staged",
     "supp",
+    "meta",
 }
 
 
@@ -35,24 +36,53 @@ def _tables(db):
     }
 
 
+def _action_bindings(facts_by_fid):
+    selected = {}
+    for fact in facts_by_fid.values():
+        for sid in facts.action_sids(fact):
+            selected[sid] = min(selected.get(sid, fact.fid), fact.fid)
+    return selected
+
+
 def _expected_projection(node, workspace):
-    """Derive exact local rows from one authenticated validated set."""
-    reader = node.reader(workspace)
-    validated = reader.all_facts()
-    facts_by_fid = {
-        fid: encode(fact)
-        for fid, fact in validated.facts.items()
+    """Replay accepted writer trees into an independent in-memory consumer."""
+    consumer = FactConsumer(workspace)
+    result = asyncio.run(RepositoryMirror(
+        workspace,
+        node.store(workspace),
+        node.writer_binding,
+        consumer,
+    ).replay_local())
+    assert result.errors == ()
+    source_by_fid = {
+        fid: consumer.fact_bytes(fid)
+        for fid in consumer.fact_ids()
+    }
+    decoded = {
+        fid: facts.hydrate(decode(raw))
+        for fid, raw in source_by_fid.items()
     }
     rows = {
         row
-        for fact in validated.facts.values()
+        for fact in decoded.values()
         for row in fact_index.index_rows(fact)
     }
     rows.update(
         (fact_index.ACTION_INDEX, sid, "", fid)
-        for sid, fid in action_bindings(validated.facts).items()
+        for sid, fid in _action_bindings(decoded).items()
     )
-    return facts_by_fid, rows
+    return {
+        fid: sql_store._encode_current(decode(raw))
+        for fid, raw in source_by_fid.items()
+    }, rows
+
+
+def _durable_heads(node, workspace):
+    store = node.store(workspace)
+    return {
+        key: store.get(key)
+        for key in store.list(f"heads/{workspace}/")
+    }
 
 
 def _assert_exact_projection(node, workspace):
@@ -66,14 +96,10 @@ def _assert_exact_projection(node, workspace):
 
     assert actual_facts == expected_facts
     assert actual_rows == expected_rows
-    assert _tables(db) == {"facts", "fact_index", "meta"}
-    assert set(
-        key for (key,) in db.execute("SELECT k FROM meta")
-    ) == {"root"}
+    assert _tables(db) == {"facts", "fact_index", "projected_heads"}
     for fid, raw in actual_facts.items():
-        fact = decode(raw)
+        _source, fact = sql_store._decode_current(raw)
         assert fact.fid == fid
-        assert encode(fact) == raw
 
 
 def test_sql_store_has_one_blob_table_and_one_exact_combined_index(tmp_path):
@@ -117,7 +143,7 @@ def test_public_queries_restart_from_the_same_disposable_rows(tmp_path):
     keep = facts.content.message.post(node, workspace, "general", "keep", ts=2)
     remove = facts.content.message.post(node, workspace, "general", "remove", ts=3)
     facts.content.delete.remove(node, workspace, remove, ts=4)
-    root = node.reader(workspace).root_bytes
+    heads = _durable_heads(node, workspace)
     expected = {
         "members": facts.auth.user.members(node, workspace),
         "messages": facts.content.message.messages(node, workspace),
@@ -129,7 +155,7 @@ def test_public_queries_restart_from_the_same_disposable_rows(tmp_path):
 
     reopened = FullPeer(str(directory))
 
-    assert reopened.reader(workspace).root_bytes == root
+    assert _durable_heads(reopened, workspace) == heads
     assert facts.auth.user.members(reopened, workspace) == expected["members"]
     assert facts.content.message.messages(reopened, workspace) == expected["messages"]
     assert dict(reopened.idx(workspace).execute(
@@ -140,86 +166,107 @@ def test_public_queries_restart_from_the_same_disposable_rows(tmp_path):
     assert not (directory / "app.db").exists()
 
 
-def test_legacy_authority_schema_is_discarded_then_root_refreshed(
+def test_app_version_replays_legacy_source_into_current_serialized_form(
         tmp_path):
     directory = tmp_path / "node"
     node = FullPeer(str(directory))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
-    message_fid = facts.content.message.post(
-        node, workspace, "general", "survives cut", ts=2)
-    root = node.reader(workspace).root_bytes
+    secret, writer = node.identity(workspace)
+    root = node.fact_of(workspace, workspace)
+    legacy = legacy_message(
+        workspace, writer, "general", "survives cut", 2, writer)
+    node.publish_closed(workspace, ((
+        root,
+        signature(secret, writer, legacy, 2),
+        legacy,
+    ),))
+    message_fid = legacy.fid
+    heads = _durable_heads(node, workspace)
     path = directory / "ws" / f"{workspace}.idx.db"
     node.idx(workspace).close()
 
+    # This is the disposable projection an older application left behind.
+    # Durable writer-pile bytes already contain the exact legacy source.
     db = sqlite3.connect(path)
-    db.executescript("""
-        DROP TABLE facts;
-        DROP TABLE fact_index;
-        CREATE TABLE facts(
-            fid TEXT PRIMARY KEY, ts INT, t TEXT, j TEXT, admitted INT);
-        CREATE TABLE fact_index(
-            kind TEXT, k0 TEXT, k1 TEXT, src TEXT);
-        CREATE TABLE action_proposals(value TEXT);
-        CREATE TABLE action_targets(value TEXT);
-        CREATE TABLE actions(value TEXT);
-        CREATE TABLE admission_receipts(value TEXT);
-        CREATE TABLE edges(value TEXT);
-        CREATE TABLE log(value TEXT);
-        CREATE TABLE offers(value TEXT);
-        CREATE TABLE proofs(value TEXT);
-        CREATE TABLE staged(value TEXT);
-        CREATE TABLE supp(value TEXT);
-        CREATE INDEX fact_keys ON fact_index(k0,src);
-        CREATE INDEX fact_boundaries ON fact_index(k0,src);
-        PRAGMA user_version=0;
-    """)
+    db.execute(f"PRAGMA user_version={facts.APP_VERSION - 1}")
+    db.execute(
+        "UPDATE facts SET blob=? WHERE fid=?",
+        (encode(legacy), legacy.fid),
+    )
     local_only = Fact(
-        "legacy",
+        "obsolete_local",
         3,
         [],
         {"value": "must be discarded"},
         workspace,
     )
     db.execute(
-        "INSERT INTO facts VALUES(?,?,?,?,?)",
-        (
-            local_only.fid,
-            local_only.ts,
-            local_only.t,
-            json.dumps(local_only.to_json()),
-            1,
-        ),
-    )
-    db.execute(
-        "INSERT OR REPLACE INTO meta VALUES('obsolete',?)",
-        ("legacy-projection-v27",),
+        "INSERT INTO facts VALUES(?,?)",
+        (local_only.fid, encode(local_only)),
     )
     db.commit()
     db.close()
 
     reopened = FullPeer(str(directory))
     upgraded = reopened.idx(workspace)
+    stored = reopened.sql(workspace).stored_bytes(message_fid)
+    source, form = sql_store._decode_current(stored)
 
-    assert reopened.reader(workspace).root_bytes == root
-    assert reopened.fact_of(workspace, message_fid) is not None
+    assert _durable_heads(reopened, workspace) == heads
+    assert isinstance(form, CurrentFact)
+    assert source == legacy
+    assert current_fact(form).t == "msg"
+    assert current_fact(form).body == {
+        "pk": writer,
+        "owner": writer,
+        "chan": "general",
+        "text": "survives cut",
+    }
+    assert form.fid == message_fid
+    assert stored != encode(legacy)
+    assert reopened.sql(workspace).fact_bytes(message_fid) == encode(legacy)
+    assert reopened.sql(workspace).source_fact_of(message_fid) == legacy
     assert reopened.fact_of(
         workspace, local_only.fid) is None
-    assert _tables(upgraded) == {"facts", "fact_index", "meta"}
-    assert _tables(upgraded).isdisjoint(OBSOLETE_TABLES)
+    assert _tables(upgraded) == {
+        "facts", "fact_index", "projected_heads"}
+    assert upgraded.execute("PRAGMA user_version").fetchone()[0] \
+        == facts.APP_VERSION
     assert upgraded.execute(
-        "SELECT 1 FROM sqlite_master "
-        "WHERE type='index' AND name IN "
-        "('fact_keys','fact_boundaries')"
+        "SELECT 1 FROM facts WHERE fid=?", (local_only.fid,)
     ).fetchone() is None
-    _assert_exact_projection(reopened, workspace)
+    assert upgraded.execute(
+        "SELECT 1 FROM fact_index WHERE kind=? AND k0='msg' AND src=?",
+        (fact_index.TYPE_INDEX, message_fid),
+    ).fetchone() == (1,)
+    assert upgraded.execute(
+        "SELECT 1 FROM fact_index WHERE kind=? AND k0='msg.v0' AND src=?",
+        (fact_index.TYPE_INDEX, message_fid),
+    ).fetchone() is None
+    assert facts.content.message.messages(reopened, workspace) == [{
+        "chan": "general",
+        "from": "alice",
+        "text": "survives cut",
+        "mentions": [],
+        "ts": 2,
+        "fid": message_fid,
+    }]
+
+    # A current dependent closes over and republishes the exact legacy source;
+    # only the disposable semantic view is current.
+    facts.content.delete.remove(reopened, workspace, message_fid, ts=3)
+    assert facts.content.message.messages(reopened, workspace) == []
+    current_blob = reopened.sql(workspace).stored_bytes(message_fid)
+    reopened.rebuild(workspace)
+    assert reopened.sql(workspace).stored_bytes(message_fid) == current_blob
 
 
-def test_root_refresh_replaces_stale_missing_and_extra_rows(tmp_path):
+def test_projection_rebuild_replaces_stale_missing_and_extra_rows(tmp_path):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     message_fid = facts.content.message.post(
         node, workspace, "general", "kept", ts=2)
-    root = node.reader(workspace).root_bytes
+    heads = _durable_heads(node, workspace)
     db = node.idx(workspace)
     db.execute(
         "DELETE FROM fact_index WHERE src=?", (message_fid,))
@@ -233,30 +280,10 @@ def test_root_refresh_replaces_stale_missing_and_extra_rows(tmp_path):
 
     node.rebuild(workspace)
 
-    assert node.reader(workspace).root_bytes == root
+    assert _durable_heads(node, workspace) == heads
     _assert_exact_projection(node, workspace)
     assert [row["fid"] for row in facts.content.message.messages(
         node, workspace)] == [message_fid]
-
-
-def test_foreign_root_format_fails_closed_without_local_republish(
-        tmp_path):
-    directory = tmp_path / "node"
-    node = FullPeer(str(directory))
-    workspace = facts.auth.workspace.create(node, "alice", ts=1)
-    facts.content.message.post(node, workspace, "general", "kept", ts=2)
-    store = node.store(workspace)
-    value = json.loads(store.get("root"))
-    value["stamp"] = "obsolete-or-foreign-layout"
-    foreign = canon(value)
-    store._replace("root", foreign)
-    node.idx(workspace).close()
-
-    with pytest.raises(ValueError, match="root shape"):
-        FullPeer(str(directory))
-
-    assert store.get("root") == foreign
-
 
 def test_index_lookup_decodes_only_selected_fact_bodies(
         tmp_path, monkeypatch):

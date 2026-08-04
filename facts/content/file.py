@@ -3,10 +3,11 @@ import os
 import tempfile
 
 from core.fact_index import REF_INDEX, TYPE_INDEX
-from core.fact import Fact, Need
+from core.fact import Fact
 from core.shape import valid_fid
 from .._policy import DELETE_SELF, FamilyPolicy, Self, author_selectors
-from .._commands import direct_upload, member_source
+from .._commands import member_source
+from .._identity import actor_needs
 from ..auth import signature
 from .. import _bao as bao
 from . import file_slice as slices
@@ -41,10 +42,7 @@ def file(workspace, pk, channel, name, size, root, ts, owner=None):
 def needs(fact):
     pk = fact.body.get("pk", "")
     owner = fact.body.get("owner", "")
-    return (
-        Need("author", "author", fact.fid, pk),
-        Need("member", "member", pk, owner),
-    )
+    return actor_needs(fact, pk, owner)
 
 
 # VALIDATE
@@ -86,9 +84,9 @@ def _stable(stat):
 def _author(node, workspace, channel, path, name, ts, emit):
     """Prove one stable source and emit descriptor-first closed piles.
 
-    Every call to ``emit(raw, fid)`` receives one independently valid ordinary
-    pile: first the signed descriptor closure, then exactly one unsigned slice
-    plus that same closure. No detached completion channel exists.
+    Every call to ``emit(closure, fid)`` receives one independently valid
+    closure: first the signed descriptor, then exactly one Bao slice plus that
+    descriptor closure. Each unit becomes an ordinary writer-tree leaf.
     """
     native = node.attachment_io()
     timestamp = node.now_ms() if ts is None else ts
@@ -119,13 +117,13 @@ def _author(node, workspace, channel, path, name, ts, emit):
             [signed, descriptor],
             {signed.fid: [], descriptor.fid: [signed.fid, member]},
         )
-        emit(sender.pack(descriptor_closed), descriptor.fid)
+        emit(tuple(descriptor_closed), descriptor.fid)
 
         for index in range(bao.geometry(size)):
             proof = native.proof(source, outboard, index, size)
             item = slices.file_slice(
                 workspace, descriptor.fid, index, proof, timestamp)
-            emit(sender.pack((*descriptor_closed, item)), item.fid)
+            emit((*descriptor_closed, item), item.fid)
 
         if _stable(os.stat(source)) != _stable(initial):
             raise ValueError("file changed while it was being proved")
@@ -133,62 +131,14 @@ def _author(node, workspace, channel, path, name, ts, emit):
 
 
 def send(node, workspace, channel, path, name=None, ts=None):
-    """Publish the descriptor and each inline range through the one Applier."""
-    def receive(raw, expected):
-        node.receive_pile(workspace, node.member_for(workspace), raw)
+    """Publish the descriptor and each inline range as writer-tree leaves."""
+    def receive(closed, expected):
+        node.publish_closed(workspace, (closed,))
         if node.fact_of(workspace, expected) is None:
             raise ValueError(f"authored fact was not admitted: {expected}")
 
     return _author(
         node, workspace, channel, path, name, ts, receive).fid
-
-
-def upload(
-        node, workspace, channel, path, broker_url, provider_origin,
-        name=None, ts=None):
-    """Upload and collect each pile before authoring the next Bao slice."""
-    count = 0
-
-    def deliver(raw, _expected):
-        nonlocal count
-        source = node.create_upload(workspace, raw)
-        result = direct_upload(
-            node, workspace, source, broker_url, provider_origin)
-        count += 1
-        if result["status"] == "rejected":
-            raise ValueError(
-                f"upload rejected; retained source {source.source_id}")
-
-    descriptor = _author(
-        node, workspace, channel, path, name, ts, deliver)
-    return {"fid": descriptor.fid, "piles": count}
-
-
-def resume_upload(
-        node, workspace, upload_id, broker_url, provider_origin):
-    if not valid_fid(upload_id):
-        raise ValueError("upload id")
-    return direct_upload(
-        node, workspace, node.load_upload(upload_id),
-        broker_url, provider_origin)
-
-
-def uploads(node, workspace, cursor=None):
-    if cursor is not None and not valid_fid(cursor):
-        raise ValueError("upload cursor")
-    return node.upload_status(workspace, cursor)
-
-
-def abandon_upload(node, workspace, upload_id):
-    if not valid_fid(upload_id):
-        raise ValueError("upload id")
-    return node.abandon_upload(workspace, upload_id)
-
-
-def collect_upload(node, workspace, upload_id):
-    if not valid_fid(upload_id):
-        raise ValueError("upload id")
-    return node.collect_upload(workspace, upload_id)
 
 
 # QUERIES
@@ -213,7 +163,7 @@ def _record(descriptor, have):
 def _states(node, workspace, selector=None):
     """Pin only the selected descriptor's proof facts; lists count indexes."""
     with node.lock:
-        node._sync_sql(workspace)
+        node._ensure_projection(workspace)
         admitted = node.sql(workspace)
 
         def select(kind, k0=None, k1=None, **filters):
@@ -282,7 +232,7 @@ def _resolve_state(node, workspace, selector):
 def _payloads(node, workspace, record, descriptor, by_index):
     for index in range(record["total"]):
         with node.lock:
-            item = node.sql(workspace).fact(by_index[index])
+            item = node.sql(workspace).fact_of(by_index[index])
         if item is None:
             raise ValueError("file slice disappeared from validated storage")
         yield slices.payload(item, descriptor)
@@ -325,12 +275,7 @@ def save(node, workspace, selector, out_path):
 
 
 CLI = {
-    "content.file.abandon_upload": abandon_upload,
-    "content.file.collect_upload": collect_upload,
     "content.file.list": files,
-    "content.file.resume_upload": resume_upload,
     "content.file.save": save,
     "content.file.send": send,
-    "content.file.upload": upload,
-    "content.file.uploads": uploads,
 }

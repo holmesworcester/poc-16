@@ -6,10 +6,23 @@ Scope packages are deliberately just tables of contents.
 import inspect
 
 from . import auth, content
-from core.suppression import deathkey, is_deletion, scoped_id, suppkeys
+from core.limits import MAX_REMOVAL_UPDATES
+from core.shape import valid_fid
+from core.suppression import (
+    deathkey,
+    is_deletion,
+    scoped_id,
+    suppkeys,
+    suppression_slot,
+)
 from ._policy import validate_fact_policy, validate_family_policy
 
 MODULES = auth.MODULES + content.MODULES
+
+# Bump for any change in family extraction, policy, or query interpretation
+# that must rebuild the disposable full-peer projection.  Canonical fact
+# bytes and writer trees are never migrated; current code replays them.
+APP_VERSION = 4
 
 
 def _principal_namespaces(modules):
@@ -36,6 +49,18 @@ def compile_families(modules):
         raise ValueError("every fact family must own its policy")
     for module in modules:
         validate_family_policy(module.POLICY)
+    shapes = {}
+    for module in modules:
+        declared = getattr(module, "SHAPES", (module.TAG,))
+        if not isinstance(declared, tuple) or not declared \
+                or module.TAG not in declared \
+                or len(set(declared)) != len(declared) \
+                or not all(isinstance(tag, str) and tag for tag in declared):
+            raise ValueError("bad fact family shapes")
+        for tag in declared:
+            if tag in shapes:
+                raise ValueError("duplicate fact shape tag")
+            shapes[tag] = module
     _principal_namespaces(modules)
     if sum(bool(getattr(module, "GENESIS", False)) for module in modules) != 1:
         raise ValueError("exactly one genesis family required")
@@ -43,7 +68,12 @@ def compile_families(modules):
 
 
 FAMILIES = compile_families(MODULES)
-MAX_AUTHORITY_SCOPES = 64
+SHAPE_FAMILIES = {
+    tag: module
+    for module in MODULES
+    for tag in getattr(module, "SHAPES", (module.TAG,))
+}
+MAX_CURRENT_SCOPES = 64
 
 
 PRINCIPAL_NAMESPACES = _principal_namespaces(MODULES)
@@ -93,13 +123,13 @@ def compile_proof_commands(modules):
 PROOF_COMMANDS = compile_proof_commands(MODULES)
 
 
-def proof_payload(node, workspace, purpose, exp, ts):
+def proof_payload(node, workspace, purpose, exp, ts, **context):
     """Ask the registered fact family to author one ephemeral proof closure."""
     try:
         command = PROOF_COMMANDS[purpose]
     except KeyError:
         raise ValueError(f"unknown proof purpose: {purpose}") from None
-    return command(node, workspace, purpose, exp, ts)
+    return command(node, workspace, purpose, exp, ts, **context)
 
 
 def workspace_for(node, prefix):
@@ -131,7 +161,238 @@ def invoke_command(node, path, argv):
 
 def family_for(tag):
     """The one checked dispatch table: behavior and policy travel together."""
-    return FAMILIES.get(tag)
+    return FAMILIES.get(tag) or SHAPE_FAMILIES.get(tag)
+
+
+def hydrate(source):
+    """Purely re-extract one retained source into current family vocabulary."""
+    from core.fact import CurrentFact, Fact
+
+    if not isinstance(source, Fact):
+        raise TypeError("source fact")
+    family = family_for(source.t)
+    if family is None or source.t == family.TAG:
+        return source
+    reextract = getattr(family, "reextract", None)
+    if not callable(reextract):
+        raise ValueError("legacy fact shape has no re-extractor")
+    current = reextract(source)
+    if not isinstance(current, Fact) or current.t != family.TAG \
+            or current.ts != source.ts or current.ws != source.ws:
+        raise ValueError("fact re-extraction")
+    return CurrentFact(source, current)
+
+
+def control_projection(stream):
+    """Select the fact-declared durable control subset of one closure.
+
+    Families may narrow replay residence when a generic evidence fact is
+    useful only for a particular target.  The signature family uses this to
+    retain signatures of authority facts without growing the authority tree
+    with signatures of every message or file slice.
+    """
+    sources = tuple(stream)
+    current = tuple(hydrate(fact) for fact in sources)
+    by_fid = {fact.fid: fact for fact in current}
+    if len(by_fid) != len(current):
+        raise ValueError("control projection duplicate")
+    selected = []
+    for source, fact in zip(sources, current):
+        family = family_for(fact.t)
+        if family is None or not family.DURABLE \
+                or not family.POLICY.control_fact:
+            continue
+        refine = getattr(family, "project_control", None)
+        if refine is None or refine(fact, by_fid.get):
+            selected.append(source)
+    return tuple(selected)
+
+
+def semantic_evaluation(judgment, stream):
+    """Return current-form receipts and stream for post-kernel policy.
+
+    Kernel receipts deliberately retain exact source facts for durable
+    storage.  Family authorization is semantic work and must never fall back
+    to an old source vocabulary after the kernel already hydrated it.
+    """
+    if getattr(judgment, "ok", None) is not True:
+        raise ValueError("semantic evaluation judgment")
+    current_stream = tuple(hydrate(source) for source in stream)
+    by_fid = {fact.fid: fact for fact in current_stream}
+    if len(by_fid) != len(current_stream):
+        raise ValueError("semantic evaluation duplicate")
+    try:
+        receipts = tuple(
+            valid._replace(fact=by_fid[valid.fact.fid])
+            for valid in judgment.valids
+        )
+    except KeyError as error:
+        raise ValueError("semantic evaluation receipt") from error
+    return receipts, current_stream
+
+
+def _control_receipts(judgment, stream):
+    """Return current receipts for one all-control kernel judgment."""
+    valids, current_stream = semantic_evaluation(judgment, stream)
+    current = tuple(valid.fact for valid in valids)
+    if len(current) != len(current_stream) or any(
+            (family := family_for(fact.t)) is None or not family.DURABLE
+            for fact in current):
+        raise ValueError("control pile contains non-durable fact")
+    # Project from the retained source bytes. ``control_projection`` performs
+    # the one hydration itself and deliberately returns sources for storage.
+    # Passing ``current_stream`` here would attempt to hydrate CurrentFact a
+    # second time during an application-version replay.
+    selected = control_projection(stream)
+    if tuple(fact.fid for fact in selected) != tuple(
+            fact.fid for fact in current):
+        raise ValueError("control pile contains ordinary content")
+    return valids, current
+
+
+def control_evaluation(judgment, stream):
+    """Require one evaluated pile to contain only declared control facts.
+
+    This is a classification of the same kernel judgment, not a second
+    validator. Generic signatures qualify only when their exact target in the
+    closure is itself family-declared control material.
+    """
+    _valids, current = _control_receipts(judgment, stream)
+    return current
+
+
+def has_control_action_sink(judgment, stream):
+    """Whether an evaluated pile hides an independent suppressing action.
+
+    Ordinary content closures repeat membership and signature facts as named
+    dependencies, and may also repeat a device proof as a harmless independent
+    CLEAR sink.  Neither is a new suppressing turn.  An independent sink with
+    an ACTIVE route is state-changing and may not hide beside ordinary
+    content or another sink.
+    """
+    valids, _current_stream = semantic_evaluation(judgment, stream)
+    dependencies = {
+        edge.fid
+        for valid in valids
+        for edge in valid.edges
+    }
+    return any(
+        valid.fact.fid not in dependencies
+        and (family := family_for(valid.fact.t)) is not None
+        and family.DURABLE
+        and family.POLICY.control_fact
+        and action_sids(valid.fact)
+        for valid in valids
+    )
+
+
+def control_sink(judgment, stream):
+    """Select the one semantic mutation whose dependencies close this pile.
+
+    Closed piles carry a complete validation closure. Replaying every provider
+    as a new removal mutation makes work grow with delegation depth and with
+    repeated evidence. The semantic sink is the sole fact not consumed as a
+    named dependency by another receipt. A caller with several independent
+    mutations must send several independently closed piles.
+    """
+    valids, current = _control_receipts(judgment, stream)
+    dependencies = {
+        edge.fid
+        for valid in valids
+        for edge in valid.edges
+    }
+    sinks = tuple(
+        fact for fact in current
+        if fact.fid not in dependencies
+    )
+    if len(sinks) != 1:
+        raise ValueError("control pile needs one semantic sink")
+    return sinks[0]
+
+
+def removal_state_updates(judgment, stream):
+    """Derive the one sink fact's tiny deterministic ACI update."""
+    fact = control_sink(judgment, stream)
+    rows = {
+        sid: suppression_slot()
+        for sid in current_scopes(fact) | clear_sids(fact)
+    }
+    rows.update(
+        (sid, suppression_slot(fact.fid))
+        for sid in action_sids(fact)
+    )
+    if len(rows) > MAX_REMOVAL_UPDATES:
+        raise ValueError("fact exceeds removal-state route budget")
+    return tuple(sorted(rows.items()))
+
+
+def bootstrap_member(judgment, stream, writer):
+    """Select the one direct member fact naming a bootstrap pile's writer."""
+    if not valid_fid(writer):
+        raise ValueError("bootstrap writer")
+    sink = control_sink(judgment, stream)
+    if ("member", writer, writer) not in sink.offers():
+        raise ValueError("bootstrap direct member")
+    return sink
+
+
+def authorize_writer_head(
+        judgment, stream, view, writer, proposed_head, trusted_now):
+    """Dispatch one pinned-current exact-head decision through its family."""
+    decisions = []
+    valids, current_stream = semantic_evaluation(judgment, stream)
+    for valid in valids:
+        family = family_for(valid.fact.t)
+        authorize = getattr(family, "authorize_head", None)
+        if callable(authorize):
+            decision = authorize(
+                view, valid, current_stream,
+                writer, proposed_head, trusted_now)
+            if decision is not None:
+                decisions.append(decision)
+    return decisions[0] if len(decisions) == 1 else None
+
+
+def authorize_removal_path(judgment, stream, writer, trusted_now):
+    """Dispatch exactly one historical path request from one signed pile."""
+    valids, current_stream = semantic_evaluation(judgment, stream)
+    requests = []
+    for valid in valids:
+        family = family_for(valid.fact.t)
+        authorize = getattr(family, "authorize_path", None)
+        if callable(authorize):
+            requests.append(authorize(
+                valid, current_stream, writer, trusted_now))
+    accepted = [request for request in requests if request is not None]
+    return accepted[0] if len(requests) == 1 and len(accepted) == 1 else None
+
+
+def authorize_access(
+        judgment, stream, view, trusted_now, *, purpose, writer=None):
+    """Dispatch one ephemeral access request from a signed pile judgment.
+
+    The caller supplies a verifier-pinned current-authority view.  The pile
+    supplies its complete historical membership closure, while the view
+    decides whether the exact selected provider is still current and clear.
+    """
+    valids, current_stream = semantic_evaluation(judgment, stream)
+    ephemeral = []
+    for valid in valids:
+        family = family_for(valid.fact.t)
+        if family is not None and not family.DURABLE:
+            ephemeral.append((family, valid))
+    if len(ephemeral) != 1:
+        return None
+    family, valid = ephemeral[0]
+    authorize = getattr(family, "authorize", None)
+    return authorize(
+        view,
+        valid,
+        current_stream,
+        trusted_now,
+        purpose=purpose,
+        writer=writer,
+    ) if callable(authorize) else None
 
 
 def is_genesis(tag):
@@ -161,6 +422,13 @@ def principal_sids(fact):
         _offer_sids(fact, family.POLICY.principal_offers))
 
 
+def clear_sids(fact):
+    """Extra family-declared cells reserved without guarding this fact."""
+    family = family_for(fact.t)
+    return frozenset() if family is None else frozenset(
+        _offer_sids(fact, family.POLICY.clear_offers))
+
+
 def authority_scopes(fact):
     """Return continuing-liveness ids declared by this fact's own policy.
 
@@ -187,7 +455,7 @@ def authority_scopes(fact):
         # the concrete signing key. Direct users have the same value in both
         # positions; devices thereby inherit their owner's liveness.
         out.add(principal_sid(namespace, need.a1 or need.a0))
-    if len(out) > MAX_AUTHORITY_SCOPES:
+    if len(out) > MAX_CURRENT_SCOPES:
         raise ValueError("authority liveness scope budget")
     return frozenset(out)
 

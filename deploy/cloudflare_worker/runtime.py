@@ -1,25 +1,30 @@
 """Cloudflare request and binding translation around the shared HttpGate."""
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 from time import time_ns
 from urllib.parse import parse_qs, urlsplit
 
 from adapters.r2.worker import R2BindingStore
 from core import peer_capability
+from core.access import AccessGate
 from core.crypto import load_sk, sign, verify
 from core.limits import (
-    MAX_MINT_FETCHES as CORE_MAX_MINT_FETCHES,
-    MAX_MINT_FETCH_BYTES as CORE_MAX_MINT_FETCH_BYTES,
     MAX_MINT_REQUEST_BYTES,
     MAX_OBJECT_BYTES as CORE_MAX_OBJECT_BYTES,
     MAX_PAGE_BATCH_BYTES,
-    MAX_ROOT_BYTES as CORE_MAX_ROOT_BYTES,
     PAGE_BATCH,
 )
 from core.shape import valid_fid
-from core.http import HttpGate, Response
+from core.http import HttpGate, MAX_HEAD_CONTROL_REQUEST_BYTES, Response
 from core.object_store import validate_store_prefix
+from core.writer_repository import OpaqueHeadGate
+from deploy.cloudflare_pack.contract import (
+    PACK_TICKET_SECRET_BYTES,
+    R2PackTarget,
+)
+from deploy.cloudflare_pack.issuer import R2PackIssuer
+from deploy.cloudflare_pack.put import R2ImmutablePut
 
 if __package__:
     from .crypto_compat import seal_to, unseal
@@ -27,25 +32,22 @@ else:
     from crypto_compat import seal_to, unseal
 
 MAX_REQUEST_BYTES = min(512 * 1024, MAX_MINT_REQUEST_BYTES)
-MAX_ROOT_BYTES = min(64 * 1024, CORE_MAX_ROOT_BYTES)
+MAX_CONTROL_BYTES = MAX_HEAD_CONTROL_REQUEST_BYTES
 MAX_OBJECT_BYTES = CORE_MAX_OBJECT_BYTES
 MAX_BATCH_COUNT = min(48, PAGE_BATCH)
 MAX_BATCH_BYTES = min(4 * 1024 * 1024, MAX_PAGE_BATCH_BYTES)
-MAX_MINT_FETCHES = min(48, CORE_MAX_MINT_FETCHES)
-MAX_MINT_FETCH_BYTES = min(
-    MAX_MINT_FETCHES * 8 * 1024, CORE_MAX_MINT_FETCH_BYTES)
 MAX_QUERY_BYTES = 4 * 1024
 MAX_QUERY_FIELDS = 8
 MAX_GRANT_TTL_MS = 60_000
+EDGE_SECRET_BYTES = 32
+PERMIT_SECRET_BYTES = 32
 
 _BUDGETS = {
     "MAX_REQUEST_BYTES": MAX_REQUEST_BYTES,
-    "MAX_ROOT_BYTES": MAX_ROOT_BYTES,
+    "MAX_CONTROL_BYTES": MAX_CONTROL_BYTES,
     "MAX_OBJECT_BYTES": MAX_OBJECT_BYTES,
     "MAX_BATCH_COUNT": MAX_BATCH_COUNT,
     "MAX_BATCH_BYTES": MAX_BATCH_BYTES,
-    "MAX_MINT_FETCHES": MAX_MINT_FETCHES,
-    "MAX_MINT_FETCH_BYTES": MAX_MINT_FETCH_BYTES,
     "MAX_QUERY_BYTES": MAX_QUERY_BYTES,
     "MAX_QUERY_FIELDS": MAX_QUERY_FIELDS,
     "GRANT_TTL_MS": MAX_GRANT_TTL_MS,
@@ -61,9 +63,9 @@ def _crypto_self_test():
     global _CRYPTO_READY
     if _CRYPTO_READY:
         return
-    secret = load_sk("42" * 32)
+    secret = load_sk("42" * EDGE_SECRET_BYTES)
     public = secret.verify_key.encode().hex()
-    message = "poc-16-cloudflare-python-compatibility"
+    message = "poc-16-cloudflare-python-self-test"
     signature = sign(secret, message)
     if not verify(public, message, signature):
         raise RuntimeError("Cloudflare PyNaCl Ed25519 self-test")
@@ -95,19 +97,40 @@ def _budget(env, name):
     return value
 
 
+def _integer(env, name):
+    value = _text(env, name)
+    if not value.isascii() or not value.isdecimal() \
+            or str(int(value)) != value:
+        raise ValueError(f"{name} binding")
+    return int(value)
+
+
+def _secret(env, name, expected_bytes):
+    try:
+        secret = base64.b64decode(_text(env, name), validate=True)
+    except (ValueError, TypeError) as error:
+        raise ValueError(f"{name} binding") from error
+    if len(secret) != expected_bytes:
+        raise ValueError(f"{name} binding")
+    return secret
+
+
 @dataclass(frozen=True)
 class Settings:
     bucket: object
     workspace: str
     prefix: str
-    secret: bytes
+    grant_secret: bytes = field(repr=False)
+    permit_secret: bytes = field(repr=False)
+    pack_target: R2PackTarget
+    r2_access_key_id: str = field(repr=False)
+    r2_secret_access_key: str = field(repr=False)
+    pack_ticket_secret: bytes = field(repr=False)
     max_request_bytes: int
-    max_root_bytes: int
+    max_control_bytes: int
     max_object_bytes: int
     max_batch_count: int
     max_batch_bytes: int
-    max_mint_fetches: int
-    max_mint_fetch_bytes: int
     max_query_bytes: int
     max_query_fields: int
     grant_ttl_ms: int
@@ -122,32 +145,65 @@ class Settings:
             validate_store_prefix(prefix)
         except (TypeError, ValueError, UnicodeError) as error:
             raise ValueError("STORE_PREFIX binding") from error
-        try:
-            secret = base64.b64decode(
-                _text(env, "GRANT_SECRET"), validate=True)
-        except (ValueError, TypeError) as error:
-            raise ValueError("GRANT_SECRET binding") from error
-        if len(secret) != 32:
-            raise ValueError("GRANT_SECRET binding")
-        return cls(
-            getattr(env, "BUCKET"),
-            workspace,
+        bucket = getattr(env, "BUCKET")
+        grant_secret = _secret(env, "GRANT_SECRET", EDGE_SECRET_BYTES)
+        permit_secret = _secret(
+            env, "PERMIT_SECRET", PERMIT_SECRET_BYTES)
+        if permit_secret == grant_secret:
+            raise ValueError(
+                "PERMIT_SECRET binding must differ from GRANT_SECRET")
+        ticket_secret = _secret(
+            env, "PACK_TICKET_SECRET", PACK_TICKET_SECRET_BYTES)
+        target = R2PackTarget(
+            _text(env, "R2_ENDPOINT"),
+            _text(env, "PACK_BUCKET"),
             prefix,
-            secret,
-            *(_budget(env, name) for name in _BUDGETS),
+            _text(env, "PACK_PUT_ENDPOINT"),
+            _integer(env, "PACK_TTL_SECONDS"),
+        )
+        access_key_id = _text(env, "R2_ACCESS_KEY_ID")
+        secret_access_key = _text(env, "R2_SECRET_ACCESS_KEY")
+        R2PackIssuer(
+            target,
+            access_key_id,
+            secret_access_key,
+            ticket_secret,
+            clock=lambda: 0,
+        )
+        R2ImmutablePut(target, bucket, ticket_secret, clock=lambda: 0)
+        budgets = {
+            name.lower(): _budget(env, name)
+            for name in _BUDGETS
+        }
+        return cls(
+            bucket=bucket,
+            workspace=workspace,
+            prefix=prefix,
+            grant_secret=grant_secret,
+            permit_secret=permit_secret,
+            pack_target=target,
+            r2_access_key_id=access_key_id,
+            r2_secret_access_key=secret_access_key,
+            pack_ticket_secret=ticket_secret,
+            **budgets,
         )
 
+    def issue_packs(self, clock):
+        return R2PackIssuer(
+            self.pack_target,
+            self.r2_access_key_id,
+            self.r2_secret_access_key,
+            self.pack_ticket_secret,
+            clock=clock,
+        )
 
-class ReadOnlyStore:
-    """Narrow an R2 ObjectStore binding to the HttpGate's read capability."""
-
-    __slots__ = ("_store",)
-
-    def __init__(self, bucket, prefix):
-        self._store = R2BindingStore(bucket, prefix)
-
-    async def get_bounded(self, key, max_bytes):
-        return await self._store.get_bounded(key, max_bytes)
+    def put_immutables(self, clock):
+        return R2ImmutablePut(
+            self.pack_target,
+            self.bucket,
+            self.pack_ticket_secret,
+            clock=clock,
+        )
 
 
 def now_ms():
@@ -156,19 +212,34 @@ def now_ms():
 
 def gateway(settings, clock=None):
     clock = now_ms if clock is None else clock
+    issuer = settings.issue_packs(clock)
+    store = R2BindingStore(settings.bucket, settings.prefix)
+    gate = AccessGate(settings.workspace, store)
+    heads = OpaqueHeadGate(store, gate.authorize_head)
+
+    async def commit_permit(permit, proposed, secret):
+        return await gate.commit_head_permit(
+            heads, permit, proposed, secret)
+
     return HttpGate(
-        ReadOnlyStore(settings.bucket, settings.prefix),
+        store,
         settings.workspace,
-        settings.secret,
+        settings.grant_secret,
         clock,
-        sync_profile=peer_capability.READ_ONLY,
+        head_advance=heads.advance,
+        head_permit_issue=gate.issue_head_permit,
+        head_permit_commit=commit_permit,
+        permit_secret=settings.permit_secret,
+        mint_authorize=gate.authorize_access,
+        path_authorize=gate.removal_path,
+        removal_bootstrap=gate.state.bootstrap,
+        object_open=issuer.open_object,
+        pack_open=issuer.open_pack,
+        sync_profile=peer_capability.OWNER,
         max_request_bytes=settings.max_request_bytes,
-        max_root_bytes=settings.max_root_bytes,
         max_object_bytes=settings.max_object_bytes,
         max_batch_count=settings.max_batch_count,
         max_batch_bytes=settings.max_batch_bytes,
-        max_mint_fetches=settings.max_mint_fetches,
-        max_mint_fetch_bytes=settings.max_mint_fetch_bytes,
         grant_ttl_ms=settings.grant_ttl_ms,
         seal=seal_to,
     )
@@ -255,6 +326,16 @@ async def _bounded_body(request, limit):
         reader.releaseLock()
 
 
+def _request_limit(settings, method, path):
+    """Return the provider-confined budget for one shared-gate route."""
+    path = "/" + path.strip("/")
+    protocol = HttpGate.request_limit(method, path)
+    control = protocol > MAX_MINT_REQUEST_BYTES
+    provider = settings.max_control_bytes \
+        if control else settings.max_request_bytes
+    return min(protocol, provider) if protocol else provider
+
+
 def _secured(response):
     return Response(
         response.status,
@@ -267,7 +348,7 @@ def _secured(response):
     )
 
 
-async def handle(request, env):
+async def handle(request, env, *, clock=None):
     """Translate one Workers SDK request into the shared HttpGate contract."""
     try:
         _crypto_self_test()
@@ -276,15 +357,28 @@ async def handle(request, env):
         return _secured(Response(500))
     try:
         method = _method(request)
+        url = urlsplit(str(request.url))
+    except (AttributeError, TypeError, ValueError, UnicodeError):
+        return _secured(Response(400))
+    if method == "PUT" and url.path.startswith(("/obj/", "/pack/")):
+        try:
+            result = await settings.put_immutables(
+                now_ms if clock is None else clock).handle(request)
+            return _secured(Response(
+                result.status, result.body, dict(result.headers)))
+        except Exception:
+            return _secured(Response(500))
+    try:
         headers = _headers(request)
         length = _content_length(headers)
     except Exception:
         return _secured(Response(400))
-    if length is not None and length > settings.max_request_bytes:
+    body_limit = _request_limit(settings, method, url.path)
+    if length is not None and length > body_limit:
         return _secured(Response(413))
     try:
         body = await _bounded_body(
-            request, settings.max_request_bytes) if method in {
+            request, body_limit) if method in {
             "POST", "PUT", "PATCH"} else b""
     except Exception:
         return _secured(Response(400))
@@ -297,12 +391,11 @@ async def handle(request, env):
             settings.max_query_bytes,
             settings.max_query_fields,
         )
-        url = urlsplit(str(request.url))
     except OverflowError:
         return _secured(Response(414))
     except (TypeError, ValueError, UnicodeError):
         return _secured(Response(400))
-    result = await gateway(settings).handle(
+    result = await gateway(settings, clock).handle(
         method,
         url.path,
         query,

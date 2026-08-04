@@ -1,18 +1,18 @@
 """Canonical peer profiles carried by the authenticated mint grant.
 
-The short strings are the complete wire vocabulary.  A mint response repeats
-the profile embedded in its sealed, HMAC-protected bearer token; clients grant
-push authority only when the two copies agree exactly.  Missing copies mean a
-legacy full peer, while any present unknown or mismatched value is pull-only.
+The short strings are the complete wire vocabulary. A mint response repeats
+the profile embedded in its sealed, HMAC-protected bearer token; clients use
+the grant only when the two copies agree exactly. Missing, unknown, or
+mismatched profiles are invalid protocol, not compatibility signals.
 """
 import base64
 import json
 
 
 FULL = "sync-v1/full"
+OWNER = "sync-v1/owner"
 READ_ONLY = "sync-v1/read"
-_KNOWN = frozenset((FULL, READ_ONLY))
-_MISSING = object()
+_KNOWN = frozenset((FULL, OWNER, READ_ONLY))
 _INVALID = object()
 
 
@@ -28,20 +28,26 @@ def _grant_profile(token):
         payload = json.loads(base64.urlsafe_b64decode(encoded))
         if not isinstance(payload, dict):
             return _INVALID
-        return payload.get("cap", _MISSING)
+        return payload.get("cap", _INVALID)
     except (AttributeError, TypeError, ValueError):
         return _INVALID
 
 
 def negotiate(token, mint_response):
-    """Return the agreed profile, collapsing every bad signal to read-only."""
+    """Return the one exact profile authenticated and advertised by mint."""
     embedded = _grant_profile(token)
-    advertised = mint_response.get("cap", _MISSING) \
+    advertised = mint_response.get("cap", _INVALID) \
         if isinstance(mint_response, dict) else _INVALID
-    if embedded is _MISSING and advertised is _MISSING:
-        return None
-    return embedded if embedded == advertised and known(embedded) else READ_ONLY
+    if embedded != advertised or not known(embedded):
+        raise ValueError("peer capability negotiation")
+    return embedded
 
 
 def allows_push(profile):
-    return profile is None or profile == FULL
+    """Whether a peer accepts validate-first gossip for every writer."""
+    return profile == FULL
+
+
+def allows_object_put(profile):
+    """Whether a peer accepts immutable bytes before a confined head write."""
+    return profile in {FULL, OWNER}

@@ -1,36 +1,31 @@
-"""Bounded notification derivation from historical event work.
+"""Bounded notification derivation from scanner-validated event bytes.
 
-The event root proves what happened.  A separately pinned current root owns
-every mutable delivery decision: event suppression, recipient preferences,
-member/device liveness, and endpoint liveness.  Delivery is never a repository
-commit effect.
+The durable cursor certifies which writer-head diff produced each event.  A
+separately rebuilt current repository owns every mutable delivery decision:
+event suppression, recipient preferences, member/device liveness, and endpoint
+liveness. Delivery is never a repository commit effect.
 """
 from dataclasses import dataclass
-from inspect import isawaitable
 from typing import Awaitable, Protocol
 
 import facts
 
 from core.crypto import h
-from core.fact import canon
-from core.fetch_budget import BudgetedFetch, FetchBudgetExceeded
+from core.fact import canon, decode, encode
 from core.limits import (
     MAX_ATOM_VALUE_BYTES,
     MAX_PILE_FACTS,
-    MAX_ROOT_BYTES,
     valid_bounded_text,
 )
-from core.repository_reader import RepositoryReader
 from core.shape import FACT_TS_MAX, valid_fid
 from facts._notification import NotificationTrigger
 from facts.auth import push_endpoint
 from facts.content import notification_preference as preference
+from .forest import CurrentView
 
 
 MAX_MATCH_ROWS = 16_384
 MAX_DELIVERIES = 4_096
-MAX_NOTIFICATION_FETCHES = 32_768
-MAX_NOTIFICATION_FETCH_BYTES = 32 * 1024 * 1024
 # Notification data contains only workspace/event/channel/kind identifiers.
 # Keep its raw canonical form far below FCM's 4,096-byte encoded data budget;
 # Base64 expansion, delivery_id, and JSON keys must fit too.
@@ -41,36 +36,34 @@ MAX_FIREBASE_ROUTES = 32
 
 
 class InvalidPublicationHint(ValueError):
-    """The named fact is not an authenticated event at the named root."""
-
-
-class _ObjectMiss(BaseException):
-    """Escape synchronous tree traversal so an async driver can fetch."""
-
-    __slots__ = ("oid",)
-
-    def __init__(self, oid):
-        super().__init__(oid)
-        self.oid = oid
+    """Scanner-certified bytes do not encode the claimed event work."""
 
 
 @dataclass(frozen=True, slots=True)
 class PublicationHint:
-    """Advisory work created only after this exact root was published."""
+    """Scanner-validated historical event facts for one writer-head page."""
 
     workspace: str
-    root: bytes
-    facts: tuple[str, ...]
+    events: tuple[bytes, ...]
 
     def __post_init__(self):
         if not valid_fid(self.workspace) \
-                or not isinstance(self.root, bytes) \
-                or not 0 < len(self.root) <= MAX_ROOT_BYTES \
-                or not isinstance(self.facts, tuple) \
-                or len(self.facts) > MAX_PILE_FACTS \
-                or tuple(sorted(set(self.facts))) != self.facts \
-                or not all(valid_fid(fid) for fid in self.facts):
+                or not isinstance(self.events, tuple) \
+                or not 1 <= len(self.events) <= MAX_PILE_FACTS:
             raise ValueError("notification publication hint")
+        try:
+            decoded = tuple(decode(raw) for raw in self.events)
+        except Exception as error:
+            raise ValueError("notification publication hint") from error
+        if any(encode(fact) != raw for fact, raw in zip(
+                decoded, self.events)) \
+                or tuple(sorted(set(fact.fid for fact in decoded))) != tuple(
+                    fact.fid for fact in decoded):
+            raise ValueError("notification publication hint")
+
+    @property
+    def facts(self):
+        return tuple(decode(raw).fid for raw in self.events)
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,8 +146,8 @@ class PushUnregistered(PushInvalidEndpoint):
     pass
 
 
-class CurrentRootBehind(PushRetryable):
-    """The current authority view has not observed the event root yet."""
+class CurrentRepositoryBehind(PushRetryable):
+    """The current validated writer forest has not observed the event yet."""
 
 
 class PushProvider(Protocol):
@@ -207,7 +200,7 @@ def _postings(view, kind, k0, k1, budget):
         page = view.postings(kind, k0, k1, after=after)
         budget.add(len(page.rows))
         for row in page.rows:
-            yield row, view.fact(row.fid)
+            yield row, view.fact_of(row.fid)
         if page.cursor is None:
             return
         if page.cursor == after:
@@ -295,45 +288,30 @@ def trigger_for(fact):
     return value
 
 
-def _check_derivation(
-        hint, current_root, push_node, max_fetches, max_fetch_bytes):
+def _check_derivation(hint, current_view, push_node):
     if not isinstance(hint, PublicationHint) \
-            or not isinstance(current_root, bytes) \
-            or not 0 < len(current_root) <= MAX_ROOT_BYTES \
-            or type(max_fetches) is not int \
-            or not 0 <= max_fetches <= MAX_NOTIFICATION_FETCHES \
-            or type(max_fetch_bytes) is not int \
-            or not 0 <= max_fetch_bytes <= MAX_NOTIFICATION_FETCH_BYTES \
+            or not isinstance(current_view, CurrentView) \
+            or current_view.workspace != hint.workspace \
             or push_node is not None and not valid_fid(push_node):
         raise ValueError("notification derivation")
 
 
-def _derive_from(hint, fetch, current_root, push_node):
-    try:
-        event_view = RepositoryReader(
-            hint.workspace, hint.root, fetch).worker()
-    except (TypeError, ValueError) as error:
-        raise InvalidPublicationHint(
-            "invalid notification event root") from error
-    current_view = RepositoryReader(
-        hint.workspace, current_root, fetch).worker()
+def _derive_from(hint, current_view, push_node):
     budget, intents = _Budget(), {}
-    for fid in hint.facts:
+    for raw in hint.events:
         try:
-            fact = event_view.fact(fid)
+            fact = decode(raw)
+            fid = fact.fid
             trigger = trigger_for(fact)
-            event_active = event_view.fact_active(fid)
-        except (FetchBudgetExceeded, OSError):
-            raise
         except Exception as error:
             raise InvalidPublicationHint(
                 "invalid notification event fact") from error
-        if trigger is None or not event_active:
+        if trigger is None:
             continue
         if not current_view.fact_known(fid):
-            raise CurrentRootBehind(
-                "current notification root has not observed event")
-        current_fact = current_view.fact(fid)
+            raise CurrentRepositoryBehind(
+                "current notification repository has not observed event")
+        current_fact = current_view.fact_of(fid)
         if current_fact != fact:
             raise ValueError("notification event residence conflict")
         if not current_view.fact_active(fid):
@@ -387,66 +365,10 @@ def _derive_from(hint, fetch, current_root, push_node):
     return tuple(intents[key] for key in sorted(intents))
 
 
-def derive(
-        hint, fetch, current_root, *, push_node=None,
-        max_fetches=MAX_NOTIFICATION_FETCHES,
-        max_fetch_bytes=MAX_NOTIFICATION_FETCH_BYTES):
-    """Prove historical events, then join only current delivery authority."""
-    if not callable(fetch):
-        raise ValueError("notification derivation")
-    _check_derivation(
-        hint, current_root, push_node, max_fetches, max_fetch_bytes)
-    return _derive_from(
-        hint,
-        BudgetedFetch(
-            fetch, max_fetches=max_fetches, max_bytes=max_fetch_bytes),
-        current_root,
-        push_node,
-    )
-
-
-async def derive_awaited(
-        hint, fetch, current_root, *, push_node=None,
-        max_fetches=MAX_NOTIFICATION_FETCHES,
-        max_fetch_bytes=MAX_NOTIFICATION_FETCH_BYTES):
-    """Drive the same synchronous matcher with sync or awaited object reads."""
-    if not callable(fetch):
-        raise ValueError("notification derivation")
-    _check_derivation(
-        hint, current_root, push_node, max_fetches, max_fetch_bytes)
-    cache = {}
-    fetched_bytes = 0
-
-    def cached_fetch(oid):
-        if oid not in cache:
-            raise _ObjectMiss(oid)
-        return cache[oid]
-
-    bounded_fetch = BudgetedFetch(
-        cached_fetch, max_fetches=max_fetches, max_bytes=max_fetch_bytes)
-    while True:
-        try:
-            return _derive_from(
-                hint, bounded_fetch, current_root, push_node)
-        except _ObjectMiss as miss:
-            oid = miss.oid
-        if oid in cache:
-            raise AssertionError("notification fetch replay")
-        if len(cache) >= max_fetches:
-            raise FetchBudgetExceeded("unique object-fetch budget")
-        raw = fetch(oid)
-        if isawaitable(raw):
-            raw = await raw
-        if raw is not None and not isinstance(raw, bytes):
-            raise TypeError("object fetch returned non-bytes")
-        fetched_bytes += len(raw) if raw is not None else 0
-        if fetched_bytes > max_fetch_bytes:
-            raise FetchBudgetExceeded("object-fetch byte budget")
-        cache[oid] = raw
-        # The budget wrapper already charged this miss before it escaped.
-        # Seed its memo directly so replay neither charges nor fetches twice.
-        bounded_fetch.cache[oid] = raw
-        bounded_fetch.bytes = fetched_bytes
+def derive(hint, current_view, *, push_node=None):
+    """Join scanner-certified events with current validated forest state."""
+    _check_derivation(hint, current_view, push_node)
+    return _derive_from(hint, current_view, push_node)
 
 
 def request_for(intent, push_node_secret, now_ms):
@@ -475,12 +397,10 @@ def request_for(intent, push_node_secret, now_ms):
 
 
 __all__ = (
-    "CurrentRootBehind",
+    "CurrentRepositoryBehind",
     "DeliveryResult",
     "InvalidPublicationHint",
     "MAX_FIREBASE_ROUTES",
-    "MAX_NOTIFICATION_FETCHES",
-    "MAX_NOTIFICATION_FETCH_BYTES",
     "MAX_PAYLOAD_BYTES",
     "NotificationIntent",
     "PublicationHint",
@@ -491,7 +411,6 @@ __all__ = (
     "PushRetryable",
     "PushUnregistered",
     "derive",
-    "derive_awaited",
     "delivery_domain_id",
     "request_for",
     "seal_target",

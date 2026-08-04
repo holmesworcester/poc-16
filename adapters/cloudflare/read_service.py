@@ -1,7 +1,7 @@
 """Validated client for a private bounded object-read service binding."""
 
 from core.limits import MAX_ROOT_BYTES, MAX_STORE_READ_BYTES, PayloadTooLarge
-from core.object_store import ABSENT, Versioned, VersionToken
+from core.object_store import ABSENT, ListPage, Versioned, VersionToken
 
 
 class ReadServiceStore:
@@ -12,7 +12,9 @@ class ReadServiceStore:
     def __init__(self, service, *, versioned=True):
         if not callable(getattr(service, "get_bounded", None)) \
                 or versioned and not callable(
-                    getattr(service, "read_versioned", None)):
+                    getattr(service, "read_versioned", None)) \
+                or versioned and not callable(
+                    getattr(service, "list_page", None)):
             raise TypeError("Cloudflare read service binding")
         self.service = service
         self.versioned = versioned
@@ -45,6 +47,25 @@ class ReadServiceStore:
                 or len(value["value"]) > MAX_ROOT_BYTES:
             raise ValueError("read service versioned response")
         return Versioned(value["value"], VersionToken(value.get("token")))
+
+    async def list_page(self, prefix, cursor=None, limit=256):
+        value = await self.service.list_page(prefix, cursor, limit)
+        if not isinstance(value, dict) or set(value) != {"cursor", "keys"} \
+                or not isinstance(value.get("keys"), list) \
+                or not all(isinstance(key, str) for key in value["keys"]) \
+                or value.get("cursor") is not None \
+                and not isinstance(value["cursor"], str):
+            raise ValueError("read service list response")
+        return ListPage(tuple(value["keys"]), value["cursor"])
+
+    async def copy_pile_object(self, oid, maximum, write):
+        """Small-body service fallback; direct large reads stay segregated."""
+        raw = await self.get_bounded(
+            "obj/" + oid, min(maximum, MAX_STORE_READ_BYTES))
+        if raw is None:
+            return None
+        write(raw)
+        return len(raw)
 
 
 __all__ = ("ReadServiceStore",)

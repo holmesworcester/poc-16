@@ -1,19 +1,30 @@
 """Pure object-store contract shared by local and remote implementations.
 
-The root-authoritative snapshot uses only two namespaces:
+The protocol uses these namespaces:
 
 ``obj/<sha256>``
-    A grow-only content-addressed map. Conditional creation may report either
-    that the bytes were created or that identical bytes already existed.
+    A grow-only content-addressed map of facts, Merkle pages, signed writer
+    piles, and heads. Conditional creation may report either that the bytes
+    were created or that identical bytes already existed. Large signed piles
+    use the direct streaming HTTP path rather than buffered semantic reads.
 
-``root``
-    One linearizable value-CAS register. A version token is an opaque
-    comparison capability for the exact bytes returned by the same read; it is
-    not a content digest or a globally unique generation.
+``removal``, ``removal-node/<sha256>``
+    One private suppression-root CAS cell and its immutable proof nodes.
+    These names are available only to the access engine; they are never
+    mapped into generic object, pack, grant, or public LIST routes.
 
-The same local store may retain exact ``ingress/v1/`` sources. Hosted uploads
-put that namespace in a separate provider compartment. It is retry input,
-never a repository answer or part of ``RepositoryReader``.
+``cursor``
+    A generic operational CAS cell used only by isolated subsystems such as
+    notification delivery. It is never workspace fact authority.
+
+``heads/<workspace>/<device>``, ``layouts/<workspace>/<device>/<window>``
+    Independent linearizable CAS registers. Heads are signed logical history;
+    layout pages are untrusted source-local transfer hints.
+
+``pack/<sha256>``
+    Immutable large transfer objects. Their keys share this namespace and
+    mutation policy, but their bodies use the separate streaming data plane
+    rather than the bounded semantic-object methods in this trait.
 
 Provider and POSIX implementations live outside this module so the
 database-free authorization path can import integrity helpers in runtimes
@@ -26,14 +37,21 @@ import re
 from typing import Protocol
 
 from .crypto import h
-from .ingress import MAX_INGRESS_KEY_BYTES
 from .limits import (
     MAX_OBJECT_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
+    WRITER_LAYOUT_WINDOW_PILES,
     PayloadTooLarge,
 )
 
 KEY_RE = re.compile(r"^[a-z0-9:._/-]+$")
+REMOVAL_ROOT_KEY = "removal"
+REMOVAL_NODE_PREFIX = "removal-node/"
+OPERATIONAL_CURSOR_KEY = "cursor"
+SINGLETON_CAS_KEYS = frozenset((
+    REMOVAL_ROOT_KEY,
+    OPERATIONAL_CURSOR_KEY,
+))
 
 # S3 and R2 both cap one complete object key at 1,024 bytes. A configured
 # prefix must leave room for every logical namespace the shared store may
@@ -42,10 +60,11 @@ KEY_RE = re.compile(r"^[a-z0-9:._/-]+$")
 MAX_PROVIDER_KEY_BYTES = 1024
 MAX_INVITE_ID_BYTES = 256
 MAX_LOGICAL_KEY_BYTES = max(
-    len("root"),
+    len(OPERATIONAL_CURSOR_KEY),
     len("obj/") + 64,
+    len(REMOVAL_NODE_PREFIX) + 64,
+    len("heads/") + 64 + 1 + 64,
     len("invite/") + MAX_INVITE_ID_BYTES,
-    MAX_INGRESS_KEY_BYTES,
 )
 MAX_STORE_PREFIX_BYTES = (
     MAX_PROVIDER_KEY_BYTES - 1 - MAX_LOGICAL_KEY_BYTES)
@@ -57,8 +76,8 @@ def validate_key(key):
         raise ValueError(f"bad key {key!r}")
     parts = key.split("/")
     if any(not part or part in {".", ".."} for part in parts) \
-            or parts[0] == ".root.lock" \
-            or key.startswith("root/"):
+            or parts[0] in {".cas.lock", ".root.lock"} \
+            or key == "root" or key.startswith("root/"):
         raise ValueError(f"reserved key {key!r}")
     return key
 
@@ -77,8 +96,38 @@ def validate_store_prefix(prefix):
 
 def authoritative_key(key):
     """Whether a public unconditional mutation must reject this key."""
-    return key == "root" or key.startswith("root/") \
-        or key == "obj" or key.startswith("obj/")
+    return key in SINGLETON_CAS_KEYS \
+        or key.startswith("cursor/") \
+        or key.startswith(REMOVAL_NODE_PREFIX) \
+        or key == "obj" or key.startswith("obj/") \
+        or key == "heads" or key.startswith("heads/") \
+        or key == "layouts" or key.startswith("layouts/") \
+        or key == "pack" or key.startswith("pack/")
+
+
+def mutable_key(key):
+    """Whether ``key`` is one exact protocol CAS register."""
+    key = validate_key(key)
+    if key in SINGLETON_CAS_KEYS:
+        return True
+    parts = key.split("/")
+    if len(parts) == 3 and parts[0] == "heads":
+        return all(
+            re.fullmatch(r"[0-9a-f]{64}", part) for part in parts[1:])
+    if len(parts) != 4 or parts[0] != "layouts" \
+            or not all(
+                re.fullmatch(r"[0-9a-f]{64}", part)
+                for part in parts[1:3]):
+        return False
+    # Keep the low-level store independent of the layout codec while still
+    # accepting only its canonical fixed-window address arithmetic.
+    sequence = parts[3]
+    if len(sequence) != 16 or not sequence.isascii() \
+            or not sequence.isdigit():
+        return False
+    start = int(sequence)
+    return 1 <= start <= (1 << 53) - 1 \
+        and (start - 1) % WRITER_LAYOUT_WINDOW_PILES == 0
 
 
 def validate_create(key, value):
@@ -86,11 +135,13 @@ def validate_create(key, value):
     key = validate_key(key)
     if not isinstance(value, bytes):
         raise TypeError("object value must be bytes")
-    if key == "root" or key.startswith("root/"):
-        raise ValueError("root requires compare-and-swap")
-    for prefix in ("obj/",):
-        if key == prefix[:-1] or (
-                key.startswith(prefix) and key[len(prefix):] != h(value)):
+    if mutable_key(key) \
+            or key == "heads" or key.startswith("heads/"):
+        raise ValueError("mutable register requires compare-and-swap")
+    for prefix in ("obj/", "pack/", REMOVAL_NODE_PREFIX):
+        if key == prefix[:-1] or key.startswith(prefix) and (
+                len(key) != len(prefix) + 64
+                or key[len(prefix):] != h(value)):
             raise ValueError("immutable object address")
     return key
 
@@ -184,10 +235,15 @@ class OutcomeUnknown(StoreError):
 
 
 class ObjectStore(Protocol):
-    """The complete bounded mutation surface used by RepositoryApplier."""
+    """The complete bounded mutation surface used by every repository role."""
 
     def get_bounded(
             self, key: str, max_bytes: int) -> bytes | None: ...
+
+    def copy_pile_object(
+            self, oid: str, max_bytes: int, write) -> int | None: ...
+
+    def has(self, key: str) -> bool: ...
 
     def read_versioned(self, key: str) -> Versioned | Absent: ...
 
@@ -198,11 +254,20 @@ class ObjectStore(Protocol):
             self, key: str, token: VersionToken | Absent,
             value: bytes) -> Applied | Stale: ...
 
+    def list_page(
+            self, prefix: str, cursor: str | None = None,
+            limit: int = 256) -> ListPage: ...
+
 class AsyncObjectStore(Protocol):
     """Awaited equivalent of the exact object-store contract."""
 
     async def get_bounded(
             self, key: str, max_bytes: int) -> bytes | None: ...
+
+    async def copy_pile_object(
+            self, oid: str, max_bytes: int, write) -> int | None: ...
+
+    async def has(self, key: str) -> bool: ...
 
     async def read_versioned(self, key: str) -> Versioned | Absent: ...
 
@@ -212,6 +277,10 @@ class AsyncObjectStore(Protocol):
     async def cas(
             self, key: str, token: VersionToken | Absent,
             value: bytes) -> Applied | Stale: ...
+
+    async def list_page(
+            self, prefix: str, cursor: str | None = None,
+            limit: int = 256) -> ListPage: ...
 
 
 class SyncStoreAdapter:
@@ -227,6 +296,12 @@ class SyncStoreAdapter:
             raise PayloadTooLarge("object-store read exceeds byte limit")
         return value
 
+    async def copy_pile_object(self, oid, max_bytes, write):
+        return self.store.copy_pile_object(oid, max_bytes, write)
+
+    async def has(self, key):
+        return self.store.has(key)
+
     async def read_versioned(self, key):
         return self.store.read_versioned(key)
 
@@ -235,6 +310,9 @@ class SyncStoreAdapter:
 
     async def cas(self, key, token, value):
         return self.store.cas(key, token, value)
+
+    async def list_page(self, prefix, cursor=None, limit=256):
+        return self.store.list_page(prefix, cursor, limit)
 
     def namespace_id(self):
         return store_namespace(self.store)
@@ -280,8 +358,9 @@ def verified_object(
 
 
 async def ensure_object_async(store, oid, raw):
-    """Establish one immutable object before a root may reference it."""
-    if not isinstance(raw, bytes) or len(raw) > MAX_OBJECT_BYTES \
+    """Establish one immutable buffered semantic object."""
+    if not isinstance(raw, bytes) \
+            or len(raw) > MAX_REPOSITORY_OBJECT_BYTES \
             or not isinstance(oid, str) or h(raw) != oid:
         raise ValueError("immutable object address")
     key = "obj/" + oid

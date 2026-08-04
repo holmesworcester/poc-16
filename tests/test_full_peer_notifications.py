@@ -10,6 +10,7 @@ import pytest
 
 from core.crypto import h, keypair
 from core.object_store import Versioned
+from core.writer_head import decode_slot_at, head_slot_key
 from facts.auth import push_endpoint
 from facts.auth.device import bind
 from facts.content import message
@@ -66,11 +67,10 @@ def _world(tmp_path, provider=None):
     service = FullPeerNotifications(
         node, node.dir, push_secret, provider, cadence=.05)
     bootstrap = service.bootstrap(workspace, "current")
-    assert bootstrap == {
-        "base": h(node.reader(workspace).root_bytes),
-        "mode": "current",
-        "workspace": workspace,
-    }
+    assert bootstrap["mode"] == "current"
+    assert bootstrap["workspace"] == workspace
+    assert bootstrap["heads"] == _cursor(
+        service, workspace).heads["root"]
     baseline, = service.run_once()
     assert baseline.status == "idle"
     assert provider.requests == []
@@ -87,9 +87,15 @@ def _wait(predicate, timeout=5):
 
 
 def _cursor(service, workspace):
-    current = service.state_store(workspace).read_versioned("root")
+    current = service.state_store(workspace).read_versioned("cursor")
     assert isinstance(current, Versioned)
     return decode_cursor(current.value)
+
+
+def _head(node, workspace):
+    device = node.identity_id(workspace)
+    key = head_slot_key(workspace, device)
+    return decode_slot_at(key, node.store(workspace).get(key)).head
 
 
 def test_workspace_requires_explicit_notification_bootstrap(tmp_path):
@@ -141,15 +147,16 @@ def test_transient_fcm_retry_preserves_cursor_and_restart_resumes(
     accepted, = restarted.run_once()
 
     assert accepted.status == "republished"
-    assert _cursor(restarted, workspace).target is None
+    assert _cursor(restarted, workspace).pending is None
     assert len(provider.requests) == 2
     assert provider.requests[0].delivery_id \
         == provider.requests[1].delivery_id
     assert provider.requests[0].payload == provider.requests[1].payload
     assert event in provider.requests[1].payload.decode()
 
-    idle, = FullPeerNotifications(
-        node, node.dir, service.secret, provider).run_once()
+    advanced, = restarted.run_once()
+    idle, = restarted.run_once()
+    assert advanced.status == "advanced"
     assert idle.status == "idle"
     assert len(provider.requests) == 2
 
@@ -201,7 +208,7 @@ def test_delayed_retry_uses_current_authority(
 
     assert cancelled.status == "republished"
     assert len(provider.requests) == 1
-    assert _cursor(service, workspace).target is None
+    assert _cursor(service, workspace).pending is None
 
 
 def test_dropped_wake_is_recovered_by_cadence_and_shutdown_is_clean(
@@ -252,7 +259,8 @@ def test_concurrent_turns_use_cursor_cas_without_corruption(tmp_path):
     statuses = sorted(turn[0].status for turn in results)
     assert statuses == ["published", "raced"]
     assert len(provider.requests) == 1
-    assert _cursor(service, workspace).target is None
+    assert _cursor(service, workspace).pending is None
+    assert service.run_once()[0].status == "advanced"
     assert service.run_once()[0].status == "idle"
 
 
@@ -279,7 +287,6 @@ def test_notification_authority_never_consults_sql(
 
     monkeypatch.setattr(node, "sql", forbidden)
     monkeypatch.setattr(node, "idx", forbidden)
-    monkeypatch.setattr(node, "_sync_sql", forbidden)
 
     result, = service.run_once()
     assert result.status == "published"
@@ -458,10 +465,10 @@ def test_hung_provider_cannot_block_peer_publication_or_fail_service(
     service.start()
     try:
         assert provider.entered.wait(5)
-        before = node.reader(workspace).root_bytes
+        before = _head(node, workspace)
         later = message.post(
             node, workspace, "general", "publication stays live", ts=5)
-        assert node.reader(workspace).root_bytes != before
+        assert _head(node, workspace) != before
         assert node.fact_of(workspace, later) is not None
         assert service.failure is None
         assert service.peer_thread.is_alive()

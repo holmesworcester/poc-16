@@ -37,9 +37,6 @@ from deploy.notification_launch import (  # noqa: E402
     require_mobile_launches,
     tree_digest,
 )
-from deploy.python_role_modules import (  # noqa: E402
-    REPOSITORY_READER_CORE_MODULES,
-)
 from notifications.delivery import delivery_domain_id  # noqa: E402
 
 
@@ -127,8 +124,27 @@ CONFIG_PATHS = {
     "fcm": FCM_CONFIG,
 }
 
-CORE_MODULES = tuple(dict.fromkeys(
-    (*REPOSITORY_READER_CORE_MODULES, "fetch_budget.py")))
+CORE_MODULES = (
+    "__init__.py",
+    "crypto.py",
+    "limits.py",
+    "object_store.py",
+    "shape.py",
+)
+WRITER_CONSUMER_CORE_MODULES = (
+    "close.py",
+    "fact.py",
+    "fact_index.py",
+    "http_body.py",
+    "kernel.py",
+    "merkle_map.py",
+    "removal_path.py",
+    "suppression.py",
+    "suppression_tree.py",
+    "writer_head.py",
+    "writer_repository.py",
+    "writer_tree.py",
+)
 _STAGE_LOCK_FD = None
 
 
@@ -183,7 +199,7 @@ def _copy(source, destination):
 
 
 def stage():
-    """Stage exact role import trees without RepositoryApplier."""
+    """Stage exact role import trees without an aggregate compiler."""
     patch_pynacl(VENDORED)
     pending = BUILD / "pending"
     if pending.exists():
@@ -197,7 +213,9 @@ def stage():
         _copy(PACKAGE / entry, root / "entry.py")
         _copy(PACKAGE / f"{role}.py", root / f"{role}.py")
         _copy(PACKAGE / "settings.py", root / "settings.py")
-        for name in CORE_MODULES:
+        role_core = CORE_MODULES if role == "reader" else (
+            *CORE_MODULES, *WRITER_CONSUMER_CORE_MODULES)
+        for name in role_core:
             _copy(REPOSITORY / "core" / name, root / "core" / name)
         if role != "reader":
             shutil.copytree(
@@ -210,8 +228,10 @@ def stage():
             REPOSITORY / "adapters" / "__init__.py",
             root / "adapters" / "__init__.py")
         if role in {"reader", "scanner"}:
-            names = ("__init__.py", "reader.py") if role == "reader" else (
-                "__init__.py", "reader.py", "worker.py")
+            names = (
+                "__init__.py", "listing.py", "reader.py") \
+                if role == "reader" else (
+                    "__init__.py", "listing.py", "reader.py", "worker.py")
             for name in names:
                 _copy(
                     REPOSITORY / "adapters" / "r2" / name,
@@ -247,7 +267,6 @@ def stage():
             PACKAGE / "uv.lock",
             REPOSITORY / "deploy" / "cloudflare_python.py",
             REPOSITORY / "deploy" / "notification_launch.py",
-            REPOSITORY / "deploy" / "python_role_modules.py",
             *(
                 PACKAGE / name for name in (
                     "wrangler.reader.jsonc", "wrangler.scanner.jsonc",
@@ -1402,13 +1421,14 @@ def _require_prefix_synchronously_readable(
 
 def _require_retained_notification_objects(
         reader, scanner, environment=os.environ):
-    # Cursor root bytes alone are insufficient: historical FactTree pages and
-    # fact objects are fetched from canonical state during lag and redrive.
+    # Cursor bytes retain acknowledged OIDs, not the pinned writer trees and
+    # closed piles needed to validate a lagging scan. Pending event bytes live
+    # in notification state for independent carrier redrive.
     _require_prefix_synchronously_readable(
         reader, "CANONICAL_PREFIX", "canonical notification history",
         environment)
     _require_prefix_synchronously_readable(
-        scanner, "NOTIFICATION_STATE_PREFIX", "notification cursor/root",
+        scanner, "NOTIFICATION_STATE_PREFIX", "notification cursor",
         environment)
 
 
@@ -2106,7 +2126,7 @@ def verify():
         "recreate expired wakes")
     print(
         "R2 VERIFIED: no enabled deletion lifecycle overlaps canonical "
-        "history or the permanent notification cursor/root prefix; this "
+        "writer history or the permanent notification cursor prefix; this "
         "tool never mutates lifecycle")
 
 
@@ -2186,8 +2206,8 @@ Commands:
   provision  explicitly create primary and DLQ with one-day retention
   deploy     promote exact versions, then attach Queue/Cron effects
   disable    stop Queue/Cron traffic without uploading another version
-  bootstrap-current   initialize at the current root on the next schedule
-  bootstrap-backfill  initialize from the empty FactTree on the next schedule
+  bootstrap-current   acknowledge current writer heads on the next schedule
+  bootstrap-backfill  start from empty writer checkpoints on the next schedule
   seal-bootstrap      disable initialization after observing its completion
   verify     verify ownership and print queue status/required alarms
   redrive    safely move one bounded DLQ batch to the primary queue

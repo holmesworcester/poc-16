@@ -24,6 +24,7 @@ def compile_policy(policy):
 @pytest.mark.parametrize(
     ("field", "value", "error"),
     (
+        ("control_fact", 1, "control fact must be bool"),
         ("suppression", [], "nonempty tuple"),
         ("suppression", (), "nonempty tuple"),
         ("suppression", ("self",), "selector policy"),
@@ -158,6 +159,21 @@ def compile_policy(policy):
             ),
             "duplicate principal",
         ),
+        ("clear_offers", [], "must be a tuple"),
+        ("clear_offers", ("member",), "declaration"),
+        (
+            "clear_offers",
+            (_policy.SidOffer("", "device"),),
+            "declaration",
+        ),
+        (
+            "clear_offers",
+            (
+                _policy.SidOffer("member", "device"),
+                _policy.SidOffer("member", "other"),
+            ),
+            "duplicate clear",
+        ),
         ("action_offers", [], "must be a tuple"),
         ("action_offers", ("removed",), "declaration"),
         (
@@ -204,8 +220,17 @@ def test_registry_rejects_offer_role_ambiguity():
         action_offers=(_policy.SidOffer("member", "member"),),
     )
 
-    with pytest.raises(ValueError, match="principal/action"):
+    with pytest.raises(ValueError, match="clear/action"):
         compile_policy(policy)
+
+
+def test_clear_offer_may_share_a_source_without_guarding_the_fact():
+    policy = _policy.FamilyPolicy(
+        principal_offers=(_policy.SidOffer("member", "member"),),
+        clear_offers=(_policy.SidOffer("member", "device"),),
+    )
+
+    assert compile_policy(policy)["synthetic"].POLICY is policy
 
 
 def test_registry_rejects_wrong_policy_type():
@@ -234,6 +259,7 @@ def test_registry_rejects_cross_family_principal_namespace_conflict():
 
 def test_registry_accepts_complete_distinct_policy_and_production_inventory():
     policy = _policy.FamilyPolicy(
+        control_fact=True,
         suppression=(
             _policy.Self(),
             _policy.Parent("parent"),

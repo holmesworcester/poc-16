@@ -4,7 +4,7 @@ from core.fact import Fact, workspace_of
 from .._policy import FamilyPolicy
 
 TAG = "signature"
-POLICY = FamilyPolicy()
+POLICY = FamilyPolicy(control_fact=True)
 
 
 # SHAPE
@@ -29,6 +29,22 @@ def validate(f, ctx):
         return name == "author" and f == shaped \
             and verify(pk, target, f.body["sig"])
     except (KeyError, IndexError, TypeError, ValueError):
+        return False
+
+
+def project_control(f, fact_of):
+    """Keep authorship evidence only when its exact target is control."""
+    try:
+        name, target, _public = f.offers()[0]
+        target_fact = fact_of(target)
+        if name != "author" or target_fact is None:
+            return False
+        from facts import family_for
+
+        family = family_for(target_fact.t)
+        return family is not None and family.DURABLE \
+            and family.POLICY.control_fact
+    except (IndexError, TypeError, ValueError):
         return False
 
 

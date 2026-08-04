@@ -8,13 +8,17 @@ import time
 from urllib.parse import parse_qs
 
 from adapters.s3 import S3Config, S3Store
+from core import peer_capability
+from core.access import AccessGate
 from core.limits import (
     MAX_MINT_REQUEST_BYTES,
+    MAX_PAGE_BATCH_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
     PayloadTooLarge,
 )
 from deploy.aws_lambda.config import (
     FUNCTION_TIMEOUT_SECONDS,
+    MAX_CONTROL_REQUEST_BYTES,
     MAX_LOG_METHOD_CHARS,
     MAX_LOG_PATH_CHARS,
     MAX_LOG_RECORD_BYTES,
@@ -25,7 +29,17 @@ from deploy.aws_lambda.config import (
     SDK_TOTAL_ATTEMPTS,
     validate_sdk_budget,
 )
-from core.http import AsyncFromSyncReader, HttpGate, Response
+from deploy.aws_lambda.pack_issuer import (
+    DEFAULT_PACK_TTL_SECONDS,
+    S3PackBinding,
+    S3PackIssuer,
+)
+from core.http import (
+    AsyncFromSyncReader,
+    HttpGate,
+    Response,
+)
+from core.writer_repository import OpaqueHeadGate
 
 _gateway_cache = None
 _logger = logging.getLogger(__name__)
@@ -47,6 +61,32 @@ def _positive(name, default):
     if value < 1:
         raise RuntimeError(f"invalid {name}")
     return value
+
+
+def _bounded_positive(name, default, ceiling):
+    value = _positive(name, default)
+    if value > ceiling:
+        raise RuntimeError(f"invalid {name}")
+    return value
+
+
+def _request_limit(method, path):
+    """Apply the exact route budget before decoding a Function URL body."""
+    path = "/" + path.strip("/")
+    protocol = HttpGate.request_limit(method, path)
+    if protocol > MAX_MINT_REQUEST_BYTES:
+        provider = _bounded_positive(
+            "TINYP2P_MAX_CONTROL_BYTES",
+            MAX_CONTROL_REQUEST_BYTES,
+            MAX_CONTROL_REQUEST_BYTES,
+        )
+    else:
+        provider = _bounded_positive(
+            "TINYP2P_MAX_REQUEST_BYTES",
+            MAX_MINT_REQUEST_BYTES,
+            MAX_MINT_REQUEST_BYTES,
+        )
+    return min(protocol, provider) if protocol else provider
 
 
 def _sdk_budget():
@@ -85,12 +125,13 @@ def _botocore_config():
     )
 
 
-def _secret():
+def _secret(arn_environment, label):
+    """Load one stable authority secret from its exact configured ARN."""
     import boto3
 
     response = boto3.client(
         "secretsmanager", config=_botocore_config()).get_secret_value(
-        SecretId=_required("TINYP2P_GRANT_SECRET_ARN"))
+        SecretId=_required(arn_environment))
     if isinstance(response.get("SecretString"), str):
         value = response["SecretString"].encode()
     else:
@@ -98,13 +139,13 @@ def _secret():
         if isinstance(value, str):
             value = base64.b64decode(value, validate=True)
     if not isinstance(value, bytes) or len(value) < 32:
-        raise RuntimeError("grant secret must contain at least 32 bytes")
+        raise RuntimeError(f"{label} secret must contain at least 32 bytes")
     return value
 
 
-def _store():
+def _s3_config():
     connect, read, attempts = _sdk_budget()
-    config = S3Config(
+    return S3Config(
         bucket=_required("TINYP2P_S3_BUCKET"),
         prefix=_required("TINYP2P_S3_PREFIX"),
         region_name=os.environ.get("AWS_REGION"),
@@ -118,33 +159,69 @@ def _store():
         read_total_max_attempts=attempts,
         probe_access_denied_missing=True,
     )
-    # HttpGate receives only the narrowed reader wrapper. The execution role
-    # has no S3 mutation action even though S3Store also implements publishing.
+
+
+def _store(config=None):
+    config = _s3_config() if config is None else config
+    if not isinstance(config, S3Config):
+        raise TypeError("Lambda S3 config")
+    # The gate receives one awaited bucket contract for private removal state
+    # and writer heads. Public object and pack bytes still bypass Lambda only
+    # through exact presigned requests, never a general mutation route.
     return AsyncFromSyncReader(S3Store(config))
+
+
+def _pack_issuer(config=None):
+    """Construct one metadata-only issuer; callers transfer bytes to S3."""
+    config = _s3_config() if config is None else config
+    ttl = _positive("TINYP2P_PACK_TTL_SECONDS", DEFAULT_PACK_TTL_SECONDS)
+    return S3PackIssuer(S3PackBinding(config, ttl))
 
 
 def _gateway():
     global _gateway_cache
     if _gateway_cache is None:
+        config = _s3_config()
+        issuer = _pack_issuer(config)
+        store = _store(config)
+        workspace = _required("TINYP2P_WORKSPACE_ID")
+        clock = lambda: int(time.time() * 1000)
+        gate = AccessGate(workspace, store)
+        heads = OpaqueHeadGate(store, gate.authorize_head)
+        grant_secret = _secret("TINYP2P_GRANT_SECRET_ARN", "grant")
+        permit_secret = _secret("TINYP2P_PERMIT_SECRET_ARN", "permit")
+        if grant_secret == permit_secret:
+            raise RuntimeError("grant and permit secrets must be distinct")
+
+        async def commit_permit(permit, proposed, secret):
+            return await gate.commit_head_permit(
+                heads, permit, proposed, secret)
+
         _gateway_cache = HttpGate(
-            _store(),
-            _required("TINYP2P_WORKSPACE_ID"),
-            _secret(),
-            lambda: int(time.time() * 1000),
-            max_request_bytes=_positive(
-                "TINYP2P_MAX_REQUEST_BYTES", 512 * 1024),
-            max_root_bytes=_positive(
-                "TINYP2P_MAX_ROOT_BYTES", 1024 * 1024),
+            store,
+            workspace,
+            grant_secret,
+            clock,
+            head_advance=heads.advance,
+            head_permit_issue=gate.issue_head_permit,
+            head_permit_commit=commit_permit,
+            permit_secret=permit_secret,
+            mint_authorize=gate.authorize_access,
+            path_authorize=gate.removal_path,
+            removal_bootstrap=gate.state.bootstrap,
+            object_open=issuer.open_object,
+            pack_open=issuer.open_pack,
+            sync_profile=peer_capability.OWNER,
+            max_request_bytes=_bounded_positive(
+                "TINYP2P_MAX_REQUEST_BYTES",
+                MAX_MINT_REQUEST_BYTES,
+                MAX_MINT_REQUEST_BYTES),
             max_object_bytes=_positive(
                 "TINYP2P_MAX_OBJECT_BYTES", MAX_REPOSITORY_OBJECT_BYTES),
             max_batch_count=_positive(
                 "TINYP2P_MAX_BATCH_COUNT", 256),
             max_batch_bytes=_positive(
-                "TINYP2P_MAX_BATCH_BYTES", 4 * 1024 * 1024),
-            max_mint_fetches=_positive(
-                "TINYP2P_MINT_MAX_FETCHES", 128),
-            max_mint_fetch_bytes=_positive(
-                "TINYP2P_MINT_MAX_FETCH_BYTES", 4 * 1024 * 1024),
+                "TINYP2P_MAX_BATCH_BYTES", MAX_PAGE_BATCH_BYTES),
             grant_ttl_ms=_positive(
                 "TINYP2P_GRANT_TTL", 60_000),
         )
@@ -162,18 +239,19 @@ def _event(event):
     if not isinstance(method, str) or not isinstance(path, str) \
             or not isinstance(headers, dict):
         raise ValueError("Function URL request")
+    body_limit = _request_limit(method, path)
     encoded = event.get("body")
     if encoded is None:
         body = b""
     elif not isinstance(encoded, str):
         raise ValueError("Function URL body")
     elif event.get("isBase64Encoded") is True:
-        if len(encoded) > 4 * ((MAX_MINT_REQUEST_BYTES + 2) // 3):
+        if len(encoded) > 4 * ((body_limit + 2) // 3):
             raise PayloadTooLarge("Function URL body")
         body = base64.b64decode(encoded, validate=True)
     else:
         body = encoded.encode()
-    if len(body) > MAX_MINT_REQUEST_BYTES:
+    if len(body) > body_limit:
         raise PayloadTooLarge("Function URL body")
     raw_query = event.get("rawQueryString") or ""
     if not isinstance(raw_query, str):

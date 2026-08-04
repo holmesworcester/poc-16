@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "poc-16-readonly-gateway",
+  "name": "poc-16-owner-gateway",
   "main": "build/worker/entry.py",
   "base_dir": "build/worker",
   "compatibility_date": "2026-07-29",
@@ -10,6 +10,9 @@
   "workers_dev": false,
   "preview_urls": false,
   "routes": [],
+  "limits": {
+    "subrequests": 10000
+  },
   "r2_buckets": [
     {
       "binding": "BUCKET",
@@ -21,20 +24,26 @@
   "vars": {
     "WORKSPACE": "0000000000000000000000000000000000000000000000000000000000000000",
     "STORE_PREFIX": "workspaces/0000000000000000000000000000000000000000000000000000000000000000",
+    "R2_ENDPOINT": "https://00000000000000000000000000000000.r2.cloudflarestorage.com",
+    "PACK_BUCKET": "replace-with-production-bucket",
+    "PACK_PUT_ENDPOINT": "https://packs.example.com",
+    "PACK_TTL_SECONDS": 60,
     "MAX_REQUEST_BYTES": 524288,
-    "MAX_ROOT_BYTES": 65536,
+    "MAX_CONTROL_BYTES": 5768222,
     "MAX_OBJECT_BYTES": 4194304,
     "MAX_BATCH_COUNT": 48,
     "MAX_BATCH_BYTES": 4194304,
-    "MAX_MINT_FETCHES": 48,
-    "MAX_MINT_FETCH_BYTES": 393216,
     "MAX_QUERY_BYTES": 4096,
     "MAX_QUERY_FIELDS": 8,
     "GRANT_TTL_MS": 60000
   },
   "secrets": {
     "required": [
-      "GRANT_SECRET"
+      "GRANT_SECRET",
+      "PERMIT_SECRET",
+      "PACK_TICKET_SECRET",
+      "R2_ACCESS_KEY_ID",
+      "R2_SECRET_ACCESS_KEY"
     ]
   },
   "python_modules": {
@@ -50,6 +59,8 @@
       "../../core",
       "../../facts",
       "../../adapters/r2",
+      "../../deploy/cloudflare_pack",
+      "../../deploy/cloudflare_sigv4.py",
       "../../core/http.py",
       "crypto_compat.py",
       "entry.py",

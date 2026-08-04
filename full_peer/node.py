@@ -1,28 +1,27 @@
-"""Full P2P composition: PileSender + RepositoryApplier + RepositoryReader.
-
-SQLite is a disposable local query/authorship projection.  It is rebuilt from
-the committed authenticated repository and is never an input to receiving,
-immutable-object creation, or root CAS.
-"""
+"""Stateful peer composition over the complete database-free writer core."""
 import asyncio
-from dataclasses import asdict
-import json
 import os
 import threading
 import time
 
+import facts
+
 from core import fact_index
-from core.crypto import h
+from core.access import AccessGate
+from core.close import encode_signed_pile
 from core.fact import Fact
-from core.ingress import ingress_key, parse_ingress_key
-from core.limits import (
-    MAX_REPOSITORY_OBJECT_BYTES,
-    MAX_ROOT_BYTES,
-)
-from core.repository_applier import RepositoryApplier
-from core.repository_reader import RepositoryReader
+from core.limits import MAX_CONTROL_PILE_BYTES
 from core.store import FsStore
-from full_peer.upload_journal import UploadSource
+from core.writer_head import WriterBinding, writer_store_binding
+from core.writer_repository import (
+    FactConsumer,
+    OpaqueHeadGate,
+    RepositoryMirror,
+    WriterLog,
+    open_accepted_pile,
+)
+from facts.auth.head_request import payload as head_proof_payload
+from facts.auth.removal_path_request import payload as path_proof_payload
 
 from . import bao_native, sql_store
 from .keychain import (
@@ -37,12 +36,15 @@ from .keychain import (
 from .pile_sender import PileSender
 
 
+ACCESS_PROOF_TTL_MS = 120_000
+
+
 def now_ms():
     return int(time.time() * 1000)
 
 
-def _run_applier(awaitable):
-    """Run core at the blocking FullPeer boundary; async hosts use to_thread."""
+def _run_core(awaitable):
+    """Run the shared async core at the blocking stateful-peer boundary."""
     return asyncio.run(awaitable)
 
 
@@ -57,20 +59,15 @@ class FullPeer:
         self._kr_path = os.path.join(dir, "keyring.json")
         self.keychain = Keychain(self._kr_path, initial_secret)
         self.sk, self.pk = self.keychain.default()
-        # app.db was a disposable projection cache. SqlStore now holds the
-        # canonical blobs and generic index needed by family queries.
-        try:
-            os.remove(os.path.join(dir, "app.db"))
-        except FileNotFoundError:
-            pass
-        self._stores, self._sql = {}, {}
-        self._appliers, self._senders = {}, {}
-        self.sync_cache = {}  # (ws, peer_url) -> walk state
+        self.permit_secret = bytes.fromhex(
+            self.keychain.data["permit_secret"])
+        self._stores, self._sql, self._senders = {}, {}, {}
+        self._consumers, self._mirrors, self._writers = {}, {}, {}
+        self._access_gates = {}
         self._iroh_peer_urls = {}  # (ws, endpoint) -> disposable loopback URL
         self._sync_errors = {}
-        self._ingress_attempt_errors = {}
-        for ws in self.workspaces():  # a stale/wiped index is rebuilt from the store
-            self._sync_sql(ws)
+        for ws in self.workspaces():
+            self._ensure_projection(ws)
 
     # ---- full-peer-local state -----------------------------------------------
 
@@ -102,14 +99,6 @@ class FullPeer:
     def has_workspace(self, workspace):
         return workspace in self.keyring["workspaces"]
 
-    def applier(self, workspace):
-        """Return the exact receiving engine shared with hosted recipients."""
-        with self.lock:
-            if workspace not in self._appliers:
-                self._appliers[workspace] = RepositoryApplier(
-                    workspace, self.store(workspace))
-            return self._appliers[workspace]
-
     def sender(self, workspace):
         """Return the SQL-permitted local pile author."""
         with self.lock:
@@ -117,18 +106,57 @@ class FullPeer:
                 self._senders[workspace] = PileSender(self, workspace)
             return self._senders[workspace]
 
-    def reader(self, workspace):
-        """Pin the same DB-free read capability used by hosted recipients."""
-        store = self.store(workspace)
-        root = store.get_bounded("root", MAX_ROOT_BYTES)
-        if root is None:
-            return None
-        return RepositoryReader(
-            workspace,
-            root,
-            lambda oid: store.get_bounded(
-                "obj/" + oid, MAX_REPOSITORY_OBJECT_BYTES),
+    def consumer(self, workspace):
+        """Compose core pile judgment with the disposable SQL sink."""
+        with self.lock:
+            if workspace not in self._consumers:
+                self._consumers[workspace] = FactConsumer(
+                    workspace,
+                    sql_store.LockedProjection(
+                        self.sql(workspace), self.lock),
+                )
+            return self._consumers[workspace]
+
+    def mirror(self, workspace):
+        """Return the exact directory/RBSR receiver shared with cloud peers."""
+        with self.lock:
+            if workspace not in self._mirrors:
+                access = self.access_gate(workspace)
+                self._mirrors[workspace] = RepositoryMirror(
+                    workspace,
+                    self.store(workspace),
+                    self.writer_binding,
+                    self.consumer(workspace),
+                    current_binding_for=self.current_writer_binding,
+                    control_state=access.state,
+                )
+            return self._mirrors[workspace]
+
+    def access_gate(self, workspace):
+        """Return the database-free two-phase gate for one recipient."""
+        with self.lock:
+            if workspace not in self._access_gates:
+                self._access_gates[workspace] = AccessGate(
+                    workspace, self.store(workspace))
+            return self._access_gates[workspace]
+
+    def head_gate(self, workspace):
+        """Compose exact-head CAS with the same database-free access gate."""
+        return OpaqueHeadGate(
+            self.store(workspace),
+            self.access_gate(workspace).authorize_head,
         )
+
+    def removal_bootstrap_pile(self, workspace):
+        """Open this device's original signed control leaf without reclosure."""
+        _secret, device = self.identity(workspace)
+        return _run_core(open_accepted_pile(
+            self.store(workspace),
+            workspace,
+            device,
+            1,
+            max_bytes=MAX_CONTROL_PILE_BYTES,
+        ))
 
     def add_workspace(self, workspace, name, peers, identity=None):
         """Record the locally trusted anchor before its first pile is opened."""
@@ -152,7 +180,6 @@ class FullPeer:
                 "peers": peers, "name": name,
                 "identity": identity}
             self._save_workspace(workspace, entry)
-            self._evict_sync_cache(workspace)
             self._forget_iroh_workspace(workspace)
             self._peers_changed()
 
@@ -186,46 +213,6 @@ class FullPeer:
     def attachment_io(self):
         return bao_native
 
-    def create_upload(self, workspace, pile):
-        return UploadSource.create(
-            os.path.join(self.dir, "uploads"),
-            workspace,
-            self.member_for(workspace),
-            pile,
-        )
-
-    def load_upload(self, upload_id):
-        return UploadSource.load(
-            os.path.join(self.dir, "uploads", upload_id))
-
-    def upload_status(self, workspace, cursor=None):
-        """Return one bounded page of local delivery state, never publication."""
-        page = UploadSource.discover(
-            os.path.join(self.dir, "uploads"), self.now_ms(), cursor)
-        return {
-            "cursor": page.cursor,
-            "uploads": [
-                asdict(status)
-                for status in page.uploads
-                if status.workspace == workspace
-            ],
-        }
-
-    def abandon_upload(self, workspace, upload_id):
-        source = self.load_upload(upload_id)
-        if source.workspace != workspace:
-            raise ValueError("upload source workspace")
-        return asdict(source.abandon(self.now_ms()))
-
-    def collect_upload(self, workspace, upload_id):
-        return UploadSource.collect(
-            os.path.join(self.dir, "uploads"),
-            workspace, upload_id, self.now_ms())
-
-    def run_upload(self, source, broker_url, provider_origin, proof):
-        from full_peer.upload_client_http import run_http
-        return run_http(source, broker_url, provider_origin, proof)
-
     def resolve_peer(self, workspace, peer):
         """Resolve local reachability; callers still use the ordinary HTTP client."""
         peer = normalize_peer(peer)
@@ -238,9 +225,6 @@ class FullPeer:
         url = self._forwarders.resolve(workspace, peer)
         key = workspace, peer["endpoint"]
         with self.lock:
-            previous = self._iroh_peer_urls.get(key)
-            if previous is not None and previous != url:
-                self._evict_sync_cache(workspace, previous)
             self._iroh_peer_urls[key] = url
         return url
 
@@ -308,28 +292,10 @@ class FullPeer:
     def bind_identity(self, workspace, identity):
         with self.lock:
             self.keychain.bind(workspace, identity)
-            self._evict_sync_cache(workspace)
-
-    def _evict_sync_cache(self, workspace, url=None):
-        """Detach reachability state without mutating an in-flight walk."""
-        with self.lock:
-            for key in [
-                key for key in self.sync_cache
-                if key[0] == workspace
-                and (url is None or key[1] == url)
-            ]:
-                self.sync_cache.pop(key)
-
-    def sync_state(self, workspace, url):
-        """Acquire one walk state at the same lock boundary used for eviction."""
-        with self.lock:
-            return self.sync_cache.setdefault((workspace, url), {})
 
     def _forget_iroh_peer(self, workspace, endpoint):
         with self.lock:
-            previous = self._iroh_peer_urls.pop((workspace, endpoint), None)
-            if previous is not None:
-                self._evict_sync_cache(workspace, previous)
+            self._iroh_peer_urls.pop((workspace, endpoint), None)
 
     def _forget_iroh_workspace(self, workspace):
         with self.lock:
@@ -337,40 +303,6 @@ class FullPeer:
                     key for key in self._iroh_peer_urls
                     if key[0] == workspace]:
                 self._forget_iroh_peer(*key)
-
-    def record_ingress_attempt_failure(self, ws, source, error):
-        """Expose a retained retryable/program failure without deleting it."""
-        self._ingress_attempt_errors[(ws, source)] = (
-            error,
-            {
-                "error": f"{type(error).__name__}: {error}",
-                "source": source,
-                "ts": now_ms(),
-            },
-        )
-
-    def clear_ingress_attempt_failure(self, ws, source):
-        self._ingress_attempt_errors.pop((ws, source), None)
-
-    def ingress_attempt_failures(self, ws):
-        out = []
-        for (workspace, source), (_, value) in sorted(
-                self._ingress_attempt_errors.items()):
-            if workspace != ws:
-                continue
-            if not self.store(ws).has(source):
-                self.clear_ingress_attempt_failure(ws, source)
-                continue
-            out.append(dict(value))
-        return out
-
-    def ingress_attempt_error(self, ws, source):
-        row = self._ingress_attempt_errors.get((ws, source))
-        return row[0] if row is not None else None
-
-    def ingress_failures(self, ws):
-        """Process-local failures; retained source bytes carry retry work."""
-        return self.ingress_attempt_failures(ws)
 
     def record_sync_failure(self, ws, url, error):
         with self.lock:
@@ -411,25 +343,24 @@ class FullPeer:
                     os.path.join(self.dir, "ws", ws + ".idx.db"), ws)
             return self._sql[ws]
 
-    def _sync_sql(self, ws):
-        """Refresh the disposable client projection without repository writes."""
-        reader = self.reader(ws)
-        projection = self.sql(ws)
-        if projection.current_for(reader):
-            return
-        projection.refresh(reader)
+    def _ensure_projection(self, ws):
+        """Replay accepted slots whose transactional SQL checkpoint lags."""
+        result = _run_core(self.mirror(ws).replay_local())
+        if result.errors:
+            raise ValueError(
+                f"writer projection replay failed: {result.errors[0][1]}")
 
     def fact_of(self, ws, fid) -> Fact:
         with self.lock:
-            self._sync_sql(ws)
-            return self.sql(ws).fact(fid)
+            self._ensure_projection(ws)
+            return self.sql(ws).fact_of(fid)
 
     def select(
             self, ws, kind, k0=None, k1=None, *,
             include_suppressed=False, **_options):
         """Select current facts through the one generic type/offer index."""
         with self.lock:
-            self._sync_sql(ws)
+            self._ensure_projection(ws)
             projection = self.sql(ws)
             rows = projection.indexed(kind, k0, k1)
             if include_suppressed:
@@ -445,7 +376,7 @@ class FullPeer:
     def keys(self, ws):
         """Canonical validated keys for client-only query assembly."""
         with self.lock:
-            self._sync_sql(ws)
+            self._ensure_projection(ws)
             return [
                 fact_key for (fact_key,) in self.idx(ws).execute(
                     "SELECT i.k0 FROM fact_index i "
@@ -453,77 +384,242 @@ class FullPeer:
                 )
             ]
 
-    # ---- the turn ------------------------------------------------------------
+    # ---- authoring tail: close -> signed writer leaf -> accepted slot --------
 
-    def turn(self, ws, source):
-        """Apply one caller-named local source through the shared engine."""
+    def ingest_new(self, ws, news, deps_new, *, owner=None):
+        return self.sender(ws).send(news, deps_new, owner=owner)
+
+    def _projected_writer_binding(self, workspace, device, owner=None):
+        """Read one live local authoring identity from disposable SQL."""
+        projection = self.sql(workspace)
+        # Direct membership proves ownership, not continuing liveness of this
+        # concrete device. The database-free gate checks the same typed cell.
+        if not projection.principal_active("device", device):
+            return None
+        owners = set()
+        if any(
+                not projection.suppresses(fact)
+                and ("member", device, device) in fact.offers()
+                for fact in projection.indexed(
+                    "member", device, device)):
+            owners.add(device)
+        owners.update(
+            offered_owner
+            for fact in projection.indexed("device_key", device)
+            if not projection.suppresses(fact)
+            for name, key, offered_owner in fact.offers()
+            if name == "device_key" and key == device and offered_owner
+            and (owner is None or offered_owner == owner)
+        )
+        if owner is not None:
+            owners.intersection_update((owner,))
+        if len(owners) > 1:
+            raise ValueError("ambiguous writer ownership")
+        if not owners:
+            return None
+        selected = next(iter(owners))
+        if not any(
+                not projection.suppresses(fact)
+                and ("member", selected, selected) in fact.offers()
+                for fact in projection.indexed(
+                    "member", selected, selected)) \
+                or device != selected and not any(
+                not projection.suppresses(fact)
+                and ("device_key", device, selected) in fact.offers()
+                for fact in projection.indexed(
+                    "device_key", device, selected)):
+            return None
+        return WriterBinding(
+            workspace,
+            device,
+            selected,
+            writer_store_binding(workspace, device),
+        )
+
+    async def writer_binding(
+            self, workspace, device, _removal_root, candidate):
+        """Bind a signed-head claim; its closed piles must prove the claim."""
+        if getattr(candidate, "workspace", None) != workspace \
+                or getattr(candidate, "device", None) != device:
+            raise ValueError("writer head claim")
+        return WriterBinding(
+            workspace,
+            device,
+            candidate.owner,
+            writer_store_binding(workspace, device),
+        )
+
+    async def current_writer_binding(
+            self, workspace, device, removal_root, candidate):
+        """Use the same claim binding for new suffixes; core validates piles."""
+        return await self.writer_binding(
+            workspace, device, removal_root, candidate)
+
+    def local_writer_binding(self, workspace):
+        """Return this peer's live owner binding for one publication turn."""
         with self.lock:
-            store = self.store(ws)
-            before = store.get_bounded("root", MAX_ROOT_BYTES)
-            try:
-                result = _run_applier(self.applier(ws).apply_exact(
-                    store, source, parse_ingress_key(source).digest))
-            except Exception as error:
-                self.record_ingress_attempt_failure(ws, source, error)
-                return []
-            return self._finish_turn(ws, source, before, result)
+            self._ensure_projection(workspace)
+            _secret, device = self.identity(workspace)
+            return self._projected_writer_binding(workspace, device)
 
-    def _finish_turn(self, ws, source, before, result):
-        """Reflect one core result into disposable full-peer state."""
-        store = self.store(ws)
-        if result.status == "retryable":
-            self.record_ingress_attempt_failure(
-                ws, source, RuntimeError("repository apply retryable"))
+    def _writer(self, workspace, owner):
+        secret, device = self.identity(workspace)
+        key = workspace, device, owner
+        if key not in self._writers:
+            binding = WriterBinding(
+                workspace, device, owner,
+                writer_store_binding(workspace, device))
+            self._writers[key] = WriterLog(
+                workspace, device, owner, binding.store,
+                secret, self.store(workspace))
+        return self._writers[key]
+
+    def removal_path_proof(
+            self, workspace, *, owner=None, closures=()):
+        """Build the historical-member phase signed by this exact device."""
+        timestamp = now_ms()
+        closed = path_proof_payload(
+            self,
+            workspace,
+            timestamp + ACCESS_PROOF_TTL_MS,
+            timestamp,
+            owner=owner,
+            closures=closures,
+        )
+        return self.sender(workspace).pack(closed)
+
+    def head_proof(
+            self, workspace, owner, base_head, proposed_head, *,
+            removal_path, closures=()):
+        """Build one disposable proof for this device's exact head update."""
+        timestamp = now_ms()
+        closed = head_proof_payload(
+            self,
+            workspace,
+            owner,
+            base_head,
+            proposed_head,
+            timestamp + ACCESS_PROOF_TTL_MS,
+            removal_path,
+            timestamp,
+            closures=closures,
+        )
+        return self.sender(workspace).pack(closed)
+
+    def publish_closed(self, workspace, closures, *, owner=None):
+        """Publish and consume one batch through the same core as a pull."""
+        closures = tuple(tuple(closure) for closure in closures)
+        if not closures:
             return []
-        if result.status == "rejected":
-            self.record_ingress_attempt_failure(
-                ws, source, ValueError("repository rejected exact pile"))
-            return []
-        self.clear_ingress_attempt_failure(ws, source)
-        if store.get_bounded("root", MAX_ROOT_BYTES) != before:
-            self._evict_sync_cache(ws)
-        self._sync_sql(ws)
-        return list(result.admitted)
-
-    # ---- authoring tail: close -> own pile -> turn ("kick") ------------------
-
-    def ingest_new(self, ws, news, deps_new):
-        return self.sender(ws).send(news, deps_new)
-
-    def receive_pile(self, ws, member, raw):
-        """Persist one received body, then invoke the shared exact Applier."""
         with self.lock:
-            payload = h(raw)
-            source = ingress_key(ws, payload[:32], member, payload)
-            store = self.store(ws)
-            before = store.get_bounded("root", MAX_ROOT_BYTES)
-            try:
-                result = _run_applier(
-                    self.applier(ws).receive_pile(member, raw))
-            except Exception as error:
-                self.record_ingress_attempt_failure(ws, source, error)
-                return []
-            return self._finish_turn(ws, source, before, result)
+            secret, device = self.identity(workspace)
+            binding = self._projected_writer_binding(
+                workspace, device)
+            if owner is not None:
+                if binding is None or binding.owner != owner:
+                    raise ValueError("publishing identity owner mismatch")
+            elif binding is not None:
+                owner = binding.owner
+            else:
+                bootstrap_owners = {
+                    owner
+                    for closure in closures
+                    for fact in closure
+                    for name, key, owner in fact.offers()
+                    if name == "member" and key == device and owner == device
+                }
+                if bootstrap_owners != {device} \
+                        or self.sql(workspace).fact_ids():
+                    raise ValueError("writer has no current durable owner")
+                owner = device
+            before = self.sql(workspace).fact_ids()
+            writer = self._writer(workspace, owner)
+            update = _run_core(writer.prepare(closures))
+            _run_core(writer.establish(update))
+            access = self.access_gate(workspace)
+            raw_piles = tuple(map(encode_signed_pile, update.piles))
+            if _run_core(access.state.pin()) is None:
+                for raw in raw_piles:
+                    result = _run_core(access.state.bootstrap(raw))
+                    if result.status in {"applied", "noop"}:
+                        break
+                if _run_core(access.state.pin()) is None:
+                    raise ValueError(
+                        "first writer update needs a clear control pile")
+
+            classified = self.consumer(workspace).prepare_batch(
+                tuple((raw, device) for raw in raw_piles),
+                owner=owner,
+            )
+            control = set(classified.control_piles)
+            control_piles = tuple(
+                raw for oid, raw in zip(update.pile_oids, raw_piles)
+                if oid in control)
+
+            path_proof = self.removal_path_proof(
+                workspace, owner=owner, closures=closures)
+            removal_path = _run_core(access.removal_path(
+                path_proof, now_ms()))
+            if removal_path is None:
+                raise ValueError("historical membership proof rejected")
+            proof = self.head_proof(
+                workspace,
+                owner,
+                update.base_head,
+                update.head_oid,
+                removal_path=removal_path,
+                closures=closures,
+            )
+            head_gate = self.head_gate(workspace)
+            if control_piles:
+                permit = _run_core(access.issue_head_permit(
+                    proof,
+                    update.head_oid,
+                    control_piles,
+                    now_ms(),
+                    self.permit_secret,
+                ))
+                if not isinstance(permit, bytes):
+                    raise ValueError("control-head permit rejected")
+                outcome = _run_core(access.commit_head_permit(
+                    head_gate,
+                    permit,
+                    update.head_oid,
+                    self.permit_secret,
+                ))
+            else:
+                outcome = _run_core(head_gate.advance(
+                    proof, update.head_oid, now_ms()))
+            if outcome.status not in {"applied", "noop"}:
+                raise RuntimeError("writer head advance requires rebase")
+            replay = _run_core(self.mirror(workspace).replay_local())
+            if replay.errors:
+                raise ValueError(
+                    f"writer projection failed: {replay.errors[0][1]}")
+            return sorted(self.sql(workspace).fact_ids() - before)
 
     # ---- rebuild: the store's own units through the same kernel --------------
 
     def rebuild(self, ws, *, republish=False):
-        """Rebuild only the disposable SQL projection from the pinned root."""
+        """Rebuild only disposable SQL from durable accepted writer slots."""
         if republish:
-            raise ValueError(
-                "repository repair requires an exact RepositoryApplier pile")
+            raise ValueError("writer trees are never rebuilt from SQL")
         with self.lock:
-            self.sql(ws).refresh(self.reader(ws))
+            self.sql(ws).reset()
+            result = _run_core(self.mirror(ws).replay_local())
+            if result.errors:
+                raise ValueError(
+                    f"writer projection rebuild failed: {result.errors[0][1]}")
 
     # ---- exact suppression consult -------------------------------------------
 
     def suppressed(self, ws, fact):
         """The one local mask: explicit fact scopes intersect active actions."""
         with self.lock:
-            self._sync_sql(ws)
+            self._ensure_projection(ws)
             return self.sql(ws).suppresses(fact)
 
     def suppression_active(self, ws, sid):
         with self.lock:
-            self._sync_sql(ws)
+            self._ensure_projection(ws)
             return self.sql(ws).active(sid)

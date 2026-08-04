@@ -1,10 +1,14 @@
-"""Structural authority ratchets complement the behavioral role tests."""
+"""Small structural ratchets for the running peer architecture.
+
+Behavior belongs in black-box tests.  These assertions protect boundaries
+that are easy to violate accidentally while still producing correct-looking
+unit results: one core protocol, private removal state, and no resurrection of
+the retired aggregate repository.
+"""
+
 import ast
-import json
 from pathlib import Path
 import re
-import subprocess
-import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,19 +16,14 @@ ROOT_DOCS = {"AGENTS.md", "DESIGN.md", "README.md"}
 SOURCE_ROOTS = (
     "core", "full_peer", "facts", "notifications", "adapters", "deploy")
 EXCLUDED_PARTS = {
-    "__pycache__",
-    ".pytest_cache",
-    ".wrangler",
-    "build",
-    "generated",
-    "node_modules",
-    "python_modules",
+    "__pycache__", ".pytest_cache", ".wrangler", "build", "generated",
+    "node_modules", "python_modules",
 }
 
 
 def source_paths():
-    """Discover the working filesystem, including untracked production code."""
-    paths = []
+    """Include untracked production Python while excluding build artifacts."""
+    found = []
     for root_name in SOURCE_ROOTS:
         for path in (ROOT / root_name).rglob("*.py"):
             relative = path.relative_to(ROOT)
@@ -33,47 +32,55 @@ def source_paths():
                     or path.name.startswith("test_") \
                     or "tests" in relative.parts:
                 continue
-            paths.append(relative)
-    return tuple(sorted(paths))
+            found.append(relative)
+    return tuple(sorted(found))
 
 
 def parsed(path):
     return ast.parse((ROOT / path).read_text(), filename=str(path))
 
 
-def class_definitions(name):
+def definitions(name, kind=ast.ClassDef):
     return [
         path
         for path in source_paths()
         for item in ast.walk(parsed(path))
-        if isinstance(item, ast.ClassDef) and item.name == name
+        if isinstance(item, kind) and item.name == name
     ]
 
 
-def annotated_fields(path, class_name):
-    owner = next(
+def owner(path, name):
+    return next(
         item for item in parsed(path).body
-        if isinstance(item, ast.ClassDef) and item.name == class_name)
-    return tuple(
-        item.target.id
-        for item in owner.body
-        if isinstance(item, ast.AnnAssign)
-        and isinstance(item.target, ast.Name)
-    )
+        if isinstance(item, ast.ClassDef) and item.name == name)
 
 
-def calls_named(name):
-    return [
-        (path, call)
-        for path in source_paths()
-        for call in ast.walk(parsed(path))
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == name
-    ]
+def method(path, class_name, name):
+    return next(
+        item for item in owner(path, class_name).body
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and item.name == name)
 
 
-def test_only_three_markdown_authorities_remain():
+def imports(path):
+    names = []
+    for item in ast.walk(parsed(path)):
+        if isinstance(item, ast.Import):
+            names.extend(alias.name for alias in item.names)
+        elif isinstance(item, ast.ImportFrom):
+            names.append(item.module or "")
+    return tuple(names)
+
+
+def production_text():
+    return "\n".join((ROOT / path).read_text() for path in source_paths())
+
+
+def flat(path):
+    return re.sub(r"\s+", " ", (ROOT / path).read_text())
+
+
+def test_only_three_root_documents_exist_and_links_resolve():
     found = {
         path.relative_to(ROOT).as_posix()
         for path in ROOT.rglob("*.md")
@@ -84,771 +91,309 @@ def test_only_three_markdown_authorities_remain():
     assert found == ROOT_DOCS
     assert not (ROOT / "docs").exists()
 
-
-def test_root_document_links_resolve_locally():
     link = re.compile(r"\[[^]]+]\(([^)]+)\)")
     for name in ROOT_DOCS:
         source = ROOT / name
         for target in link.findall(source.read_text()):
             if "://" in target or target.startswith("#"):
                 continue
-            path = target.split("#", 1)[0]
-            assert (source.parent / path).exists(), (
+            assert (source.parent / target.split("#", 1)[0]).exists(), (
                 f"{name} links missing {target}")
 
 
-def test_writer_log_target_is_not_claimed_as_running_before_cutover():
-    documents = {
-        name: re.sub(r"\s+", " ", (ROOT / name).read_text().replace(">", ""))
-        for name in ROOT_DOCS
-    }
-    assert all("poc-16-iq2" in text for text in documents.values())
-    assert "accepted target architecture" in documents["DESIGN.md"]
-    assert "Current `main` still implements the predecessor" \
-        in documents["DESIGN.md"]
-    assert "running code and operational instructions below still describe" \
-        in documents["README.md"]
-    assert "Do not deepen the predecessor's global-root assumptions" \
-        in documents["AGENTS.md"]
+def test_documents_describe_the_running_writer_forest_and_access_gate():
+    design = flat(ROOT / "DESIGN.md")
+    readme = flat(ROOT / "README.md")
+    guide = flat(ROOT / "AGENTS.md")
+    joined = " ".join((design, readme, guide))
 
-
-def test_target_has_one_closed_pile_evaluation_boundary():
-    design = (ROOT / "DESIGN.md").read_text()
-    guide = (ROOT / "AGENTS.md").read_text()
-    flat_design = re.sub(r"\s+", " ", design)
-
-    assert "CloudGate" not in design + guide
+    assert "defines the running architecture" in design
+    assert "There is no workspace-global mutable content root" in readme
+    assert "POC-16 has no backwards-compatibility surface" in guide
+    assert "AccessGate" in design and "AccessGate" in guide
     assert "ClosedPileEvaluator" in design
-    assert "AuthorityGate" in design and "AuthorityGate" in guide
     assert "Pull is replication. Push is not." in design
-    assert "A pushed pile never enters" in design + guide
+    assert "Every logical writer-tree leaf is independently closed" in design
+    assert "no range or page boundary splits a pile" in design
+    assert "Historical membership reveals only the caller's path" in design
+    assert "Every pile is signed directly by its publishing device" in design
+    assert "range-based set reconciliation (RBSR)" in design
+    assert "not one sync session per pile" in design
     assert "Hosted and local turns are isomorphic" in design
-    assert "Every logical writer-tree leaf is independently closed" \
-        in flat_design
-    assert "no range or page boundary splits a pile" in flat_design
+
+    stale_claims = (
+        "accepted target architecture",
+        "Current `main` still implements the predecessor",
+        "One-way cutover from the current global root",
+        "After cutover, no workspace-global mutable content root remains",
+    )
+    assert all(claim not in joined for claim in stale_claims)
 
 
-def test_retired_authority_implementations_cannot_return():
-    for relative in (
-            "core/admission.py",
-            "core/admission_proof.py",
-            "core/candidate_archive.py",
-            "core/cmds.py",
-            "core/legacy_v7.py",
-            "core/mint.py",
-            "core/publication.py",
-            "core/settlement.py",
-            "core/runtime.py",
-            "core/removals.py",
-            "core/bao.py",
-            "core/catalog.py",
-            "core/cli.py",
-            "core/client_projection.py",
-            "core/daemon.py",
-            "core/keychain.py",
-            "core/node.py",
-            "core/pile_sender.py",
-            "core/status.py",
-            "core/suppression_state.py",
-            "core/sync.py",
-            "core/walk.py",
-            "deploy/upload_client.py",
-            "deploy/upload_client_http.py",
-            "deploy/upload_journal.py",
-            "deploy/gateway.py",
-            "deploy/cloudflare_upload/worker/publisher_stub.py"):
-        assert not (ROOT / relative).exists()
+def test_retired_aggregate_repository_cannot_return():
+    retired = {
+        "core/admission.py",
+        "core/admission_proof.py",
+        "core/authority.py",
+        "core/candidate_archive.py",
+        "core/catalog.py",
+        "core/client_projection.py",
+        "core/ingress.py",
+        "core/node.py",
+        "core/pile_sender.py",
+        "core/publication.py",
+        "core/repository_applier.py",
+        "core/repository_reader.py",
+        "core/repository_snapshot.py",
+        "core/runtime.py",
+        "core/settlement.py",
+        "core/snapshot.py",
+        "core/sync.py",
+        "core/validated_set.py",
+        "core/worker.py",
+        "deploy/gateway.py",
+        "deploy/upload_broker.py",
+        "deploy/upload_client.py",
+        "deploy/upload_journal.py",
+        "full_peer/upload_client.py",
+        "full_peer/upload_journal.py",
+    }
+    assert not [relative for relative in retired if (ROOT / relative).exists()]
+
     for name in (
-            "AdmissionMembrane",
-            "Publisher",
+            "AdmissionMembrane", "AuthorityRepository", "Candidate",
+            "FactRecord", "Node", "Publisher", "RepositoryApplier",
+            "RepositoryReader", "Settlement", "ValidatedSet", "WorkerView",
             "WorkspaceRuntime"):
-        assert class_definitions(name) == []
-    assert class_definitions("PileSender") == [
-        Path("full_peer/pile_sender.py")]
-    assert class_definitions("FullPeer") == [Path("full_peer/node.py")]
-    assert class_definitions("UploadClient") == [
-        Path("full_peer/upload_client.py")]
-    assert class_definitions("UploadSource") == [
-        Path("full_peer/upload_journal.py")]
-    assert class_definitions("UploadSourceBuilder") == []
-    assert class_definitions("Node") == []
-    assert class_definitions("RepositoryApplier") == [
-        Path("core/repository_applier.py")]
-    assert class_definitions("RepositoryReader") == [
-        Path("core/repository_reader.py")]
+        assert definitions(name) == []
+
+    text = production_text()
+    for retired_name in (
+            "AuthorityRepository.publish", "AUTHORITY_ROOT_KEY",
+            "_publish_authority", "advance_leaf"):
+        assert retired_name not in text
 
 
-def test_validated_residence_has_no_persisted_admission_judgment():
-    """A closed pile is the certificate; repository residence stores no path."""
-    for name in (
-            "AdmissionProof",
-            "Candidate",
-            "CandidateView",
-            "FactRecord",
-            "Settlement",
-    ):
-        assert class_definitions(name) == []
-
-    assert annotated_fields(Path("core/fact.py"), "Need") == (
-        "role", "name", "a0", "a1")
-    assert annotated_fields(Path("core/kernel.py"), "ResolvedEdge") == (
-        "role", "fid")
-    assert annotated_fields(Path("core/kernel.py"), "Valid") == (
-        "fact", "edges")
-    assert annotated_fields(
-        Path("core/validated_set.py"), "ValidatedSet") == (
-            "workspace", "root", "facts")
-
-
-def test_core_dispatches_through_facts_without_importing_family_modules():
-    """Core may call the checked router, but family modules stay authoritative."""
+def test_core_is_the_database_free_engine_and_families_own_semantics():
     offenders = []
     for path in source_paths():
-        if path.parts[0] != "core":
-            continue
-        for item in ast.walk(parsed(path)):
-            if isinstance(item, ast.ImportFrom):
-                names = (item.module or "",)
-            elif isinstance(item, ast.Import):
-                names = tuple(alias.name for alias in item.names)
-            else:
-                continue
-            for name in names:
-                if name == "facts.auth" or name.startswith("facts.auth.") \
-                        or name == "facts.content" \
-                        or name.startswith("facts.content."):
-                    offenders.append((path.as_posix(), name))
-    assert offenders == []
-
-
-def test_repository_core_cannot_own_notification_delivery():
-    """Push is a replayable consequence of a root, never a commit effect."""
-    offenders = []
-    for path in source_paths():
-        if path.parts[0] != "core":
-            continue
-        for item in ast.walk(parsed(path)):
-            if isinstance(item, ast.ImportFrom):
-                names = (item.module or "",)
-            elif isinstance(item, ast.Import):
-                names = tuple(alias.name for alias in item.names)
-            else:
-                continue
+        names = imports(path)
+        if path.parts[0] == "core":
             offenders.extend(
-                (path.as_posix(), name)
-                for name in names
-                if name == "notifications" or name.startswith("notifications."))
-    assert offenders == []
-    assert not (ROOT / "core/delivery_queue.py").exists()
-    applier = (ROOT / "core/repository_applier.py").read_text()
-    assert "publication_effect" not in applier
-    assert "notification" not in applier
-
-
-def test_facts_depend_on_host_capabilities_not_full_peer_or_deploy():
-    """Family policy/commands name behavior, never one host implementation."""
-    offenders = []
-    for path in source_paths():
-        if path.parts[0] != "facts":
-            continue
-        for item in ast.walk(parsed(path)):
-            if isinstance(item, ast.ImportFrom):
-                names = (item.module or "",)
-            elif isinstance(item, ast.Import):
-                names = tuple(alias.name for alias in item.names)
-            else:
-                continue
+                (path, name) for name in names
+                if name == "sqlite3" or name == "full_peer"
+                or name.startswith("full_peer.")
+                or name == "notifications"
+                or name.startswith("notifications."))
             offenders.extend(
-                (path.as_posix(), name)
-                for name in names
+                (path, name) for name in names
+                if name == "facts.auth" or name.startswith("facts.auth.")
+                or name == "facts.content"
+                or name.startswith("facts.content."))
+        elif path.parts[0] == "facts":
+            offenders.extend(
+                (path, name) for name in names
                 if name.split(".", 1)[0] in {
-                    "adapters", "deploy", "full_peer"}
-            )
+                    "adapters", "deploy", "full_peer"})
     assert offenders == []
 
-    node = next(
-        item for item in parsed(Path("full_peer/node.py")).body
-        if isinstance(item, ast.ClassDef) and item.name == "FullPeer")
-    assert {
-        "abandon_upload",
-        "attachment_io",
-        "collect_upload",
-        "create_upload",
-        "load_upload",
-        "now_ms",
-        "run_upload",
-        "upload_status",
-    } <= {
-        item.name for item in node.body
-        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
+    assert definitions("FactContext") == [Path("facts/_policy.py")]
+    assert definitions("FullPeer") == [Path("full_peer/node.py")]
+    assert definitions("HttpGate") == [Path("core/http.py")]
+    assert definitions("AccessGate") == [Path("core/access.py")]
 
 
-def test_full_peer_owns_upload_client_state_not_provider_runtime():
-    """Client state flows down to shared wire values, never broker code."""
-    allowed_shared_protocol = {
-        "deploy.upload_session",
-        "deploy.upload_wire",
-    }
-    offenders = []
-    for path in source_paths():
-        if path.parts[0] != "full_peer":
-            continue
-        for item in ast.walk(parsed(path)):
-            if isinstance(item, ast.ImportFrom):
-                names = (item.module or "",)
-            elif isinstance(item, ast.Import):
-                names = tuple(alias.name for alias in item.names)
-            else:
-                continue
-            offenders.extend(
-                (path.as_posix(), name)
-                for name in names
-                if name == "deploy" or name.startswith("deploy.")
-                if name not in allowed_shared_protocol
-            )
-    assert offenders == []
-
-    deploy_to_client = []
-    for path in source_paths():
-        if path.parts[0] != "deploy":
-            continue
-        for item in ast.walk(parsed(path)):
-            if isinstance(item, ast.ImportFrom):
-                names = (item.module or "",)
-            elif isinstance(item, ast.Import):
-                names = tuple(alias.name for alias in item.names)
-            else:
-                continue
-            deploy_to_client.extend(
-                (path.as_posix(), name)
-                for name in names
-                if name in {
-                    "full_peer.upload_client",
-                    "full_peer.upload_client_http",
-                    "full_peer.upload_journal",
-                }
-            )
-    assert deploy_to_client == []
+def test_core_writer_engine_has_one_authority_flow():
+    expected = Path("core/writer_repository.py")
     for name in (
-            "FinalizedUpload",
-            "OpenedUpload",
-            "UploadCapability"):
-        assert class_definitions(name) == [Path("deploy/upload_wire.py")]
+            "FactConsumer", "OpaqueHeadGate", "OwnerPublisher",
+            "RepositoryMirror", "WriterLog"):
+        assert definitions(name) == [expected]
 
+    node = (ROOT / "full_peer/node.py").read_text()
+    sync = (ROOT / "full_peer/sync.py").read_text()
+    assert "RepositoryMirror(" in node
+    assert "OwnerPublisher(" in sync
+    assert "RepositoryMirror(" in sync
+    assert "RepositoryApplier" not in node + sync
+    assert "authority_root" not in node + sync
+    assert "authority_recover" not in node + sync
 
-def test_one_explicit_fact_context_serves_core_and_full_peer_authoring():
-    assert class_definitions("FactContext") == [Path("facts/_policy.py")]
-    for path, owner in (
-            (Path("core/kernel.py"), "MemoryContext"),
-            (Path("full_peer/sql_store.py"), "SqlStore")):
-        definition = next(
-            item for item in parsed(path).body
-            if isinstance(item, ast.ClassDef) and item.name == owner)
-        members = {
-            item.name for item in definition.body
-            if isinstance(item, ast.FunctionDef)
-        } | {
-            target.id
-            for item in definition.body if isinstance(item, ast.Assign)
-            for target in item.targets if isinstance(target, ast.Name)
-        }
-        assert {"fact_of", "offers_from", "resolve_offer"} <= members
-
-    for path in (Path("core/kernel.py"), Path("facts/_policy.py")):
-        assert not [
-            call for call in ast.walk(parsed(path))
-            if isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Name)
-            and call.func.id == "hasattr"
-        ]
-
-
-def test_one_repository_root_cas_and_one_root_compiler():
-    semantic = []
-    for path, call in calls_named("cas"):
-        if call.args and isinstance(call.args[0], ast.Constant) \
-                and call.args[0].value == "root":
-            semantic.append((path, call))
-    assert [path for path, _call in semantic] == [
-        Path("core/repository_applier.py"),
-        Path("notifications/discovery.py"),
-        Path("notifications/discovery.py"),
-    ]
-    notification_owners = []
-    for _path, call in semantic[1:]:
-        owner = call.func.value
-        assert isinstance(owner, ast.Attribute) \
-                and isinstance(owner.value, ast.Name) \
-                and owner.value.id == "self"
-        notification_owners.append(owner.attr)
-    assert notification_owners == ["store", "cursor_store"]
-
-    encode_root = []
-    for path in source_paths():
-        if path == Path("core/snapshot.py"):
-            continue
-        for call in ast.walk(parsed(path)):
-            if isinstance(call, ast.Call) \
-                    and isinstance(call.func, ast.Attribute) \
-                    and call.func.attr == "encode_root":
-                encode_root.append(path)
-    assert encode_root == [Path("core/repository_snapshot.py")]
-
-    applier = (ROOT / "core" / "repository_applier.py").read_text()
-    assert "extend_snapshot" in applier
-    assert "compile_snapshot" not in applier
-    assert "reconstruct" not in applier
-
-
-def test_provider_authentication_has_no_materialized_winner_tree():
-    from core import indexes, snapshot
-    from core.worker import WorkerView
-
-    assert snapshot.MAP_NAMES == ("fact_order", "fact", "supp")
-    assert indexes.TREE_NAMES == ("fact", "supp")
-    assert not hasattr(indexes, "AUTHORITY")
-    assert not hasattr(indexes, "action_key")
-    assert not hasattr(WorkerView, "authority_provider")
-    assert not hasattr(WorkerView, "authority_known")
-    assert hasattr(WorkerView, "fact_known")
-
-
-def test_applier_owns_object_establishment_and_exact_source_identity():
-    object_store_functions = {
-        item.name for item in parsed(Path("core/object_store.py")).body
+    node_methods = {
+        item.name for item in owner(Path("full_peer/node.py"), "FullPeer").body
         if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    assert "ensure_object" not in object_store_functions
+    assert {"mirror", "publish_closed"} <= node_methods
+    assert {"turn", "receive_pile", "applier"}.isdisjoint(node_methods)
 
-    for function, expected in (
-            ("ensure_object_async", {
-                "core/repository_applier.py",
-                "notifications/discovery.py",
-            }),):
-        callers = {
-            path.as_posix()
-            for path in source_paths()
-            if path != Path("core/object_store.py")
-            and path != Path("core/ingress.py")
-            for call in ast.walk(parsed(path))
-            if isinstance(call, ast.Call)
-            and (
-                isinstance(call.func, ast.Name)
-                and call.func.id == function
-                or isinstance(call.func, ast.Attribute)
-                and call.func.attr == function)
-        }
-        assert callers == expected
 
-    assert not {
-        path.as_posix()
-        for path in source_paths()
-        if path != Path("core/object_store.py")
-        for call in ast.walk(parsed(path))
-        if isinstance(call, ast.Call)
-        and (
-            isinstance(call.func, ast.Name)
-            and call.func.id == "retire_exact_async"
-            or isinstance(call.func, ast.Attribute)
-            and call.func.attr == "retire_exact_async")
+def test_http_has_one_route_table_and_only_private_removal_control():
+    handle = method(Path("core/http.py"), "HttpGate", "handle")
+    routes = {
+        item.value for item in ast.walk(handle)
+        if isinstance(item, ast.Constant)
+        and isinstance(item.value, str)
+        and item.value.startswith("/")
     }
+    assert {
+        "/ctl", "/head/", "/heads", "/invite/", "/layout/", "/mint",
+        "/mirror/", "/obj", "/obj/", "/obj/open", "/pack/open",
+        "/readyz", "/removal/bootstrap",
+        "/removal/path",
+    } <= routes
+    assert {
+        "/authority", "/page", "/page/", "/pile/", "/removal/advance",
+        "/removal/apply", "/root",
+    }.isdisjoint(routes)
+
+    # Adapters compose HttpGate; they do not grow a second peer route table.
+    assert not {
+        item.value
+        for item in ast.walk(parsed(Path("core/http_stdlib.py")))
+        if isinstance(item, ast.Constant)
+        and isinstance(item.value, str)
+        and item.value.startswith("/")
+    }
+    daemon = parsed(Path("full_peer/daemon.py"))
+    assert not [
+        item for item in ast.walk(daemon)
+        if isinstance(item, ast.FunctionDef)
+        and item.name in {"do_GET", "do_PUT"}
+    ]
+
+    source = (ROOT / "core/http.py").read_text()
+    assert 'parts[2] == "permit"' in source
+    assert 'parts[2] == "commit"' in source
+    assert "self.head_permit_issue(" in source
+    assert "self.head_permit_commit(" in source
+    assert "HttpGate.requires_access_callbacks(method, path)" in (
+        ROOT / "core/http_stdlib.py").read_text()
+    assert "HttpGate.requires_mirror_callback(method, path)" in (
+        ROOT / "core/http_stdlib.py").read_text()
+    production = production_text()
+    assert "/removal/apply" not in production
+    assert "POST /authority" not in production
 
 
-def test_canonical_objects_have_no_detached_write_door():
-    callers = {
-        path.as_posix()
+def test_removal_roots_and_nodes_are_not_generic_objects_or_grants():
+    tree = (ROOT / "core/suppression_tree.py").read_text()
+    keys = (ROOT / "core/object_store.py").read_text()
+    assert 'REMOVAL_ROOT_KEY = "removal"' in keys
+    assert 'REMOVAL_NODE_PREFIX = "removal-node/"' in keys
+    assert "private_node_key" in tree
+
+    exposed = "\n".join(
+        (ROOT / path).read_text()
+        for path in (
+            Path("core/grants.py"),
+            Path("core/pack_access.py"),
+            Path("core/writer_layout.py"),
+        ))
+    assert "REMOVAL_ROOT_KEY" not in exposed
+    assert "REMOVAL_NODE_PREFIX" not in exposed
+    assert "removal-node/" not in exposed
+
+    http = (ROOT / "core/http.py").read_text()
+    assert '"obj/" + oid' in http
+    assert '"removal-node/"' not in http
+    assert '"removal"' not in ast.get_docstring(parsed(Path("core/http.py")))
+
+
+def test_closed_signed_piles_are_the_only_semantic_transfer_unit():
+    close = parsed(Path("core/close.py"))
+    functions = {
+        item.name for item in close.body
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert {"decode_signed_pile", "encode_signed_pile"} <= functions
+    assert {"decode_pile", "encode_pile"}.isdisjoint(functions)
+    assert definitions("ClosedPileEvaluator") == [Path("core/close.py")]
+
+    text = production_text()
+    assert "put_pile" not in text
+    assert "decode_pile" not in text
+    assert "encode_pile" not in text
+
+    for path, class_name, name in (
+            (Path("full_peer/pile_sender.py"), "PileSender", "pack"),
+            (Path("full_peer/pile_sender.py"), "PileSender", "send"),
+            (Path("full_peer/node.py"), "FullPeer", "publish_closed")):
+        parameters = {
+            argument.arg
+            for argument in (
+                *method(path, class_name, name).args.posonlyargs,
+                *method(path, class_name, name).args.args,
+                *method(path, class_name, name).args.kwonlyargs,
+            )
+        }
+        assert "blobs" not in parameters
+
+
+def test_canonical_object_creation_has_no_detached_write_door():
+    assert not [
+        (path, call.lineno)
         for path in source_paths()
         for call in ast.walk(parsed(path))
         if isinstance(call, ast.Call)
         and isinstance(call.func, ast.Attribute)
         and call.func.attr == "admit_object"
-    }
-    assert callers == set()
-
-    # Provider adapters expose mutation mechanics and deployment code may
-    # conditionally create isolated ingress. Neither is another canonical
-    # obj/* writer. Track simple local aliases as well as inline key building
-    # so the ratchet does not ban legitimate non-canonical creates.
-    offenders = []
-    for path in source_paths():
-        if path.parts[0] not in {"full_peer", "adapters", "deploy"}:
-            continue
-        for function in (
-                item for item in ast.walk(parsed(path))
-                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))):
-            names = set()
-
-            def canonical(expression):
-                return any(
-                    isinstance(node, ast.Constant)
-                    and isinstance(node.value, str)
-                    and (node.value == "obj" or node.value.startswith("obj/"))
-                    or isinstance(node, ast.Name) and node.id in names
-                    for node in ast.walk(expression)
-                )
-
-            for assignment in (
-                    item for item in ast.walk(function)
-                    if isinstance(item, (ast.Assign, ast.AnnAssign))):
-                value = assignment.value
-                if value is None or not canonical(value):
-                    continue
-                targets = assignment.targets \
-                    if isinstance(assignment, ast.Assign) \
-                    else (assignment.target,)
-                names.update(
-                    node.id
-                    for target in targets
-                    for node in ast.walk(target)
-                    if isinstance(node, ast.Name)
-                )
-            offenders.extend(
-                (path, call.lineno)
-                for call in ast.walk(function)
-                if isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Attribute)
-                and call.func.attr in {"put", "put_if_absent", "_replace"}
-                and call.args
-                and canonical(call.args[0])
-            )
-    assert not offenders
-
-
-def test_exact_applier_has_no_overwriteable_operational_hints():
-    applier = next(
-        item for item in parsed(Path("core/repository_applier.py")).body
-        if isinstance(item, ast.ClassDef)
-        and item.name == "RepositoryApplier")
-    callers = {
-        method.name
-        for method in applier.body
-        if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and any(
-            isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Attribute)
-            and call.func.attr == "_put_hint"
-            for call in ast.walk(method)
-        )
-    }
-    assert callers == set()
-
-
-def test_pile_sender_is_the_only_production_encoder():
-    callers = set()
-    for path in source_paths():
-        if path == Path("core/close.py"):
-            continue
-        for call in ast.walk(parsed(path)):
-            if isinstance(call, ast.Call) and (
-                    isinstance(call.func, ast.Name)
-                    and call.func.id == "encode_pile"
-                    or isinstance(call.func, ast.Attribute)
-                    and call.func.attr == "encode_pile"):
-                callers.add(path.as_posix())
-    # decode_pile owns canonical-wire validation, so no receiver re-encodes.
-    assert callers == {"full_peer/pile_sender.py"}
-
-
-def test_ordinary_pile_surfaces_have_no_embedded_object_channel():
-    """Detached object ingress cannot grow back as optional pile plumbing."""
-    surfaces = (
-        (Path("core/close.py"), None, "encode_pile"),
-        (Path("core/close.py"), None, "decode_pile"),
-        (Path("full_peer/pile_sender.py"), "PileSender", "pack"),
-        (Path("full_peer/pile_sender.py"), "PileSender", "pile"),
-        (Path("full_peer/pile_sender.py"), "PileSender", "send"),
-        (Path("full_peer/node.py"), "FullPeer", "ingest_new"),
-        (Path("facts/_commands.py"), None, "publish"),
-        (Path("core/repository_applier.py"), "RepositoryApplier",
-         "receive_pile"),
-        (Path("core/repository_applier.py"), "RepositoryApplier",
-         "apply_exact"),
-    )
-    for path, owner, name in surfaces:
-        tree = parsed(path)
-        scope = tree.body
-        if owner is not None:
-            scope = next(
-                item.body for item in tree.body
-                if isinstance(item, ast.ClassDef) and item.name == owner)
-        definition = next(
-            item for item in scope
-            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and item.name == name)
-        parameters = {
-            argument.arg
-            for argument in (
-                *definition.args.posonlyargs,
-                *definition.args.args,
-                *definition.args.kwonlyargs,
-            )
-        }
-        assert "blobs" not in parameters, (path, owner, name)
-
-
-def test_pile_sender_owns_outbound_peer_delivery():
-    assert {
-        path.as_posix()
-        for path, _ in calls_named("put_pile")
-    } == {"full_peer/pile_sender.py"}
-    assert calls_named("put_obj") == []
-
-
-def test_reader_is_side_effect_free_and_owns_subordinate_view_construction():
-    reader = parsed(Path("core/repository_reader.py"))
-    forbidden = {
-        "apply",
-        "cas",
-        "delete",
-        "drain",
-        "list",
-        "list_page",
-        "put",
-        "put_if_absent",
-        "stage",
-        "turn",
-    }
-    assert not [
-        call.func.attr
-        for call in ast.walk(reader)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr in forbidden
     ]
+    assert definitions("UploadClient") == []
+    assert definitions("UploadSource") == []
+    assert definitions("UploadSourceBuilder") == []
+    assert not (ROOT / "core/ingress.py").exists()
 
-    bypasses = []
-    for path in source_paths():
-        if path in {
-                Path("core/repository_reader.py"),
-                Path("core/validated_set.py"),
-                Path("core/worker.py")}:
-            continue
-        for call in ast.walk(parsed(path)):
-            if not isinstance(call, ast.Call):
-                continue
-            direct_validated = (
-                isinstance(call.func, ast.Name)
-                and call.func.id == "ValidatedView")
-            direct_worker = (
-                isinstance(call.func, ast.Attribute)
-                and isinstance(call.func.value, ast.Name)
-                and call.func.value.id == "WorkerView"
-                and call.func.attr == "from_root")
-            if direct_validated or direct_worker:
-                bypasses.append(path.as_posix())
-    assert bypasses == []
-
-
-def test_worker_delegates_integrity_loading_without_gaining_view_authority():
-    worker = parsed(Path("core/worker.py"))
-    imports = {
-        alias.name
-        for item in worker.body
-        if isinstance(item, ast.ImportFrom)
-        for alias in item.names
-    }
-    assert "ValidatedView" in imports
-    forbidden = {"decode_root", "Reader", "verified_object", "decode"}
-    assert not [
-        call.func.attr if isinstance(call.func, ast.Attribute)
-        else call.func.id
-        for call in ast.walk(worker)
-        if isinstance(call, ast.Call)
-        and (
-            isinstance(call.func, ast.Name) and call.func.id in forbidden
-            or isinstance(call.func, ast.Attribute)
-            and call.func.attr in forbidden
-        )
-    ]
-
-    owner = next(
-        item for item in worker.body
-        if isinstance(item, ast.ClassDef) and item.name == "WorkerView")
+    remote = owner(Path("core/store.py"), "RemoteStore")
     methods = {
-        item.name for item in owner.body
+        item.name for item in remote.body
         if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    assert not methods & {"closure", "providers", "fact_ids"}
+    assert {"copy_pile_object", "get_bounded", "put_if_absent"} <= methods
 
 
-def test_untrusted_read_boundaries_have_no_whole_get_fallback():
-    boundaries = (
-        (Path("core/http.py"), "AsyncFromSyncReader", "get_bounded"),
-        (Path("core/http.py"), "HttpGate", "_get"),
-        (Path("deploy/upload_broker.py"), "UploadBroker", "_get"),
-        (
-            Path("core/repository_applier.py"),
-            "RepositoryApplier",
-            "_get_bounded",
-        ),
-    )
-    for path, class_name, method_name in boundaries:
-        owner = next(
-            item for item in parsed(path).body
-            if isinstance(item, ast.ClassDef) and item.name == class_name)
-        method = next(
-            item for item in owner.body
-            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and item.name == method_name)
-        attributes = {
-            call.func.attr
-            for call in ast.walk(method)
-            if isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Attribute)
-        }
-        assert "get_bounded" in attributes
-        assert "get" not in attributes
-
-    for path, class_name in (
-            (Path("core/http.py"), "AsyncFromSyncReader"),
-            (Path("deploy/cloudflare_worker/runtime.py"), "ReadOnlyStore"),
-            (
-                Path("deploy/cloudflare_upload/reader.py"),
-                "R2CanonicalReader",
-            )):
-        owner = next(
-            item for item in parsed(path).body
-            if isinstance(item, ast.ClassDef) and item.name == class_name)
-        assert not [
-            item for item in owner.body
-            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and item.name == "get"
-        ]
-
-    stdlib = parsed(Path("core/http_stdlib.py"))
-    assert not any(
-        isinstance(item, ast.ClassDef) and item.name == "_SyncStore"
-        for item in stdlib.body
-    )
-    assert any(
-        isinstance(call.func, ast.Name)
-        and call.func.id == "AsyncFromSyncReader"
-        for call in ast.walk(stdlib)
-        if isinstance(call, ast.Call)
-    )
-    for path, class_name in (
-            (Path("core/http.py"), "AsyncFromSyncReader"),
-            (Path("deploy/cloudflare_worker/runtime.py"), "ReadOnlyStore"),
-    ):
-        owner = next(
-            item for item in parsed(path).body
-            if isinstance(item, ast.ClassDef) and item.name == class_name)
-        assert not any(
-            isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and item.name == "has"
-            for item in owner.body
-        )
-
-
-def test_sync_file_and_status_boundaries_keep_explicit_io_budgets():
-    remote_store = next(
-        item for item in parsed(Path("core/store.py")).body
-        if isinstance(item, ast.ClassDef) and item.name == "RemoteStore")
-    remote_bounded = next(
-        item for item in remote_store.body
-        if isinstance(item, ast.FunctionDef)
-        and item.name == "get_bounded")
-    assert {
-        call.func.attr
-        for call in ast.walk(remote_bounded)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-    } >= {"obj", "root"}
-
-    sync_tree = parsed(Path("full_peer/sync.py"))
-    remote_fetch = next(
-        item for item in ast.walk(sync_tree)
-        if isinstance(item, ast.FunctionDef)
-        and item.name == "fetch_remote")
-    file_tree = parsed(Path("facts/content/file.py"))
-    file_reads = [
-        item for item in file_tree.body
-        if isinstance(item, ast.FunctionDef)
-        and item.name in {"_state", "_payloads"}
+def test_untrusted_boundaries_stay_bounded_and_stream_large_piles():
+    async_reader = method(
+        Path("core/http.py"), "AsyncFromSyncReader", "get_bounded")
+    calls = [
+        item for item in ast.walk(async_reader)
+        if isinstance(item, ast.Call)
     ]
-    node = next(
-        item for item in parsed(Path("full_peer/node.py")).body
-        if isinstance(item, ast.ClassDef) and item.name == "FullPeer")
-    failures = next(
-        item for item in node.body
-        if isinstance(item, ast.FunctionDef)
-        and item.name == "ingress_failures")
+    assert any(
+        isinstance(call.func, ast.Name) and call.func.id == "_to_thread"
+        and any(
+            isinstance(node, ast.Attribute) and node.attr == "get_bounded"
+            for node in ast.walk(call))
+        for call in calls)
+    assert not any(
+        isinstance(call.func, ast.Attribute) and call.func.attr == "get"
+        for call in calls)
 
-    remote_attributes = {
-        call.func.attr
-        for call in ast.walk(remote_fetch)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-    }
-    assert "get_bounded" in remote_attributes
-    assert "get" not in remote_attributes
-    for method in file_reads:
-        attributes = {
-            call.func.attr
-            for call in ast.walk(method)
-            if isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Attribute)
-        }
-        assert {"get", "get_bounded"}.isdisjoint(attributes)
-    failure_attributes = {
-        call.func.attr
-        for call in ast.walk(failures)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-    }
-    assert failure_attributes == {"ingress_attempt_failures"}
+    remote = owner(Path("core/store.py"), "RemoteStore")
+    bounded = next(
+        item for item in remote.body
+        if isinstance(item, ast.AsyncFunctionDef)
+        and item.name == "get_bounded")
+    copied = next(
+        item for item in remote.body
+        if isinstance(item, ast.AsyncFunctionDef)
+        and item.name == "copy_pile_object")
+    assert "copy_obj" not in ast.unparse(bounded)
+    assert "copy_obj" in ast.unparse(copied)
 
-
-def test_http_and_worker_boundaries_never_whole_materialize_bodies():
-    functions = (
-        (Path("facts/auth/user.py"), "accept", "read_bounded", "read"),
-        (Path("full_peer/cli.py"), "ctl", "read_bounded", "read"),
-        (Path("full_peer/cli.py"), "main", "read_bounded", "read"),
-        (
-            Path("deploy/cloudflare_worker/runtime.py"),
-            "_bounded_body",
-            "getReader",
-            "bytes",
-        ),
-        (
-            Path("deploy/cloudflare_upload/worker/runtime.py"),
-            "_bounded_body",
-            "getReader",
-            "bytes",
-        ),
-        (
-            Path("deploy/cloudflare_upload/reader.py"),
-            "_bounded_response",
-            "getReader",
-            "arrayBuffer",
-        ),
-    )
-    for path, name, required, forbidden in functions:
-        function = next(
-            item for item in parsed(path).body
+    for path, class_name in (
+            (Path("core/store.py"), "FsStore"),
+            (Path("core/store.py"), "RemoteStore"),
+            (Path("adapters/s3/store.py"), "S3Store"),
+            (Path("adapters/r2/worker.py"), "R2BindingStore")):
+        assert "copy_pile_object" in {
+            item.name for item in owner(path, class_name).body
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and item.name == name)
-        attributes = {
-            call.func.attr
-            for call in ast.walk(function)
-            if isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Attribute)
         }
-        names = {
-            call.func.id
-            for call in ast.walk(function)
-            if isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Name)
-        }
-        assert required in attributes | names
-        assert forbidden not in attributes
 
 
-def test_provider_list_adapters_validate_native_page_shape_before_use():
+def test_provider_lists_validate_native_pages_before_consuming_them():
     s3 = (ROOT / "adapters/s3/store.py").read_text()
-    r2 = (ROOT / "adapters/r2/worker.py").read_text()
-
+    r2 = (ROOT / "adapters/r2/listing.py").read_text()
     assert 'len(contents) > args["MaxKeys"]' in s3
     assert "_page_objects(page.objects, limit)" in r2
     assert "for _ in range(limit + 1)" in r2
@@ -856,558 +401,121 @@ def test_provider_list_adapters_validate_native_page_shape_before_use():
     assert "not isinstance(key, str)" in r2
 
 
-def test_repository_apply_and_mutations_require_exact_stored_source():
-    owner = next(
-        item for item in parsed(Path("core/repository_applier.py")).body
-        if isinstance(item, ast.ClassDef)
-        and item.name == "RepositoryApplier")
-    methods = {
-        item.name: item
-        for item in owner.body
-        if isinstance(item, ast.AsyncFunctionDef)
-    }
-    public = {
-        name for name in methods
-        if not name.startswith("_")
-    }
-    assert public == {"apply_exact", "receive_pile"}
-    assert [arg.arg for arg in methods["receive_pile"].args.args] == [
-        "self", "member", "raw"]
-    assert [arg.arg for arg in methods["apply_exact"].args.args] == [
-        "self", "source_store", "source", "payload"]
-    assert {"apply", "propose", "commit", "stage"}.isdisjoint(methods)
-
-    calls = [
-        call.func.attr
-        for call in ast.walk(owner)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
+def test_notification_delivery_is_outside_repository_publication():
+    assert not [
+        (path, name)
+        for path in source_paths() if path.parts[0] == "core"
+        for name in imports(path)
+        if name == "notifications" or name.startswith("notifications.")
     ]
-    assert calls.count("cas") == 1
-    assert {"list", "list_page", "delete", "retire_exact_async"} \
-        .isdisjoint(calls)
+    assert not (ROOT / "core/delivery_queue.py").exists()
+    discovery = (ROOT / "notifications/discovery.py").read_text()
+    assert "OPERATIONAL_CURSOR_KEY" in discovery
+    for retired in (
+            "RepositoryApplier", "RepositoryReader", "repository_snapshot"):
+        assert retired not in discovery
+
+    full_peer = (ROOT / "full_peer/notifications.py").read_text()
+    assert full_peer.count("NotificationDiscovery(") == 1
+    assert full_peer.count("handle_carrier_delivery(") == 1
+    assert "notification" not in (ROOT / "full_peer/node.py").read_text()
 
 
-def test_internal_source_identity_has_one_retained_runtime_path():
-    source = (ROOT / "core" / "repository_applier.py").read_text()
-    assert "secrets." not in source
-    assert "staged/claim/" not in source
-    assert "_staged_claim_key" not in source
-    assert "_claimed_staged_source" not in source
-    assert "applier/generation/" not in source
-    assert "applier/spent/" not in source
-    assert "failed/" not in source
+def test_deployed_core_allowlist_is_exact_and_contains_no_retired_role():
+    from deploy.python_role_modules import HOSTED_GATE_CORE_MODULES
 
-    owner = next(
-        item for item in parsed(Path("core/repository_applier.py")).body
-        if isinstance(item, ast.ClassDef)
-        and item.name == "RepositoryApplier")
-    methods = {
-        item.name: item
-        for item in owner.body
-        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-
-    def calls(method, name):
-        return [
-            call for call in ast.walk(methods[method])
-            if isinstance(call, ast.Call)
-            and (
-                isinstance(call.func, ast.Name) and call.func.id == name
-                or isinstance(call.func, ast.Attribute)
-                and call.func.attr == name)
-        ]
-
-    assert len(calls("_stage", "ingress_key")) == 1
-    assert len(calls("apply_exact", "parse_ingress_key")) == 1
-    assert len(calls("receive_pile", "apply_exact")) == 1
-    assert not any(
-        calls(method, name)
-        for method in methods
-        for name in ("delete", "list", "list_page", "retire_exact_async")
-    )
-
-
-def test_exact_sources_need_no_shared_rejection_schema():
-    definitions = {
-        name: [
-            path for path in source_paths()
-            for item in ast.walk(parsed(path))
-            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and item.name == name
-        ]
-        for name in (
-            "decode_rejection_record",
-            "encode_rejection_record",
-            "validate_create",
-        )
-    }
-    assert definitions == {
-        "decode_rejection_record": [],
-        "encode_rejection_record": [],
-        "validate_create": [Path("core/object_store.py")],
-    }
-
-    def importers(name):
-        return {
-            path
-            for path in source_paths()
-            for item in parsed(path).body
-            if isinstance(item, ast.ImportFrom)
-            and any(alias.name == name for alias in item.names)
-        }
-
-    assert importers("decode_rejection_record") == set()
-    assert importers("encode_rejection_record") == set()
-    assert importers("validate_create") == {
-        Path("adapters/r2/worker.py"),
-        Path("adapters/s3/store.py"),
-        Path("core/store.py"),
-    }
-
-    from core import ingress
-    assert {
-        "decode_rejection_record",
-        "encode_rejection_record",
-    }.isdisjoint(ingress.__all__)
-
-
-def test_protocol_front_doors_route_semantic_reads_through_one_reader():
-    boundaries = (
-        (Path("core/http.py"), "HttpGate", "_mint", {"mint_awaited"}),
-        (
-            Path("deploy/upload_broker.py"),
-            "UploadBroker",
-            "_authorize",
-            {"mint_awaited"},
-        ),
-    )
-    forbidden_effects = {
-        "apply",
-        "cas",
-        "delete",
-        "drain",
-        "list",
-        "list_page",
-        "put",
-        "put_if_absent",
-        "stage",
-        "turn",
-    }
-    bypasses = []
-    for path, class_name, method_name, required in boundaries:
-        tree = parsed(path)
-        owner = next(
-            item for item in tree.body
-            if isinstance(item, ast.ClassDef) and item.name == class_name)
-        method = next(
-            item for item in owner.body
-            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and item.name == method_name)
-        attributes = {
-            call.func.attr
-            for call in ast.walk(method)
-            if isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Attribute)
-        }
-        assert required <= attributes
-        assert attributes.isdisjoint(forbidden_effects)
-        assert any(
-            isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Attribute)
-            and call.func.attr == "mint_awaited"
-            and isinstance(call.func.value, ast.Name)
-            and call.func.value.id == "RepositoryReader"
-            for call in ast.walk(method)
-        )
-
-        for call in ast.walk(tree):
-            if not isinstance(call, ast.Call):
-                continue
-            direct_root_decode = (
-                isinstance(call.func, ast.Name)
-                and call.func.id == "decode_root"
-                or isinstance(call.func, ast.Attribute)
-                and call.func.attr == "decode_root")
-            compatibility_mint = (
-                isinstance(call.func, ast.Name)
-                and call.func.id in {"stateless", "async_stateless"}
-                or isinstance(call.func, ast.Attribute)
-                and call.func.attr in {"stateless", "async_stateless"})
-            if direct_root_decode or compatibility_mint:
-                bypasses.append(path.as_posix())
-    assert bypasses == []
-
-
-def test_deployed_reader_core_allowlists_equal_their_import_closures():
-    from deploy.python_role_modules import (
-        REPOSITORY_READER_CORE_MODULES,
-        UPLOAD_BROKER_CORE_MODULES,
-    )
-
-    script = """
-import importlib
-import json
-import sys
-for module in sys.argv[1:]:
-    importlib.import_module(module)
-print(json.dumps(sorted(
-    name for name in sys.modules
-    if name == "core"
-    or name.startswith("core.") and name.count(".") == 1
-)))
-"""
-
-    def expected(modules):
-        return sorted(
-            "core" if name == "__init__.py" else "core." + name[:-3]
-            for name in modules
-        )
-
-    for imports, modules in (
-            (
-                ("core.http",),
-                REPOSITORY_READER_CORE_MODULES,
-            ),
-            (
-                ("deploy.upload_broker", "deploy.upload_broker_http"),
-                UPLOAD_BROKER_CORE_MODULES,
-            )):
-        result = subprocess.run(
-            [sys.executable, "-c", script, *imports],
-            cwd=ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        assert json.loads(result.stdout) == expected(modules)
-
-
-def test_applier_and_reader_import_closures_are_database_and_role_clean():
-    script = """
-import json
-import sys
-target = sys.argv[1]
-__import__(target)
-print(json.dumps(sorted(sys.modules)))
-"""
-    banned = {
-        "core.admission",
-        "core.legacy_v7",
-        "core.publication",
-        "core.runtime",
-        "full_peer",
-        "full_peer.node",
-        "full_peer.pile_sender",
-        "full_peer.sql_store",
-        "sqlite3",
-    }
-    closures = {}
-    for module in ("core.repository_applier", "core.repository_reader"):
-        result = subprocess.run(
-            [sys.executable, "-c", script, module],
-            cwd=ROOT, check=True, capture_output=True, text=True)
-        loaded = set(json.loads(result.stdout))
-        assert loaded.isdisjoint(banned)
-        closures[module] = loaded
-    assert "core.repository_reader" not in closures[
-        "core.repository_applier"]
-    assert "core.repository_applier" not in closures[
-        "core.repository_reader"]
-
-
-def test_notification_scanner_does_not_import_applier_authority():
-    script = """
-import json
-import sys
-import notifications.discovery
-print(json.dumps(sorted(sys.modules)))
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=ROOT, check=True, capture_output=True, text=True)
-    loaded = set(json.loads(result.stdout))
-    assert "core.repository_applier" not in loaded
-
-
-def test_full_peer_notifications_only_compose_the_shared_engine():
-    source = (ROOT / "full_peer" / "notifications.py").read_text()
-    assert source.count("NotificationDiscovery(") == 1
-    assert source.count("handle_carrier_delivery(") == 1
-    for duplicate_authority in (
-            "RepositoryApplier", "FactOrder", ".sql(", ".idx(",
-            ".list(", ".list_page(", ".cas("):
-        assert duplicate_authority not in source
-    node = (ROOT / "full_peer" / "node.py").read_text()
-    assert "notification" not in node
-
-
-def test_full_node_composes_roles_without_a_second_receiving_loop():
-    node_tree = parsed(Path("full_peer/node.py"))
-    node = next(
-        item for item in node_tree.body
-        if isinstance(item, ast.ClassDef) and item.name == "FullPeer")
-    turn = next(
-        item for item in node.body
-        if isinstance(item, ast.FunctionDef) and item.name == "turn")
-    attributes = [
-        call.func.attr
-        for call in ast.walk(turn)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-    ]
-    assert attributes.count("apply_exact") == 1
-    assert "turn" not in attributes
-    assert "list" not in attributes
-    assert "list_page" not in attributes
-
-
-def test_stdlib_http_receives_directly_through_repository_applier():
-    adapter = parsed(Path("core/http_stdlib.py"))
-    assert class_definitions("_SyncReceiver") == []
-
-    dispatch = next(
-        item for item in ast.walk(adapter)
-        if isinstance(item, ast.FunctionDef) and item.name == "_dispatch")
-    gates = [
-        call for call in ast.walk(dispatch)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Name)
-        and call.func.id == "HttpGate"
-    ]
-    assert len(gates) == 1
-    receiver = gates[0].args[4]
-    assert isinstance(receiver, ast.Call)
-    assert isinstance(receiver.func, ast.Attribute)
-    assert receiver.func.attr == "applier"
-    runner = next(
-        item for item in parsed(Path("full_peer/node.py")).body
-        if isinstance(item, ast.FunctionDef)
-        and item.name == "_run_applier")
-    assert len(runner.body) == 2
-    assert isinstance(runner.body[1], ast.Return)
-    assert isinstance(runner.body[1].value, ast.Call)
-    assert isinstance(runner.body[1].value.func, ast.Attribute)
-    assert runner.body[1].value.func.attr == "run"
-
-
-def test_core_is_the_complete_database_free_repository_engine():
-    """Hosted correctness stops at core; full_peer is only a composition."""
-    assert class_definitions("RepositoryApplier") == [
-        Path("core/repository_applier.py")]
-    assert class_definitions("RepositoryReader") == [
-        Path("core/repository_reader.py")]
-    assert class_definitions("HttpGate") == [Path("core/http.py")]
-    assert class_definitions("StdlibPeerHandler") == [
-        Path("core/http_stdlib.py")]
-
-    offenders = []
-    for path in source_paths():
-        if path.parts[0] != "core":
-            continue
-        for item in ast.walk(parsed(path)):
-            names = ()
-            if isinstance(item, ast.Import):
-                names = tuple(alias.name for alias in item.names)
-            elif isinstance(item, ast.ImportFrom):
-                names = (item.module or "",)
-            for name in names:
-                if name == "sqlite3" or name == "full_peer" \
-                        or name.startswith("full_peer."):
-                    offenders.append((path.as_posix(), name))
-    assert offenders == []
-
-
-def test_one_core_http_gate_owns_peer_routes_and_control_is_separate():
-    gate = next(
-        item for item in parsed(Path("core/http.py")).body
-        if isinstance(item, ast.ClassDef) and item.name == "HttpGate")
-    handle = next(
-        item for item in gate.body
-        if isinstance(item, ast.AsyncFunctionDef) and item.name == "handle")
-    route_literals = {
-        value.value
-        for value in ast.walk(handle)
-        if isinstance(value, ast.Constant)
-        and isinstance(value.value, str)
-        and value.value.startswith("/")
+    assert set(HOSTED_GATE_CORE_MODULES) <= {
+        path.name for path in (ROOT / "core").glob("*.py")
     }
     assert {
-        "/ctl",
-        "/invite/",
-        "/mint",
-        "/page",
-        "/page/",
-        "/pile/",
-        "/readyz",
-        "/root",
-    } <= route_literals
+        "access.py", "http.py", "removal_state.py",
+        "suppression_tree.py", "writer_repository.py",
+    } <= set(HOSTED_GATE_CORE_MODULES)
+    assert {
+        "authority.py", "repository_applier.py", "repository_reader.py",
+        "repository_snapshot.py", "snapshot.py", "validated_set.py",
+        "worker.py",
+    }.isdisjoint(HOSTED_GATE_CORE_MODULES)
 
-    adapter_literals = {
-        value.value
-        for value in ast.walk(parsed(Path("core/http_stdlib.py")))
-        if isinstance(value, ast.Constant)
-        and isinstance(value.value, str)
-        and value.value.startswith("/")
-    }
-    assert adapter_literals == set()
 
-    daemon = parsed(Path("full_peer/daemon.py"))
-    peer_methods = [
-        item.name
-        for item in ast.walk(daemon)
+def test_a_writer_protocol_suite_uses_real_access_authorization():
+    """Mechanical CAS helpers cannot be the only head-advance coverage."""
+    path = Path("tests/test_full_peer_writer_http_contract.py")
+    tree = parsed(path)
+    test = next(
+        item for item in tree.body
         if isinstance(item, ast.FunctionDef)
-        and item.name in {"do_GET", "do_PUT"}
-    ]
-    assert peer_methods == []
-    assert "/ctl/command" in {
-        value.value
-        for value in ast.walk(daemon)
-        if isinstance(value, ast.Constant)
-    }
+        and item.name == "test_hosted_mode_pulls_all_writers_but_publishes_only_the_dialer")
+    source = ast.unparse(test)
+    assert "AccessGate(workspace, cloud)" in source
+    assert "mechanical_head_authorizer" not in source
+    assert ".state.bootstrap(" in source
+    assert "sync_module.sync(" in source
 
 
-def test_local_control_is_unconditionally_loopback_and_not_peer_data():
-    source = (ROOT / "full_peer" / "daemon.py").read_text()
-    assert "ipaddress.ip_address(host).is_loopback" in source
-    assert '"127.0.0.1", control_port' in source
-
-    serve = next(
-        item for item in parsed(Path("full_peer/daemon.py")).body
-        if isinstance(item, ast.FunctionDef) and item.name == "serve")
-    parameters = {
-        argument.arg
-        for argument in (
-            *serve.args.posonlyargs,
-            *serve.args.args,
-            *serve.args.kwonlyargs,
-        )
-    }
-    assert "control_host" not in parameters
-
-
-def test_iroh_is_a_full_peer_owned_connection_wrapper_only():
-    crate = ROOT / "full_peer" / "iroh"
+def test_iroh_only_wraps_full_peer_connections():
+    crate = ROOT / "full_peer/iroh"
     assert {
         path.relative_to(crate).as_posix()
-        for path in crate.rglob("*")
-        if path.is_file()
-    } == {
-        "Cargo.lock",
-        "Cargo.toml",
-        "src/lib.rs",
-        "src/main.rs",
-    }
+        for path in crate.rglob("*") if path.is_file()
+    } == {"Cargo.lock", "Cargo.toml", "src/lib.rs", "src/main.rs"}
 
     manifest = (crate / "Cargo.toml").read_text()
-    for authority_or_protocol_dependency in (
-            "axum",
-            "aws-sdk-s3",
-            "http",
-            "hyper",
-            "object_store",
-            "reqwest",
-            "serde_json"):
-        assert not re.search(
-            rf"(?m)^{re.escape(authority_or_protocol_dependency)}\s*=",
-            manifest,
-        )
+    for dependency in (
+            "axum", "aws-sdk-s3", "http", "hyper", "object_store",
+            "reqwest", "serde_json"):
+        assert not re.search(rf"(?m)^{re.escape(dependency)}\s*=", manifest)
     rust = "\n".join(
         (crate / relative).read_text()
-        for relative in ("src/lib.rs", "src/main.rs")
-    )
-    for duplicate_route_or_credential in (
-            '"/mint"',
-            '"/page',
-            '"/pile',
-            '"/root"',
-            '"Authorization"',
-            '"Bearer "'):
-        assert duplicate_route_or_credential not in rust
-
-    daemon = (ROOT / "full_peer" / "daemon.py").read_text()
-    process = (ROOT / "full_peer" / "iroh_process.py").read_text()
-    forwarders = (ROOT / "full_peer" / "iroh_forwarders.py").read_text()
-    node = (ROOT / "full_peer" / "node.py").read_text()
-    assert "class IrohProcess" in process
-    assert '"serve"' in process
-    assert '"forward"' in process
-    assert '"--upstream"' in process
-    assert "class IrohForwarders" in forwarders
-    assert "IrohProcess.forward(" in forwarders
-    assert "urllib" not in forwarders
-    assert "peer_handler_for(" in daemon
-    assert "gate_options=gate_options" in daemon
-    assert "self.node.peer_address = None if iroh_binary is not None" in daemon
-    assert "self.node.use_iroh(" in daemon
-    assert "url = self.node.resolve_peer(workspace, peer)" in daemon
-    assert "sync(self.node, workspace, url)" in daemon
-    assert "def set_iroh_peer(" in node
-    assert "def remove_iroh_peer(" in node
-    assert "_control_server(" in daemon
-    assert not any(
-        path.suffix == ".rs"
-        for path in (ROOT / "core").rglob("*")
-    )
+        for relative in ("src/lib.rs", "src/main.rs"))
+    for protocol in (
+            '"/mint"', '"/page', '"/pile', '"/root"',
+            '"Authorization"', '"Bearer "'):
+        assert protocol not in rust
+    assert not any(path.suffix == ".rs" for path in (ROOT / "core").rglob("*"))
     assert all(
         "endpoint_id" not in (ROOT / path).read_text()
-        for path in source_paths()
-        if path.parts[0] == "core"
-    )
-    assert all(
-        "iroh" not in (ROOT / path).read_text().lower()
-        for path in (
-            Path("facts/auth/user.py"),
-            Path("facts/auth/user_invite.py"),
-        )
-    )
+        for path in source_paths() if path.parts[0] == "core")
 
 
-def test_full_peer_projection_has_no_repository_authority_residue():
-    source = (ROOT / "full_peer" / "sql_store.py").read_text()
-    for retired in (
-            "index-version",
-            "publish-base",
-            "root-bytes",
-            "has_facts",
-            "by_type",
-            "admission_receipts",
-            "proofs"):
-        assert retired not in source
-    assert source.count("CREATE TABLE IF NOT EXISTS") == 3
-    assert "PRAGMA user_version=1" in source
-
-
-def test_bao_native_io_is_full_peer_only():
-    assert (ROOT / "facts" / "_bao.py").is_file()
-    assert (ROOT / "full_peer" / "bao_native.py").is_file()
-    assert not (ROOT / "core" / "bao.py").exists()
-
-
-def test_production_vocabulary_has_no_retired_positive_roles():
-    offenders = []
-    retired = re.compile(
-        r"\b(?:AdmissionMembrane|WorkspaceRuntime|Publisher)\b|"
-        r"\bpublisher(?:_stub| principal| role| package)?\b",
-        re.IGNORECASE,
-    )
-    for path in source_paths():
-        if retired.search((ROOT / path).read_text()):
-            offenders.append(path.as_posix())
-    assert offenders == []
-
-
-def test_sql_projection_has_one_explicit_full_peer_boundary():
-    sqlite_importers = []
-    for path in source_paths():
-        for item in ast.walk(parsed(path)):
-            names = ()
-            if isinstance(item, ast.Import):
-                names = tuple(alias.name for alias in item.names)
-            elif isinstance(item, ast.ImportFrom):
-                names = (item.module or "",)
-            if any(name == "sqlite3" for name in names):
-                sqlite_importers.append(path)
+def test_sql_projection_and_bao_native_io_are_full_peer_only():
+    sqlite_importers = [
+        path for path in source_paths()
+        if "sqlite3" in imports(path)
+    ]
     assert sqlite_importers == [Path("full_peer/sql_store.py")]
-    assert not (ROOT / "core" / "catalog.py").exists()
-    assert not (ROOT / "core" / "client_projection.py").exists()
+    sql = (ROOT / "full_peer/sql_store.py").read_text()
+    assert sql.count("CREATE TABLE IF NOT EXISTS") == 3
+    assert "APP_VERSION = facts.APP_VERSION" in sql
+    assert "PRAGMA user_version={APP_VERSION}" in sql
+
+    assert (ROOT / "facts/_bao.py").is_file()
+    assert (ROOT / "full_peer/bao_native.py").is_file()
+    assert not (ROOT / "core/bao.py").exists()
+
+
+def test_full_peer_projection_has_no_durable_repository_authority():
+    source = (ROOT / "full_peer/sql_store.py").read_text()
+    for retired in (
+            "admission_receipts", "has_facts", "index-version", "proofs",
+            "publish-base", "root-bytes"):
+        assert retired not in source
+    projection = owner(Path("full_peer/sql_store.py"), "SqlStore")
+    methods = {
+        item.name for item in projection.body
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert "fact_of" in methods
+    assert "fact" not in methods
+
+
+def test_deployment_commands_do_not_name_deleted_test_files():
+    named = re.compile(r"[\"'](tests/test_[a-z0-9_]+\.py)[\"']")
+    missing = []
+    for path in source_paths():
+        if path.parts[0] != "deploy":
+            continue
+        for relative in named.findall((ROOT / path).read_text()):
+            if not (ROOT / relative).is_file():
+                missing.append((path.as_posix(), relative))
+    assert missing == []

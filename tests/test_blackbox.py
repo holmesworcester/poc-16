@@ -89,8 +89,9 @@ def wait_until(pred, timeout, what):
     raise AssertionError(f"timed out waiting for {what}")
 
 
-def root_of(who, ws):
-    return command(who, "peer.status")["workspaces"][ws]["root"]
+def forest_of(who, ws):
+    return command(who, "peer.status")["workspaces"][ws][
+        "forest_fingerprint"]
 
 
 def texts(who, ws):
@@ -101,8 +102,8 @@ def texts(who, ws):
 
 
 def converged(ws, *whos):
-    roots = {root_of(w, ws) for w in whos}
-    return len(roots) == 1 and None not in roots
+    forests = {forest_of(w, ws) for w in whos}
+    return len(forests) == 1
 
 
 def test_alice_bob_carol(tmp_path):

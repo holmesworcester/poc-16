@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import facts
 from adapters.gcp.firebase import FirebaseAdminFcm
 from core.crypto import h, keypair
+from core.fact import encode
 from facts.auth import push_endpoint
 from facts.auth.device import bind
 from facts.auth.device_invite import grant
@@ -25,6 +26,7 @@ from notifications.delivery import (
     derive,
     seal_target,
 )
+from notifications.forest import CurrentView
 
 
 def _firebase_app(project="firebase-project"):
@@ -50,20 +52,21 @@ def _world(tmp_path, name="node"):
     return node, workspace, push_secret, push_node, endpoint
 
 
-def _fetch(node, workspace):
-    return lambda oid: node.store(workspace).get("obj/" + oid)
+def _view(node, workspace):
+    return CurrentView(workspace, {
+        fid: encode(node.fact_of(workspace, fid))
+        for fid in node.sql(workspace).fact_ids()
+    })
 
 
 def _hint(node, workspace, *fids):
     return PublicationHint(
         workspace,
-        node.reader(workspace).root_bytes,
-        tuple(sorted(set(fids))),
+        tuple(
+            encode(node.fact_of(workspace, fid))
+            for fid in sorted(set(fids))
+        ),
     )
-
-
-def _root(node, workspace):
-    return node.reader(workspace).root_bytes
 
 
 def _author_preference(node, workspace, scope, target, mode, ts):
@@ -97,7 +100,7 @@ def test_endpoint_rotation_hides_ciphertext_and_reuses_fact_deletion(tmp_path):
     assert node.fact_of(workspace, first) == before
     assert isinstance(before.body["sealed_target"], str)
     assert "firebase-installation-id" not in before.body["sealed_target"]
-    assert node.reader(workspace).worker().fact_active(first) is False
+    assert node.sql(workspace).fact_active(first) is False
     assert [row["fid"] for row in push_endpoint.endpoints(
         node, workspace)] == [replacement]
     assert "sealed_target" not in push_endpoint.endpoints(
@@ -125,7 +128,7 @@ def test_endpoint_and_preference_require_the_owning_enrolled_device(tmp_path):
     device = node.sql(workspace).resolve_offer(
         "device_key", node.pk, node.pk)
 
-    with pytest.raises(ValueError, match="not admitted"):
+    with pytest.raises(ValueError, match="rejected"):
         node.ingest_new(workspace, (signed, forged), {
             signed.fid: (),
             forged.fid: (signed.fid, member, device),
@@ -141,7 +144,7 @@ def test_endpoint_and_preference_require_the_owning_enrolled_device(tmp_path):
         11,
     )
     setting_signature = signature(node.sk, node.pk, forged_setting, 11)
-    with pytest.raises(ValueError, match="not admitted"):
+    with pytest.raises(ValueError, match="rejected"):
         node.ingest_new(workspace, (setting_signature, forged_setting), {
             setting_signature.fid: (),
             forged_setting.fid: (
@@ -172,7 +175,7 @@ def test_settings_are_user_shared_and_replace_via_ordinary_suppression(
         "user": founder,
     }
     assert node.fact_of(workspace, first).body["pk"] == laptop
-    assert node.reader(workspace).worker().fact_active(first) is False
+    assert node.sql(workspace).fact_active(first) is False
 
 
 def test_concurrent_settings_meet_restrictively_then_command_joins(tmp_path):
@@ -192,7 +195,7 @@ def test_concurrent_settings_meet_restrictively_then_command_joins(tmp_path):
     row, = preference.preferences(node, workspace, node.pk)
     assert row["mode"] == preference.INHERIT
     assert row["fids"] == [joined]
-    assert all(not node.reader(workspace).worker().fact_active(fid)
+    assert all(not node.sql(workspace).fact_active(fid)
                for fid in (allow.fid, mute.fid))
 
 
@@ -212,7 +215,7 @@ def test_setting_an_existing_value_still_retracts_concurrent_siblings(
     assert result == allow.fid
     row, = preference.preferences(node, workspace, node.pk)
     assert row["fids"] == [allow.fid]
-    assert node.reader(workspace).worker().fact_active(mute.fid) is False
+    assert node.sql(workspace).fact_active(mute.fid) is False
 
 
 def test_matching_uses_explicit_mentions_and_channel_override(tmp_path):
@@ -228,12 +231,10 @@ def test_matching_uses_explicit_mentions_and_channel_override(tmp_path):
     channel = message.post(
         node, workspace, "quiet", "channel opt-in", ts=7)
 
-    assert derive(_hint(node, workspace, text),
-                  _fetch(node, workspace), _root(node, workspace)) == ()
-    mention, = derive(_hint(node, workspace, explicit),
-                      _fetch(node, workspace), _root(node, workspace))
-    ordinary, = derive(_hint(node, workspace, channel),
-                       _fetch(node, workspace), _root(node, workspace))
+    current = _view(node, workspace)
+    assert derive(_hint(node, workspace, text), current) == ()
+    mention, = derive(_hint(node, workspace, explicit), current)
+    ordinary, = derive(_hint(node, workspace, channel), current)
     assert mention.endpoint == ordinary.endpoint == endpoint
     assert mention.kind == "mention"
     assert ordinary.kind == "message"
@@ -242,8 +243,8 @@ def test_matching_uses_explicit_mentions_and_channel_override(tmp_path):
 def test_absent_and_concurrent_inherited_preferences_fail_closed(tmp_path):
     node, workspace, _secret, _push_node, _endpoint = _world(tmp_path)
     event = message.post(node, workspace, "general", "quiet", ts=3)
-    assert derive(_hint(node, workspace, event),
-                  _fetch(node, workspace), _root(node, workspace)) == ()
+    assert derive(_hint(node, workspace, event), _view(
+        node, workspace)) == ()
 
     _author_preference(
         node, workspace, preference.CHANNEL, "general",
@@ -251,8 +252,8 @@ def test_absent_and_concurrent_inherited_preferences_fail_closed(tmp_path):
     _author_preference(
         node, workspace, preference.CHANNEL, "general",
         preference.INHERIT, 5)
-    assert derive(_hint(node, workspace, event),
-                  _fetch(node, workspace), _root(node, workspace)) == ()
+    assert derive(_hint(node, workspace, event), _view(
+        node, workspace)) == ()
 
 
 class _Message:

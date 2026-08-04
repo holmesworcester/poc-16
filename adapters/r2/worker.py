@@ -1,6 +1,8 @@
 """Cloudflare Worker R2-binding implementation of AsyncObjectStore."""
 from core.crypto import h
 from core.limits import (
+    MAX_DIRECT_OBJECT_BYTES,
+    MAX_DIRECT_STREAM_FRAGMENTS,
     MAX_OBJECT_BYTES,
     MAX_ROOT_BYTES,
     MAX_STORE_READ_BYTES,
@@ -11,19 +13,22 @@ from core.object_store import (
     CREATED,
     EXISTS,
     Applied,
+    MAX_PROVIDER_KEY_BYTES,
+    SINGLETON_CAS_KEYS,
     OutcomeUnknown,
     RetryableStoreError,
     STALE,
     StoreError,
-    ListPage,
-    MAX_PROVIDER_KEY_BYTES,
     Versioned,
     VersionToken,
     authoritative_key,
+    mutable_key,
     validate_create,
     validate_key,
     validate_store_prefix,
 )
+from core.shape import valid_fid
+from .listing import list_page as _list_page
 
 
 def _if_none_match():
@@ -73,58 +78,6 @@ class R2BindingStore:
             raise ValueError("R2 object key exceeds 1024 bytes")
         return physical
 
-    def _list_prefix(self, prefix):
-        if not isinstance(prefix, str):
-            raise ValueError("bad list prefix")
-        trailing = prefix.endswith("/")
-        logical = prefix[:-1] if trailing else prefix
-        if logical:
-            validate_key(logical)
-        physical = f"{self.prefix}/" if self.prefix else ""
-        if logical:
-            physical += logical
-        if trailing:
-            physical += "/"
-        if len(physical.encode("ascii")) > MAX_PROVIDER_KEY_BYTES:
-            raise ValueError("R2 list prefix exceeds 1024 bytes")
-        return physical
-
-    def _logical(self, physical):
-        base = f"{self.prefix}/" if self.prefix else ""
-        try:
-            oversized = len(physical.encode("ascii")) > \
-                MAX_PROVIDER_KEY_BYTES
-        except UnicodeEncodeError as error:
-            raise StoreError("R2 returned an invalid logical key") from error
-        if oversized:
-            raise StoreError("R2 returned an invalid logical key")
-        if not physical.startswith(base):
-            raise StoreError("R2 returned a key outside the configured prefix")
-        logical = physical[len(base):]
-        try:
-            return validate_key(logical)
-        except (TypeError, ValueError) as error:
-            raise StoreError("R2 returned an invalid logical key") from error
-
-    @staticmethod
-    def _page_objects(values, limit):
-        """Consume at most one object beyond the native LIST page budget."""
-        try:
-            iterator = iter(values)
-        except TypeError as error:
-            raise StoreError("R2 LIST objects are not iterable") from error
-        objects = []
-        try:
-            for _ in range(limit + 1):
-                objects.append(next(iterator))
-        except StopIteration:
-            pass
-        except Exception as error:
-            raise StoreError("R2 LIST object iteration failed") from error
-        if len(objects) > limit:
-            raise StoreError("R2 LIST exceeded the requested page limit")
-        return tuple(objects)
-
     @staticmethod
     async def _bytes(obj):
         value = await obj.arrayBuffer()
@@ -148,8 +101,55 @@ class R2BindingStore:
             raise StoreError("R2 response size mismatch")
         return value
 
+    @staticmethod
+    def _chunk_bytes(value):
+        if hasattr(value, "to_bytes"):
+            value = value.to_bytes()
+        elif hasattr(value, "to_py"):
+            value = value.to_py()
+        try:
+            return bytes(value)
+        except (TypeError, ValueError) as error:
+            raise StoreError("R2 response stream chunk is not bytes") \
+                from error
+
+    @classmethod
+    async def _copy_body(cls, obj, max_bytes, write):
+        size = getattr(obj, "size", None)
+        if type(size) is not int or size < 0:
+            raise StoreError("R2 response has invalid size")
+        if size > max_bytes:
+            raise PayloadTooLarge("R2 response exceeds byte limit")
+        stream = getattr(obj, "body", None)
+        if stream is None or not callable(getattr(stream, "getReader", None)):
+            raise StoreError("R2 response has no readable stream")
+        reader = stream.getReader()
+        total = 0
+        try:
+            for _ in range(MAX_DIRECT_STREAM_FRAGMENTS):
+                result = await reader.read()
+                if not isinstance(getattr(result, "done", None), bool):
+                    raise StoreError("R2 response stream result")
+                if result.done:
+                    if total != size:
+                        raise StoreError("R2 response size mismatch")
+                    return total
+                chunk = cls._chunk_bytes(getattr(result, "value", None))
+                total += len(chunk)
+                if total > size:
+                    raise StoreError("R2 response size mismatch")
+                if total > max_bytes:
+                    raise PayloadTooLarge("R2 response exceeds byte limit")
+                write(chunk)
+            raise StoreError("R2 response exceeded fragment budget")
+        finally:
+            release = getattr(reader, "releaseLock", None)
+            if callable(release):
+                release()
+
     async def get(self, key):
-        limit = MAX_ROOT_BYTES if key == "root" else MAX_OBJECT_BYTES
+        limit = MAX_ROOT_BYTES \
+            if key in SINGLETON_CAS_KEYS else MAX_OBJECT_BYTES
         return await self.get_bounded(key, limit)
 
     async def get_bounded(self, key, max_bytes):
@@ -167,12 +167,29 @@ class R2BindingStore:
         except Exception as error:
             raise StoreError(f"R2 read failed for {key}") from error
 
+    async def copy_pile_object(self, oid, max_bytes, write):
+        """Stream one large signed pile without allocating an ArrayBuffer."""
+        if not valid_fid(oid) or type(max_bytes) is not int \
+                or not 0 < max_bytes <= MAX_DIRECT_OBJECT_BYTES \
+                or not callable(write):
+            raise ValueError("R2 pile copy")
+        try:
+            obj = await self.bucket.get(self._key("obj/" + oid))
+            if obj is None:
+                return None
+            return await self._copy_body(obj, max_bytes, write)
+        except (PayloadTooLarge, StoreError):
+            raise
+        except Exception as error:
+            raise StoreError("R2 pile read failed") from error
+
     async def read_versioned(self, key):
         try:
             obj = await self.bucket.get(self._key(key))
             if obj is None:
                 return ABSENT
-            limit = MAX_ROOT_BYTES if key == "root" else MAX_OBJECT_BYTES
+            limit = MAX_ROOT_BYTES \
+                if key in SINGLETON_CAS_KEYS else MAX_OBJECT_BYTES
             return Versioned(
                 await self._bounded_bytes(obj, limit), self._token(obj))
         except (PayloadTooLarge, StoreError):
@@ -226,8 +243,8 @@ class R2BindingStore:
         return CREATED if result is not None else EXISTS
 
     async def cas(self, key, token, value):
-        if key != "root":
-            raise ValueError("only root is mutable by CAS")
+        if not mutable_key(key):
+            raise ValueError("key is not a CAS register")
         if token is ABSENT:
             condition = _if_none_match()
         elif isinstance(token, VersionToken):
@@ -239,47 +256,11 @@ class R2BindingStore:
         return STALE if result is None else Applied(self._token(result))
 
     async def list_page(self, prefix, cursor=None, limit=1000):
-        """Issue exactly one bounded native R2 LIST request."""
-        if type(limit) is not int or not 0 < limit <= 1000:
-            raise ValueError("R2 list page limit")
-        if cursor is not None and (
-                not isinstance(cursor, str) or not cursor):
-            raise ValueError("R2 list cursor")
-        physical = self._list_prefix(prefix)
-        try:
-            options = {"prefix": physical, "limit": limit}
-            if cursor is not None:
-                options["cursor"] = cursor
-            page = await self.bucket.list(**options)
-            objects = self._page_objects(page.objects, limit)
-            truncated = page.truncated
-            next_cursor = page.cursor
-        except StoreError:
-            raise
-        except Exception as error:
-            raise StoreError(
-                f"R2 list failed for {prefix}") from error
-        keys = set()
-        for obj in objects:
-            key = getattr(obj, "key", None)
-            if not isinstance(key, str):
-                raise StoreError("R2 LIST returned a non-string key")
-            if not key.startswith(physical):
-                raise StoreError(
-                    "R2 LIST returned an out-of-prefix key")
-            keys.add(self._logical(key))
-        keys = tuple(sorted(keys))
-        if not isinstance(truncated, bool):
-            raise StoreError("R2 LIST returned invalid truncation")
-        if not truncated:
-            return ListPage(keys, None)
-        if not isinstance(next_cursor, str) \
-                or not next_cursor or next_cursor == cursor:
-            raise StoreError("R2 LIST returned a repeated cursor")
-        return ListPage(keys, next_cursor)
+        return await _list_page(
+            self.bucket, self.prefix, prefix, cursor, limit)
 
     async def list(self, prefix):
-        """Compatibility/admin helper; receiving code uses ``list_page``."""
+        """Administrative full traversal; receiving code uses ``list_page``."""
         cursor, out = None, set()
         for _ in range(self.max_list_pages):
             page = await self.list_page(prefix, cursor, 1000)

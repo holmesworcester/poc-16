@@ -1,22 +1,22 @@
 """facts/auth/user.py — invite redemption and workspace membership."""
 import base64
 import json
-import urllib.request
 
-from core.close import decode_pile
+from core.close import decode_signed_pile
 from core.crypto import box_decrypt, kdf, load_sk, sign, verify
 from core.fact import Fact, Need, workspace_of
 from core.http_body import read_bounded
 from core.limits import MAX_INVITE_BYTES
 from core.suppression import scoped_id
-from .._policy import FamilyPolicy, Self, SidOffer, author_selectors
+from .._policy import FamilyPolicy, SidOffer, author_selectors
 from . import signature, user_invite
 from ._display import display
 
 TAG = "user"
 POLICY = FamilyPolicy(
-    suppression=(Self(),),
+    control_fact=True,
     principal_offers=(SidOffer("member", "member"),),
+    clear_offers=(SidOffer("member", "device"),),
 )
 
 
@@ -65,28 +65,31 @@ DURABLE = True
 
 
 # COMMANDS — accepting a workspace establishes its local keyring anchor.
+def _open_invite(url):
+    """Open the full-peer-only invite URL without polluting edge imports."""
+    import urllib.request
+
+    return urllib.request.urlopen(url, timeout=15)
+
+
 def accept(node, link, name):
     """Redeem a self-contained invite and commit the authored join locally."""
+    from facts import semantic_evaluation
     from core.kernel import drain
 
     link_data = json.loads(base64.urlsafe_b64decode(link))
     if not isinstance(link_data, dict):
         raise ValueError("invite link")
-    if set(link_data) == {"u", "ws", "s"}:
-        peer = link_data["u"]  # legacy URL-only envelope
-    elif set(link_data) == {"p", "ws", "s"}:
-        peer = link_data["p"]
-    else:
+    if set(link_data) != {"p", "ws", "s"}:
         raise ValueError("invite link")
+    peer = link_data["p"]
     workspace = link_data["ws"]
     seed = bytes.fromhex(link_data["s"])
     retained = False
     try:
         url = node.resolve_peer(workspace, peer)
-        response = urllib.request.urlopen(
-            f"{url}/invite/{kdf(seed, 'id').hex()}?ws={workspace}",
-            timeout=15,
-        )
+        response = _open_invite(
+            f"{url}/invite/{kdf(seed, 'id').hex()}?ws={workspace}")
         try:
             encrypted = read_bounded(
                 response, MAX_INVITE_BYTES, "invite response")
@@ -96,14 +99,18 @@ def accept(node, link, name):
         if not isinstance(blob, dict) or set(blob) != {"pile", "isk", "ws"} \
                 or blob.get("ws") != workspace:
             raise ValueError("invite workspace")
-        bootstrap = decode_pile(
-            base64.b64decode(blob["pile"], validate=True), workspace)
+        bootstrap = decode_signed_pile(
+            base64.b64decode(blob["pile"], validate=True), workspace).facts
         judgment = drain(bootstrap, workspace)
+        if not judgment.ok:
+            raise ValueError("invite bootstrap")
+        valids, _current_bootstrap = semantic_evaluation(
+            judgment, bootstrap)
         invitations = [
-            valid.fact for valid in judgment.valids
+            valid.fact for valid in valids
             if valid.fact.t == user_invite.TAG
         ]
-        if not judgment.ok or len(invitations) != 1:
+        if len(invitations) != 1:
             raise ValueError("invite bootstrap")
         invitation = invitations[0]
         ts = node.now_ms()
@@ -114,11 +121,10 @@ def accept(node, link, name):
             workspace, name, peers=[peer],
             identity=node.keychain.default_id())
         retained = True
-        # The bootstrap is already closed/topological; PileSender owns the one
-        # outbound wire encoding before the shared receiving boundary.
-        pile = node.sender(workspace).pack(bootstrap + [sig, member])
-        node.receive_pile(
-            workspace, node.member_for(workspace), pile)
+        # The bootstrap is already closed and topological.  The local writer
+        # publishes that exact closure as one signed writer-tree leaf; network
+        # reconciliation subsequently exchanges the same portable leaf.
+        node.publish_closed(workspace, (tuple(bootstrap) + (sig, member),))
         return workspace
     finally:
         if not retained:
@@ -127,14 +133,19 @@ def accept(node, link, name):
 
 # QUERIES
 def members(node, workspace):
-    """Assemble the roster from current ``member`` and ``admin`` offers."""
+    """Assemble direct members and their explicitly owned devices."""
     with node.lock:
         candidates = {}
         role_order = {"admin": 0, "member": 1, "device": 2}
         # The roster is historical presentation: keep removed identities
         # visible and report their current liveness in ``evicted`` below.
-        for fact in node.select(
-                workspace, "member", include_suppressed=True):
+        providers = {
+            fact.fid: fact
+            for kind in ("member", "device_key")
+            for fact in node.select(
+                workspace, kind, include_suppressed=True)
+        }
+        for fact in providers.values():
             body = fact.body
             if fact.t == "workspace":
                 row = (
@@ -158,16 +169,16 @@ def members(node, workspace):
                 candidates[public] = (choice, name, role, owner)
 
         admins = {
-            public
+            owner
             for fact in node.select(workspace, "admin")
-            for name, public, _ in fact.offers()
+            for name, owner, _ in fact.offers()
             if name == "admin"
         }
         rows = [
             {
                 "pk": public,
                 "name": name,
-                "role": "admin" if public in admins else role,
+                "role": "admin" if owner in admins else role,
                 "evicted": node.suppression_active(
                     workspace, scoped_id("member", owner)),
             }

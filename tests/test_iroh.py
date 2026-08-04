@@ -18,22 +18,13 @@ from urllib.parse import urlparse
 import pytest
 
 import facts
-from core.close import encode_pile
-from core.crypto import h, unseal
-from core.limits import (
-    MAX_MINT_FETCHES,
-    MAX_MINT_FETCH_BYTES,
-    MAX_PILE_BYTES,
-    MAX_ROOT_BYTES,
-)
-from core.repository_reader import RepositoryReader
-from facts.auth import request
-from full_peer import walk as walk_module
+from core.crypto import h
+from core.pack_access import MAX_OBJECT_OPEN_BYTES
 from full_peer.daemon import FullPeerService
 from full_peer.iroh_forwarders import IrohForwarders
 from full_peer.iroh_process import STOP_SECONDS
 from full_peer.keychain import iroh_peer
-from full_peer.node import FullPeer, now_ms
+from full_peer.node import FullPeer
 from full_peer.walk import Peer
 
 
@@ -167,41 +158,6 @@ def control_command(ready, path, *argv):
     return value
 
 
-def start_plain_full_peer(state, environment):
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "full_peer",
-            "daemon",
-            str(state),
-            "--port", "0",
-            "--control-port", "0",
-            "--cadence", "3600",
-        ],
-        cwd=ROOT,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        env={**os.environ, **environment},
-    )
-    service = next_line(process)
-    match = re.fullmatch(
-        r"full peer [^:]+: data (http://[^;]+); "
-        r"control (http://[^ ]+) \(.*\)",
-        service,
-    )
-    if match is None:
-        stop(process)
-        raise AssertionError(f"bad full-peer readiness: {service!r}")
-    return process, {
-        "data": match.group(1),
-        "control": match.group(2),
-    }
-
-
 def address(url):
     parsed = urlparse(url)
     return parsed.hostname, parsed.port
@@ -250,7 +206,7 @@ def repository_bytes(node_dir, workspace):
         path.relative_to(root).as_posix(): path.read_bytes()
         for path in root.rglob("*")
         if path.is_file()
-        and path.name != ".root.lock"
+        and path.name != ".cas.lock"
         and not path.name.endswith((".idx.db", ".idx.db-shm", ".idx.db-wal"))
     }
 
@@ -264,26 +220,11 @@ def http_request_threads():
     }
 
 
-def mint(target, workspace, pile, identity_secret):
-    status, body, _ = call(
-        target,
-        "POST",
-        f"/mint?ws={workspace}",
-        body=json.dumps({
-            "ws": workspace,
-            "pile": base64.b64encode(pile).decode(),
-        }).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    assert status == 200
-    value = json.loads(body)
-    return (
-        unseal(
-            identity_secret,
-            base64.b64decode(value["grant"]),
-        ).decode(),
-        value["cap"],
-    )
+def mint(target, node, workspace):
+    """Exercise the production historical-path and current-proof handshake."""
+    peer = Peer(node, workspace, f"http://{target[0]}:{target[1]}")
+    peer.mint()
+    return peer._token, peer._sync_profile
 
 
 @pytest.fixture(scope="module")
@@ -341,11 +282,6 @@ def test_saturated_real_iroh_sessions_recover_without_repository_mutation(
     state = tmp_path / "peer"
     bootstrap = FullPeer(str(state))
     workspace = facts.auth.workspace.create(bootstrap, "alice", ts=1)
-    identity_secret = bootstrap.identity(workspace)[0]
-    issued = now_ms()
-    pile = encode_pile(request.payload(
-        bootstrap, workspace, "sync", issued + 300_000, issued))
-    bootstrap.sql(workspace).db.close()
 
     service = FullPeerService(
         str(state),
@@ -358,13 +294,12 @@ def test_saturated_real_iroh_sessions_recover_without_repository_mutation(
     try:
         service.start()
         direct = address(service.data_address)
-        token, capability = mint(
-            direct, workspace, pile, identity_secret)
+        token, capability = mint(direct, bootstrap, workspace)
         assert capability == "sync-v1/full"
         expected = call(
             direct,
             "GET",
-            f"/root?ws={workspace}",
+            f"/heads?ws={workspace}",
             token=token,
         )
         assert expected[0] == 200
@@ -418,7 +353,7 @@ def test_saturated_real_iroh_sessions_recover_without_repository_mutation(
                 lambda: overflow_results.append(call(
                     forward_targets[2],
                     "GET",
-                    f"/root?ws={workspace}",
+                    f"/heads?ws={workspace}",
                     token=token,
                 )),
             ),
@@ -451,7 +386,7 @@ def test_saturated_real_iroh_sessions_recover_without_repository_mutation(
         recovered = call(
             forward_targets[2],
             "GET",
-            f"/root?ws={workspace}",
+            f"/heads?ws={workspace}",
             token=token,
         )
         assert time.monotonic() - recovered_at < 2
@@ -471,16 +406,11 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
     bootstrap = FullPeer(str(state))
     workspace = facts.auth.workspace.create(bootstrap, "alice", ts=1)
     member = bootstrap.member_for(workspace)
-    identity_secret = bootstrap.identity(workspace)[0]
-    issued = now_ms()
-    pile = encode_pile(request.payload(
-        bootstrap, workspace, "sync", issued + 300_000, issued))
     published = repository_bytes(state, workspace)
     object_key, raw = next(
         (key, value) for key, value in published.items()
         if key.startswith("obj/"))
     oid = object_key.removeprefix("obj/")
-    bootstrap.sql(workspace).db.close()
 
     daemon, ready = start_full_peer(
         state,
@@ -527,71 +457,58 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
             for target in through_iroh
         )
 
-        token, capability = mint(
-            through_iroh[0], workspace, pile, identity_secret)
+        token, capability = mint(through_iroh[0], bootstrap, workspace)
         assert capability == "sync-v1/full"
         baseline = repository_bytes(state, workspace)
-        # Canonical pages are read-only HTTP resources. The Applier is their
-        # sole writer; peers can mutate repository state only with piles.
+        # An unknown route cannot mutate repository state through either
+        # direct TCP or Iroh's opaque byte forwarding.
         assert parity(
             "PUT",
-            f"/page/{oid}?ws={workspace}",
+            f"/retired/{oid}?ws={workspace}",
             body=raw,
             token=token,
         )[0] == 404
         assert repository_bytes(state, workspace) == baseline
 
-        token, _ = mint(
-            through_iroh[1], workspace, pile, identity_secret)
+        token, _ = mint(through_iroh[1], bootstrap, workspace)
         assert parity(
             "GET",
-            f"/page/{oid}?ws={workspace}",
+            f"/obj/{oid}?ws={workspace}",
             token=token,
         )[:2] == (200, raw)
 
         time.sleep(2.2)
         assert parity(
             "GET",
-            f"/page/{oid}?ws={workspace}",
+            f"/obj/{oid}?ws={workspace}",
             token=token,
         )[0] == 401
         assert repository_bytes(state, workspace) == baseline
 
         assert parity(
             "GET",
-            f"/root?ws={workspace}",
+            f"/heads?ws={workspace}",
         )[0] == 401
-        token, _ = mint(
-            through_iroh[0], workspace, pile, identity_secret)
+        token, _ = mint(through_iroh[0], bootstrap, workspace)
         tampered = token[:-1] + ("0" if token[-1] != "0" else "1")
         assert parity(
             "GET",
-            f"/root?ws={workspace}",
+            f"/heads?ws={workspace}",
             token=tampered,
         )[0] == 401
 
-        token, _ = mint(
-            direct, workspace, pile, identity_secret)
+        token, _ = mint(direct, bootstrap, workspace)
         assert parity(
             "GET",
-            "/root?ws=" + "0" * 64,
+            "/heads?ws=" + "0" * 64,
             token=token,
         )[0] == 404
 
-        token, _ = mint(
-            through_iroh[1], workspace, pile, identity_secret)
-        assert parity(
-            "PUT",
-            f"/pile/not-{member}/{h(b'pile')}?ws={workspace}",
-            body=b"pile",
-            token=token,
-        )[0] == 403
-
         for method, path in (
-                ("POST", f"/root?ws={workspace}"),
+                ("POST", f"/heads?ws={workspace}"),
                 ("GET", f"/unknown?ws={workspace}")):
             route_token, _ = mint(
-                through_iroh[0], workspace, pile, identity_secret)
+                through_iroh[0], bootstrap, workspace)
             assert parity(
                 method,
                 path,
@@ -599,8 +516,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
             )[0] == 404
 
         control_request = b'{"path":"peer.status","argv":[]}'
-        token, _ = mint(
-            through_iroh[0], workspace, pile, identity_secret)
+        token, _ = mint(through_iroh[0], bootstrap, workspace)
         peer_control = parity(
             "POST",
             f"/ctl/command?ws={workspace}",
@@ -609,14 +525,28 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
         )
         assert peer_control[0] == 405
 
-        token, _ = mint(
-            direct, workspace, pile, identity_secret)
-        oversized = (
-            f"PUT /pile/{member}/{h(b'never lands')}?"
+        token, _ = mint(direct, bootstrap, workspace)
+        retired_put = (
+            f"PUT /obj/{h(b'never lands')}?"
             f"ws={workspace} HTTP/1.1\r\n"
             "Host: localhost\r\n"
             f"Authorization: Bearer {token}\r\n"
-            f"Content-Length: {MAX_PILE_BYTES + 1}\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode()
+        retired_results = [
+            raw_call(target, retired_put) for target in paths
+        ]
+        assert retired_results[1:] == \
+            retired_results[:1] * (len(retired_results) - 1)
+        assert retired_results[0][0] == 404
+
+        oversized = (
+            "POST /obj/open?"
+            f"ws={workspace} HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            f"Authorization: Bearer {token}\r\n"
+            f"Content-Length: {MAX_OBJECT_OPEN_BYTES + 1}\r\n"
             "Connection: close\r\n\r\n"
         ).encode()
         oversized_results = [
@@ -626,10 +556,9 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
             oversized_results[:1] * (len(oversized_results) - 1)
         assert oversized_results[0][0] == 413
 
-        token, _ = mint(
-            through_iroh[0], workspace, pile, identity_secret)
+        token, _ = mint(through_iroh[0], bootstrap, workspace)
         malformed = (
-            f"PUT /pile/{member}/{h(b'malformed never lands')}?"
+            "POST /obj/open?"
             f"ws={workspace} HTTP/1.1\r\n"
             "Host: localhost\r\n"
             f"Authorization: Bearer {token}\r\n"
@@ -770,16 +699,18 @@ def test_two_supervised_full_peers_schedule_only_through_iroh_and_reap(
         )
 
         def converged():
-            roots = {
-                workspace_row(alice_ready, workspace)["root"],
-                workspace_row(bob_ready, workspace)["root"],
+            forests = {
+                workspace_row(alice_ready, workspace)[
+                    "forest_fingerprint"],
+                workspace_row(bob_ready, workspace)[
+                    "forest_fingerprint"],
             }
             fids = {
                 row["fid"]
                 for row in control_command(
                     bob_ready, "content.message.list", workspace)
             }
-            return len(roots) == 1 and None not in roots \
+            return len(forests) == 1 \
                 and {alice_message, bob_message}.issubset(fids)
 
         wait_until(
@@ -1028,7 +959,211 @@ def test_two_supervised_full_peers_schedule_only_through_iroh_and_reap(
             )
 
 
-def test_changed_private_iroh_urls_discard_each_superseded_sync_walk(tmp_path):
+def test_four_supervised_full_peers_gossip_independent_writers_over_iroh(
+        tmp_path, iroh_binary):
+    """A line topology relays four writer trees without a direct HTTP peer."""
+    names = ("alice", "bob", "carol", "dave")
+    states = {name: tmp_path / name for name in names}
+    processes, ready = {}, {}
+    descendants = set()
+
+    def start(name):
+        process, service = start_full_peer(
+            states[name], iroh_binary, cadence=".1")
+        processes[name], ready[name] = process, service
+        descendants.add(int(service["pid"]))
+
+    def status(name):
+        return control_command(ready[name], "peer.status")
+
+    def workspace_row(name, workspace):
+        return status(name)["workspaces"][workspace]
+
+    def peer_endpoints(name, workspace):
+        return {
+            peer["endpoint"]
+            for peer in workspace_row(name, workspace)["peers"]
+        }
+
+    def remember_forwarders(workspace):
+        for name in names:
+            for connection in workspace_row(
+                    name, workspace)["iroh_connections"]:
+                if connection["pid"] is not None:
+                    descendants.add(connection["pid"])
+
+    try:
+        for name in names:
+            start(name)
+
+        workspace = control_command(
+            ready["alice"], "auth.workspace.create", "alice")
+        for name in names[1:]:
+            link = control_command(
+                ready["alice"], "auth.user_invite.create", workspace)
+            assert control_command(
+                ready[name], "auth.user.join", link, name) == workspace
+
+        expected_devices = {
+            status(name)["pk"]
+            for name in names
+        }
+
+        def bootstrap_converged():
+            rows = [workspace_row(name, workspace) for name in names]
+            return len({row["forest_fingerprint"] for row in rows}) == 1 \
+                and all(len(row["writers"]) == len(names) for row in rows) \
+                and all(
+                    {writer["device"] for writer in row["writers"]}
+                    == expected_devices
+                    for row in rows
+                )
+
+        wait_until(
+            bootstrap_converged,
+            timeout=45,
+            message="four invitees to converge through the bootstrap star",
+        )
+
+        # Invitations initially give every joiner Alice's locator. Rewire to
+        # one directed line. Each dial still reconciles in both directions:
+        # Bob <-> Alice, Carol <-> Bob, and Dave <-> Carol.
+        for name, upstream in (("carol", "bob"), ("dave", "carol")):
+            assert control_command(
+                ready[name],
+                "peer.iroh.set",
+                workspace,
+                ready[upstream]["endpoint_id"],
+                ready[upstream]["peer"],
+            ) == {"ok": True}
+            assert control_command(
+                ready[name],
+                "peer.iroh.remove",
+                workspace,
+                ready["alice"]["endpoint_id"],
+            ) == {"ok": True}
+
+        assert peer_endpoints("alice", workspace) == set()
+        assert peer_endpoints("bob", workspace) == {
+            ready["alice"]["endpoint_id"]}
+        assert peer_endpoints("carol", workspace) == {
+            ready["bob"]["endpoint_id"]}
+        assert peer_endpoints("dave", workspace) == {
+            ready["carol"]["endpoint_id"]}
+
+        # Restart the tail after rewiring. Its only durable remote locator is
+        # an Iroh endpoint/ticket; the private HTTP loopback and child process
+        # must be replaced rather than persisted.
+        def dave_forwarder_ready():
+            rows = workspace_row(
+                "dave", workspace)["iroh_connections"]
+            return len(rows) == 1 \
+                and rows[0]["state"] == "ready" \
+                and rows[0]["pid"] is not None
+
+        wait_until(
+            dave_forwarder_ready,
+            timeout=20,
+            message="Dave's line forwarder",
+        )
+        old_server_pid = int(ready["dave"]["pid"])
+        old_endpoint = ready["dave"]["endpoint_id"]
+        old_forwarder = workspace_row(
+            "dave", workspace)["iroh_connections"][0]
+        descendants.add(old_forwarder["pid"])
+        assert stop(processes.pop("dave")) == 0
+        wait_until(
+            lambda: _pid_absent(old_server_pid)
+            and _pid_absent(old_forwarder["pid"]),
+            timeout=20,
+            message="Dave's pre-restart Iroh children to exit",
+        )
+        start("dave")
+        assert ready["dave"]["endpoint_id"] == old_endpoint
+        assert peer_endpoints("dave", workspace) == {
+            ready["carol"]["endpoint_id"]}
+        wait_until(
+            dave_forwarder_ready,
+            timeout=20,
+            message="Dave's restarted line forwarder",
+        )
+        restarted_forwarder = workspace_row(
+            "dave", workspace)["iroh_connections"][0]
+        assert restarted_forwarder["pid"] != old_forwarder["pid"]
+        descendants.add(restarted_forwarder["pid"])
+
+        authored = {
+            control_command(
+                ready[name],
+                "content.message.post",
+                workspace,
+                "general",
+                f"independent writer: {name}",
+            )
+            for name in names
+        }
+        assert len(authored) == len(names)
+
+        def line_converged():
+            snapshots = {name: status(name) for name in names}
+            rows = {
+                name: snapshots[name]["workspaces"][workspace]
+                for name in names
+            }
+            if len({
+                    row["forest_fingerprint"]
+                    for row in rows.values()}) != 1:
+                return False
+            if any(
+                    len(row["writers"]) != len(names)
+                    or any(
+                        writer["head"] != writer["projected_head"]
+                        for writer in row["writers"])
+                    for row in rows.values()):
+                return False
+            return all(
+                authored <= {
+                    message["fid"]
+                    for message in control_command(
+                        ready[name],
+                        "content.message.list",
+                        workspace,
+                    )
+                }
+                for name in names
+            )
+
+        wait_until(
+            line_converged,
+            timeout=45,
+            message="four writers to converge across the Iroh line",
+        )
+        remember_forwarders(workspace)
+
+        # The local control ports drove authoring and observation. Inter-peer
+        # configuration contains only Iroh locators, so every scheduled pull,
+        # reverse mirror, grant, and multi-hop relay above crossed real Iroh.
+        for name in names:
+            row = workspace_row(name, workspace)
+            assert all(peer["kind"] == "iroh" for peer in row["peers"])
+            configured = {
+                f"iroh:{peer['endpoint']}" for peer in row["peers"]
+            }
+            assert configured.isdisjoint({
+                failure["peer"] for failure in row["sync_failures"]
+            })
+    finally:
+        for process in tuple(processes.values()):
+            stop(process)
+        for pid in descendants:
+            wait_until(
+                lambda pid=pid: _pid_absent(pid),
+                timeout=20,
+                message=f"four-peer Iroh child {pid} cleanup",
+            )
+
+
+def test_changed_private_iroh_urls_need_no_retained_sync_walk(tmp_path):
     class CyclingForwarders:
         def __init__(self):
             self.urls = iter([
@@ -1048,33 +1183,15 @@ def test_changed_private_iroh_urls_discard_each_superseded_sync_walk(tmp_path):
     peer = iroh_peer("b" * 64, "B")
     node.add_workspace(workspace, "workspace", [peer])
     node.use_iroh(iroh_peer("c" * 64, "C"), CyclingForwarders())
-    url = node.resolve_peer(workspace, peer)
-    unrelated = {"keep": True}
-    node.sync_cache[("d" * 64, "http://127.0.0.1:49999")] = unrelated
-
-    for expected in (
-            "http://127.0.0.1:41002",
-            "http://127.0.0.1:41003"):
-        superseded = {"walk": object()}
-        node.sync_cache[(workspace, url)] = superseded
-        url = node.resolve_peer(workspace, peer)
-        assert url == expected
-        assert "walk" in superseded
-        assert (workspace, url) not in node.sync_cache
-
-    current = {"current": True}
-    node.sync_cache[(workspace, url)] = current
-    assert [
-        key for key in node.sync_cache if key[0] == workspace
-    ] == [(workspace, "http://127.0.0.1:41003")]
-    assert node.sync_cache == {
-        (workspace, "http://127.0.0.1:41003"): current,
-        ("d" * 64, "http://127.0.0.1:49999"): unrelated,
-    }
+    assert [node.resolve_peer(workspace, peer) for _ in range(3)] == [
+        "http://127.0.0.1:41001",
+        "http://127.0.0.1:41002",
+        "http://127.0.0.1:41003",
+    ]
+    assert not hasattr(node, "sync_cache")
 
 
-def test_set_and_remove_detach_cache_without_mutating_an_active_http_walk(
-        tmp_path, monkeypatch):
+def test_set_and_remove_leave_only_an_inflight_peers_turn_state(tmp_path):
     private_url = "http://127.0.0.1:41001"
 
     class StaticForwarders:
@@ -1084,76 +1201,27 @@ def test_set_and_remove_detach_cache_without_mutating_an_active_http_walk(
         def resolve(self, workspace, peer):
             return private_url
 
-    class Response:
-        status = 200
-        headers = {}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            pass
-
-        def read(self, _maximum):
-            return b"root"
-
-    class BarrierCache(dict):
-        def __init__(self):
-            super().__init__(token="ordinary-grant")
-            self.entered = threading.Event()
-            self.resume = threading.Event()
-
-        def __contains__(self, key):
-            present = super().__contains__(key)
-            if key == "token":
-                self.entered.set()
-                if not self.resume.wait(5):
-                    raise TimeoutError("cache race barrier")
-            return present
-
-    monkeypatch.setattr(
-        walk_module.urllib.request,
-        "urlopen",
-        lambda *_args, **_kwargs: Response(),
-    )
     node = FullPeer(str(tmp_path / "peer"))
     workspace = "a" * 64
     endpoint = "b" * 64
     peer = iroh_peer(endpoint, "A")
     node.add_workspace(workspace, "workspace", [peer])
     node.use_iroh(iroh_peer("c" * 64, "C"), StaticForwarders())
+    url = node.resolve_peer(workspace, peer)
+    client = Peer(node, workspace, url)
+    client._token = "ordinary-grant"
+    client._sync_profile = "sync-v1/full"
 
-    def race(configured_peer, edit):
-        url = node.resolve_peer(workspace, configured_peer)
-        cache = BarrierCache()
-        with node.lock:
-            node.sync_cache[(workspace, url)] = cache
-        client = Peer(node, workspace, url)
-        errors = []
-        thread = threading.Thread(
-            target=lambda: _capture_error(
-                errors,
-                lambda: client.root(response_limit=MAX_ROOT_BYTES),
-            ),
-        )
-        thread.start()
-        assert cache.entered.wait(5)
-        try:
-            edit()
-        finally:
-            cache.resume.set()
-        thread.join(5)
-
-        assert not thread.is_alive()
-        assert errors == []
-        assert cache == {"token": "ordinary-grant"}
-        assert (workspace, url) not in node.sync_cache
-        assert Peer(node, workspace, url).cache is not cache
-        node._evict_sync_cache(workspace, url)
-
-    race(peer, lambda: node.set_iroh_peer(workspace, endpoint, "B"))
+    node.set_iroh_peer(workspace, endpoint, "B")
+    assert (client._token, client._sync_profile) == (
+        "ordinary-grant", "sync-v1/full")
     replacement = node.keyring["workspaces"][workspace]["peers"][0]
-    race(replacement, lambda: node.remove_iroh_peer(workspace, endpoint))
+    fresh = Peer(node, workspace, node.resolve_peer(workspace, replacement))
+    assert fresh._token is fresh._sync_profile is None
+
+    node.remove_iroh_peer(workspace, endpoint)
+    assert (client._token, client._sync_profile) == (
+        "ordinary-grant", "sync-v1/full")
 
 
 def test_outbound_startup_is_bounded_cancelled_and_reaped_on_close(tmp_path):
@@ -1205,70 +1273,6 @@ def test_forwarder_maintenance_attempts_only_one_due_start_per_turn(
     forwarders.maintain()
     assert len(starts) == 2
     forwarders.close()
-
-
-def test_full_peer_mint_fails_at_exactly_one_under_each_fetch_budget(tmp_path):
-    state = tmp_path / "peer"
-    bootstrap = FullPeer(str(state))
-    workspace = facts.auth.workspace.create(bootstrap, "alice", ts=1)
-    issued = now_ms()
-    pile = encode_pile(request.payload(
-        bootstrap, workspace, "sync", issued + 300_000, issued))
-    store = bootstrap.store(workspace)
-    root = store.get("root")
-
-    async def measure():
-        fetched = {}
-
-        async def fetch(oid):
-            raw = store.get("obj/" + oid)
-            fetched.setdefault(oid, raw)
-            return raw
-
-        decision = await RepositoryReader.mint_awaited(
-            workspace,
-            root,
-            fetch,
-            pile,
-            issued,
-            max_unique_fetches=MAX_MINT_FETCHES,
-            max_fetch_bytes=MAX_MINT_FETCH_BYTES,
-        )
-        assert decision is not None
-        return len(fetched), sum(len(raw) for raw in fetched.values())
-
-    fetches, fetched_bytes = asyncio.run(measure())
-    assert fetches > 0
-    assert fetched_bytes > 0
-    bootstrap.sql(workspace).db.close()
-    body = json.dumps({
-        "ws": workspace,
-        "pile": base64.b64encode(pile).decode(),
-    }).encode()
-
-    configurations = (
-        {
-            "TINYP2P_MINT_MAX_FETCHES": str(fetches - 1),
-            "TINYP2P_MINT_MAX_FETCH_BYTES": str(MAX_MINT_FETCH_BYTES),
-        },
-        {
-            "TINYP2P_MINT_MAX_FETCHES": str(MAX_MINT_FETCHES),
-            "TINYP2P_MINT_MAX_FETCH_BYTES": str(fetched_bytes - 1),
-        },
-    )
-    for environment in configurations:
-        daemon, ready = start_plain_full_peer(state, environment)
-        try:
-            assert call(
-                address(ready["data"]),
-                "POST",
-                f"/mint?ws={workspace}",
-                body=body,
-                headers={"Content-Type": "application/json"},
-            )[0] == 403
-            assert store.get("root") == root
-        finally:
-            assert stop(daemon) == 0
 
 
 def _pid_absent(pid):

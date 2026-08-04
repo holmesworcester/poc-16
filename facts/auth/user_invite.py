@@ -15,7 +15,7 @@ from .._policy import FamilyPolicy
 from . import signature
 
 TAG = "user_invite"
-POLICY = FamilyPolicy()
+POLICY = FamilyPolicy(control_fact=True)
 
 
 # SHAPE

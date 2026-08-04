@@ -11,9 +11,9 @@ ARN_RE = re.compile(r"^arn:[^:]+:iam::[0-9]{12}:(?:role|user)/.+$")
 
 
 def policy(
-        bucket, prefix, applier_principal=None, *,
+        bucket, prefix, gateway_principal=None, *,
         profile="bucket-wide", partition="aws"):
-    """Return explicit denies for one declared applier threat profile.
+    """Return explicit denies for one declared hosted-gateway threat profile.
 
     ``bucket-wide`` protects the configured authoritative keys from every
     principal while the policy remains attached and freezes lifecycle-policy
@@ -25,34 +25,37 @@ def policy(
     ``ReplicateDelete``, ``ReplicateTags``, ``ReplicateObjectAnnotation``, or
     ``ObjectOwnerOverrideToBucketOwner`` remain trusted.
 
-    ``single-applier`` is intentionally narrower. It is useful only when the
+    ``single-gateway`` is intentionally narrower. It is useful only when the
     named principal is the complete writer set and all other bucket writers
     and administrators are trusted.
     """
     S3Config(bucket=bucket, prefix=prefix)
     validate_key(prefix)
-    if profile not in {"bucket-wide", "single-applier"}:
+    if profile not in {"bucket-wide", "single-gateway"}:
         raise ValueError("bucket policy profile")
     if partition not in {"aws", "aws-us-gov", "aws-cn"}:
         raise ValueError("AWS partition")
-    if profile == "single-applier":
-        if not isinstance(applier_principal, str) \
-                or not ARN_RE.fullmatch(applier_principal):
-            raise ValueError("applier principal ARN")
-        principal_partition = applier_principal.split(":", 2)[1]
+    if profile == "single-gateway":
+        if not isinstance(gateway_principal, str) \
+                or not ARN_RE.fullmatch(gateway_principal):
+            raise ValueError("gateway principal ARN")
+        principal_partition = gateway_principal.split(":", 2)[1]
         if partition != principal_partition:
-            raise ValueError("applier principal partition")
-        principal = {"AWS": applier_principal}
-        lifecycle_sid = "DenyApplierLifecycleMutation"
+            raise ValueError("gateway principal partition")
+        principal = {"AWS": gateway_principal}
+        lifecycle_sid = "DenyGatewayLifecycleMutation"
     else:
-        if applier_principal is not None:
+        if gateway_principal is not None:
             raise ValueError(
-                "bucket-wide profile does not accept one applier")
+                "bucket-wide profile does not accept one gateway")
         principal = "*"
         lifecycle_sid = "DenyLifecycleMutation"
     bucket_arn = f"arn:{partition}:s3:::{bucket}"
-    root = f"{bucket_arn}/{prefix}/root"
+    removal = f"{bucket_arn}/{prefix}/removal"
+    removal_nodes = f"{bucket_arn}/{prefix}/removal-node/*"
+    heads = f"{bucket_arn}/{prefix}/heads/*"
     objects = f"{bucket_arn}/{prefix}/obj/*"
+    packs = f"{bucket_arn}/{prefix}/pack/*"
     return {
         "Version": "2012-10-17",
         "Statement": [
@@ -61,7 +64,8 @@ def policy(
                 "Effect": "Deny",
                 "Principal": principal,
                 "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
-                "Resource": [root, objects],
+                "Resource": [
+                    removal, heads, objects, removal_nodes],
             },
             {
                 "Sid": "DenyAuthoritativeMetadataMutation",
@@ -78,7 +82,8 @@ def policy(
                     "s3:PutObjectVersionTagging",
                     "s3:UpdateObjectEncryption",
                 ],
-                "Resource": [root, objects],
+                "Resource": [
+                    removal, heads, objects, removal_nodes],
             },
             {
                 "Sid": lifecycle_sid,
@@ -92,15 +97,15 @@ def policy(
                 "Effect": "Deny",
                 "Principal": principal,
                 "Action": "s3:PutObject",
-                "Resource": objects,
+                "Resource": [objects, packs, removal_nodes],
                 "Condition": {"Null": {"s3:if-none-match": "true"}},
             },
             {
-                "Sid": "RequireRootCompareAndSwap",
+                "Sid": "RequireMutableCompareAndSwap",
                 "Effect": "Deny",
                 "Principal": principal,
                 "Action": "s3:PutObject",
-                "Resource": root,
+                "Resource": [removal, heads],
                 "Condition": {
                     "Null": {
                         "s3:if-match": "true",
@@ -120,9 +125,9 @@ def main(argv=None):
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--prefix", required=True)
     parser.add_argument(
-        "--profile", choices=("bucket-wide", "single-applier"),
+        "--profile", choices=("bucket-wide", "single-gateway"),
         default="bucket-wide")
-    parser.add_argument("--applier-principal")
+    parser.add_argument("--gateway-principal")
     parser.add_argument(
         "--partition", choices=("aws", "aws-us-gov", "aws-cn"),
         default="aws")
@@ -137,13 +142,13 @@ def main(argv=None):
             "administrators remain trusted")
     else:
         note = (
-            "single-applier profile: all other writers, replication "
+            "single-gateway profile: all other writers, replication "
             "principals, bucket-policy administrators, and KMS-key "
             "administrators remain trusted")
     print(note, file=sys.stderr)
     print(json.dumps(
         policy(
-            args.bucket, args.prefix, args.applier_principal,
+            args.bucket, args.prefix, args.gateway_principal,
             profile=args.profile, partition=args.partition),
         indent=2, sort_keys=True))
 

@@ -3,6 +3,7 @@ import ast
 import pathlib
 
 import facts
+import pytest
 
 from core import fact as core_fact
 from core.fact import Fact
@@ -96,6 +97,110 @@ def test_router_covers_each_family_once():
     )
 
 
+def test_legacy_shape_is_owned_and_purely_reextracted_by_one_family():
+    from core.fact import CurrentFact, current_fact
+    from facts.content import message as family
+
+    workspace, author = "0" * 64, "1" * 64
+    legacy = family.legacy_message(
+        workspace, author, "general", "hello", 7, author)
+    current = family.message(
+        workspace, author, "general", "hello", 7, author)
+    hydrated = facts.hydrate(legacy)
+
+    assert facts.family_for(family.LEGACY_TAG) is family
+    assert isinstance(hydrated, CurrentFact)
+    assert hydrated.fid == legacy.fid != current.fid
+    assert current_fact(hydrated) == current
+
+    malformed = Fact(
+        family.LEGACY_TAG,
+        legacy.ts,
+        legacy.atoms,
+        {**legacy.body, "smuggled": True},
+        legacy.ws,
+    )
+    with pytest.raises(ValueError, match="legacy message shape"):
+        facts.hydrate(malformed)
+
+
+def test_post_kernel_dispatch_uses_current_form_and_source_identity(
+        monkeypatch):
+    """Family grants see current meaning without changing wire identity."""
+    from types import SimpleNamespace
+
+    from core.fact import CurrentFact, current_fact, source_fact
+    from core.kernel import drain
+    from facts._policy import FamilyPolicy
+
+    workspace, writer = "0" * 64, "1" * 64
+    source = Fact(
+        "test_grant.v0", 7, [], {"old_value": "source"}, workspace)
+    current = Fact(
+        "test_grant", 7, [], {"value": "current"}, workspace)
+    observed = []
+
+    def reextract(candidate):
+        if candidate != source:
+            raise ValueError("synthetic source")
+        return current
+
+    def validate(candidate, _context):
+        return current_fact(candidate) == current
+
+    def check(valid, stream, label):
+        assert isinstance(valid.fact, CurrentFact)
+        assert source_fact(valid.fact) == source
+        assert current_fact(valid.fact) == current
+        assert tuple(source_fact(fact) for fact in stream) == (source,)
+        assert tuple(current_fact(fact) for fact in stream) == (current,)
+        observed.append(label)
+
+    expected_writer = writer
+
+    def authorize(
+            _view, valid, stream, _trusted_now, *, purpose, writer=None):
+        assert writer == expected_writer
+        check(valid, stream, "access")
+        return writer, purpose
+
+    def authorize_head(
+            _view, valid, stream, candidate_writer,
+            _proposed_head, _trusted_now):
+        check(valid, stream, "head")
+        return candidate_writer, candidate_writer, None
+
+    family = SimpleNamespace(
+        TAG="test_grant",
+        POLICY=FamilyPolicy(),
+        DURABLE=False,
+        needs=lambda _fact: (),
+        validate=validate,
+        reextract=reextract,
+        authorize=authorize,
+        authorize_head=authorize_head,
+    )
+    real_family_for = facts.family_for
+    monkeypatch.setattr(
+        facts,
+        "family_for",
+        lambda tag: family if tag in {source.t, current.t}
+        else real_family_for(tag),
+    )
+
+    judgment = drain((source,), workspace)
+
+    assert judgment.ok
+    assert judgment.valids[0].fact is source
+    assert facts.authorize_access(
+        judgment, (source,), object(), 8,
+        purpose="sync", writer=writer) == (writer, "sync")
+    assert facts.authorize_writer_head(
+        judgment, (source,), object(), writer, "2" * 64, 8) == (
+            writer, writer, None)
+    assert observed == ["access", "head"]
+
+
 def test_every_family_validator_is_total_for_a_malformed_body():
     workspace = "0" * 64
     for module in facts.MODULES:
@@ -119,11 +224,7 @@ def test_core_fact_module_has_no_family_authors():
 
 
 def test_core_judge_and_engine_do_not_name_family_policy():
-    for name in (
-            "fact.py", "fact_index.py", "indexes.py", "kernel.py",
-            "repository_applier.py", "repository_reader.py",
-            "repository_snapshot.py", "snapshot.py", "validated_set.py",
-            "worker.py"):
+    for name in ("fact.py", "fact_index.py", "kernel.py"):
         source = (ROOT / "core" / name).read_text()
         for vocabulary in (
                 '"admin"', '"device_key"', '"member"', '"removed"',

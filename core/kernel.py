@@ -161,15 +161,16 @@ def accepts(fact, edges, ctx, strict=False):
 def _judge(stream, ctx):
     """The one streaming judge over one bounded, topological closure."""
     valids = []
-    for fact in stream:
+    for source in stream:
         # Prove the ambient anchor from authenticated fact bytes before
         # family lookup, needs resolution, policy, or staging can run.
-        if not bound_to(fact, ctx.anchor):
+        if not bound_to(source, ctx.anchor):
             return Judgment(False, tuple(valids))
-        if ctx.has_fact(fact.fid):
+        if ctx.has_fact(source.fid):
             continue
         try:
-            encode(fact)
+            encode(source)
+            fact = facts.hydrate(source)
             handler = facts.family_for(fact.t)
             refs_seen = all(ctx.has_fact(fid) for _, fid in fact.refs())
             edges = resolve_edges(
@@ -192,7 +193,9 @@ def _judge(stream, ctx):
                 or closure.bit_count() + 1 > MAX_CLOSURE_FACTS:
             return Judgment(False, tuple(valids))
         ctx.admit(fact, depth, edges)
-        valids.append(Valid(fact, tuple(edges)))
+        # Receipts retain the exact source bytes. The current semantic form is
+        # independently reproducible and lives in the relationship context.
+        valids.append(Valid(source, tuple(edges)))
     return Judgment(True, tuple(valids))
 
 

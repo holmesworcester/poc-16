@@ -9,18 +9,73 @@ import tempfile
 import facts
 
 from core import http, peer_capability
-from core.close import close, encode_pile
-from core.crypto import h, keypair
-from core.ingress import ingress_key, parse_ingress_key
-from core.object_store import CREATED, EXISTS
-from core.repository_applier import async_store
+from core.close import (
+    close,
+    decode_signed_pile,
+    encode_signed_pile,
+    make_signed_pile,
+)
+from core.crypto import h, keypair, load_sk
+from core.fact import workspace_of
 from facts.auth.device_invite import device_invite
 from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
 from facts.content.message import message
 from core.kernel import resolve_deps
+from core.writer_repository import FactConsumer, HeadGrant
+from core.writer_head import head_slot_prefix
 from full_peer.node import FullPeer, now_ms
+
+
+_FIXTURE_SIGNER = load_sk("01" * 32)
+
+
+def mechanical_head_authorizer(workspace, removal_root):
+    """Test-only semantic bypass for exercising the mechanical head CAS.
+
+    Removal-path behavior is covered through the real AccessGate tests. Lower
+    writer-tree/store tests need only a typed grant that preserves the exact
+    request's device, base, proposed head, and recipient root.
+    """
+    async def authorize(raw, proposed_head, trusted_now):
+        pile = decode_signed_pile(raw, workspace=workspace)
+        requests = [fact for fact in pile.facts if fact.t == "head_request"]
+        if len(requests) != 1:
+            return None
+        request = requests[0]
+        body = request.body
+        if pile.writer != body.get("device") \
+                or body.get("head") != proposed_head \
+                or body.get("exp", -1) < trusted_now:
+            return None
+        return HeadGrant(
+            workspace,
+            body["device"],
+            body.get("base_head") or None,
+            proposed_head,
+            removal_root,
+        )
+    return authorize
+
+
+def signed_pile_bytes(facts, *, workspace=None, secret=None):
+    """Encode one real signed wire pile for protocol-independent fixtures."""
+    facts = tuple(facts)
+    if workspace is None:
+        if not facts:
+            raise ValueError("pile workspace")
+        workspace = workspace_of(facts[0])
+    secret = _FIXTURE_SIGNER if secret is None else secret
+    writer = secret.verify_key.encode().hex()
+    return encode_signed_pile(make_signed_pile(
+        secret, workspace, writer, facts))
+
+
+def signed_pile_facts(raw, workspace=None, writer=None):
+    """Decode the sole signed wire format and return its ordered facts."""
+    return list(decode_signed_pile(
+        raw, workspace=workspace, writer=writer).facts)
 
 
 def invoke_mint_value(node, workspace, value):
@@ -39,31 +94,6 @@ def invoke_mint_value(node, workspace, value):
     ))
     body = json.loads(response.body) if response.body else None
     return gate, (response.status, body)
-
-
-async def plant_exact(store, workspace, member, raw, session=None):
-    """Test-fixture upload: create one exact source without applying it."""
-    digest = h(raw)
-    key = ingress_key(
-        workspace, digest[:32] if session is None else session,
-        member, digest)
-    store = async_store(store)
-    result = await store.put_if_absent(key, raw)
-    assert result in {CREATED, EXISTS}
-    assert await store.get_bounded(key, max(1, len(raw))) == raw
-    return key
-
-
-async def plant_for(applier, member, raw, session=None):
-    return await plant_exact(
-        applier.store, applier.workspace, member, raw, session)
-
-
-async def apply_planted(applier, source, source_store=None):
-    """Invoke only the public exact-source boundary in tests."""
-    source_store = applier.store if source_store is None else source_store
-    return await applier.apply_exact(
-        source_store, source, parse_ingress_key(source).digest)
 
 
 def invoke_mint(node, workspace, pile):
@@ -96,26 +126,20 @@ def suppression_world(path, initial_secret=None):
 
 
 def replay_random(source, workspace, destination, seed):
-    """Deliver the same valid set under a random partition/order/batching."""
+    """Consume the same valid set under a random partition and order."""
     rng = random.Random(seed)
     shuffled = all_fids(source, workspace)
     rng.shuffle(shuffled)
-    position = batch = 0
-    pending = []
+    position = 0
     while position < len(shuffled):
-        for pile in range(rng.randint(1, 3)):
+        for _pile in range(rng.randint(1, 3)):
             take = rng.randint(1, 5)
             chunk = shuffled[position:position + take]
             position += take
             if chunk:
-                pending.append(deliver(
+                deliver(
                     destination, workspace,
-                    closed_subset(source, workspace, chunk),
-                    member=h(
-                        f"seed{seed}batch{batch}pile{pile}".encode())))
-        for exact_source in pending:
-            destination.turn(workspace, exact_source)
-        batch += 1
+                    closed_subset(source, workspace, chunk))
     return destination
 
 
@@ -200,11 +224,10 @@ def member_src(n, ws, pk):
 
 
 def inject_device_claim(
-        node, workspace, secret, public, user, target, label, ts):
-    """Author a valid direct-device claim past command duplicate checks."""
-    item = device_invite(
-        workspace, public, user, target, label, ts)
-    signed = signature(secret, public, item, ts)
+        node, workspace, owner_secret, owner, target, label, ts):
+    """Author one owner-signed claim past command duplicate checks."""
+    item = device_invite(workspace, owner, target, label, ts)
+    signed = signature(owner_secret, owner, item, ts)
     node.ingest_new(
         workspace,
         [signed, item],
@@ -213,9 +236,9 @@ def inject_device_claim(
             item.fid: [
                 signed.fid,
                 node.sql(workspace).resolve_offer(
-                    "member", public, user),
+                    "member", owner, owner),
                 node.sql(workspace).resolve_offer(
-                    "device_key", public, user),
+                    "device_key", owner, owner),
             ],
         },
     )
@@ -230,15 +253,14 @@ def closed_subset(n, ws, fids):
                       lambda fid: resolve_deps(
                           n.fact_of(ws, fid), context) or [],
                       lambda fid: n.fact_of(ws, fid))
-    return encode_pile(facts, workspace=ws)
+    return signed_pile_bytes(facts, workspace=ws)
 
 
-def deliver(dst, ws, pile_bytes, member="feed" * 16):
-    """Deliver and apply one exact pile; there is no discovery turn."""
-    digest = h(pile_bytes)
-    source = ingress_key(ws, digest[:32], member, digest)
-    dst.receive_pile(ws, member, pile_bytes)
-    return source
+def deliver(dst, ws, pile_bytes):
+    """Consume one already-authenticated signed pile through common core."""
+    pile = decode_signed_pile(pile_bytes, workspace=ws)
+    return FactConsumer(ws, dst.sql(ws)).consume(
+        pile_bytes, writer=pile.writer)
 
 
 def all_fids(n, ws):
@@ -248,6 +270,15 @@ def all_fids(n, ws):
             for fid in n.sql(ws).fact_ids()
         ]
     return [fact.fid for fact in sorted(facts, key=lambda fact: fact.key)]
+
+
+def writer_slots(node, workspace):
+    """Exact accepted writer-slot bytes for a realistic mutation ratchet."""
+    store = node.store(workspace)
+    return tuple(
+        (key, store.get(key))
+        for key in store.list(head_slot_prefix(workspace))
+    )
 
 
 def send_bytes(node, workspace, name, data, channel="general", ts=None):

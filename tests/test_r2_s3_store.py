@@ -82,9 +82,9 @@ def test_r2_config_can_only_name_the_direct_account_endpoint():
 def test_r2_host_path_uses_content_md5_and_s3_conditionals():
     client = Client()
     store = R2S3Store(config(), client=client)
-    first = store.cas("root", ABSENT, b"one")
-    versioned = store.read_versioned("root")
-    second = store.cas("root", versioned.token, b"two")
+    first = store.cas("removal", ABSENT, b"one")
+    versioned = store.read_versioned("removal")
+    second = store.cas("removal", versioned.token, b"two")
 
     assert isinstance(first, Applied)
     assert isinstance(versioned, Versioned)

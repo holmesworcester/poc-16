@@ -1,4 +1,4 @@
-"""Crash, bootstrap, and race coverage for durable notification discovery."""
+"""Crash, bootstrap, and race coverage for per-writer notification cursors."""
 import asyncio
 from dataclasses import dataclass
 
@@ -6,15 +6,14 @@ import pytest
 
 import facts
 from adapters.s3 import S3Config, S3Store
-from core import merkle_map
-from core.crypto import h
-from core.fact import encode
-from core.limits import MAX_PILE_FACTS, PayloadTooLarge
+from core.crypto import h, keypair
+from core.fact import canon, encode
 from core.object_store import OutcomeUnknown
 from core.store import FsStore
+from core.writer_head import decode_head, decode_slot_at, head_slot_key
+from core.writer_tree import leaf_key, tree_reader
 from facts.auth.device import bind
-from facts import _bao
-from facts.content import delete, file_slice, message
+from facts.content import delete, message
 from full_peer.node import FullPeer
 from notifications.carrier import CarrierAccepted
 from notifications.discovery import (
@@ -27,17 +26,21 @@ from notifications.discovery import (
     PENDING_CURRENT,
     PENDING_NONCURRENT,
     Pending,
+    Scan,
     decode_cursor,
+    empty_descriptor,
     encode_cursor,
 )
 from notifications.hints import (
+    EventRef,
     MAX_HINT_BYTES,
+    MAX_HINT_EVENTS,
     NotificationHint,
     decode_hint,
     encode_hint,
     materialize_hint,
 )
-from tests.util import send_bytes
+from tests.util import add_member
 
 
 OWNER = "c" * 64
@@ -92,8 +95,32 @@ class UnknownNextCas(DelegateStore):
         return result
 
 
+class SimulatedCrash(BaseException):
+    pass
+
+
+class CrashBeforeSecondCas(DelegateStore):
+    """Crash after validation but before pending notification progress."""
+
+    def __init__(self, store):
+        super().__init__(store)
+        self.remaining = None
+
+    def arm(self):
+        # run_once first pins Scan, then attempts to persist Pending.
+        self.remaining = 2
+
+    def cas(self, key, token, value):
+        if self.remaining is not None:
+            self.remaining -= 1
+            if self.remaining == 0:
+                self.remaining = None
+                raise SimulatedCrash()
+        return self.store.cas(key, token, value)
+
+
 class AwaitedStore:
-    """Actually-async object-store fake, not the synchronous adapter."""
+    """Actually-async object-store fake, including writer-list operations."""
 
     def __init__(self, store):
         self.store = store
@@ -103,6 +130,11 @@ class AwaitedStore:
         self.calls.append(("get", key))
         await asyncio.sleep(0)
         return self.store.get_bounded(key, maximum)
+
+    async def copy_pile_object(self, oid, maximum, write):
+        self.calls.append(("copy", oid))
+        await asyncio.sleep(0)
+        return self.store.copy_pile_object(oid, maximum, write)
 
     async def read_versioned(self, key):
         self.calls.append(("read", key))
@@ -119,12 +151,37 @@ class AwaitedStore:
         await asyncio.sleep(0)
         return self.store.cas(key, token, value)
 
+    async def list_page(self, prefix, cursor=None, limit=256):
+        self.calls.append(("list", prefix))
+        await asyncio.sleep(0)
+        return self.store.list_page(prefix, cursor, limit)
+
 
 def _world(tmp_path):
     node = FullPeer(str(tmp_path / "peer"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     bind(node, workspace, "phone")
     return node, workspace
+
+
+def _forest(tmp_path):
+    alice_secret, _alice_public = keypair()
+    bob_secret, bob_public = keypair()
+    alice = FullPeer(str(tmp_path / "alice"), initial_secret=alice_secret)
+    workspace = facts.auth.workspace.create(alice, "alice", ts=1)
+    _secret, _public, bob_join = add_member(
+        alice,
+        workspace,
+        "bob",
+        ts=10,
+        member_identity=(bob_secret, bob_public),
+        invite_identity=keypair(),
+    )
+    authority = alice.sender(workspace).close((bob_join,), {})
+    bob = FullPeer(str(tmp_path / "bob"), initial_secret=bob_secret)
+    bob.add_workspace(workspace, "bob", peers=[])
+    bob.publish_closed(workspace, (authority,))
+    return alice, bob, workspace
 
 
 def _discovery(node, workspace, cursor, carrier, **kwargs):
@@ -135,7 +192,19 @@ def _discovery(node, workspace, cursor, carrier, **kwargs):
 
 def _cursor(store):
     store = getattr(store, "store", store)
-    return decode_cursor(store.read_versioned("root").value)
+    return decode_cursor(store.read_versioned("cursor").value)
+
+
+def _slot(node, workspace, device=None):
+    device = node.identity_id(workspace) if device is None else device
+    key = head_slot_key(workspace, device)
+    return decode_slot_at(key, node.store(workspace).get(key))
+
+
+async def _pending_body(discovery):
+    pending = _cursor(discovery.cursor_store).pending
+    return await discovery.state.get_bounded(
+        "obj/" + pending.oid, MAX_HINT_BYTES)
 
 
 async def _complete(discovery, raw):
@@ -148,9 +217,7 @@ async def _drain(discovery, maximum=100):
         result = await discovery.run_once()
         results.append(result)
         if result.status in {"published", "republished"}:
-            raw = await discovery.state.get_bounded(
-                "obj/" + _cursor(discovery.cursor_store).pending.oid,
-                MAX_HINT_BYTES)
+            raw = await _pending_body(discovery)
             assert await _complete(discovery, raw) == PENDING_NONCURRENT
         if result.status == "idle":
             return results
@@ -167,10 +234,9 @@ def test_run_requires_explicit_bootstrap(tmp_path):
         asyncio.run(discovery.run_once())
 
 
-def test_backfill_bootstrap_includes_history_and_is_idempotent(tmp_path):
+def test_backfill_validates_writer_head_and_materializes_exact_event(tmp_path):
     node, workspace = _world(tmp_path)
     event = message.post(node, workspace, "general", "hello", ts=3)
-    root = node.reader(workspace).root_bytes
     carrier = MemoryCarrier([])
     discovery = _discovery(
         node, workspace, FsStore(str(tmp_path / "cursor")), carrier)
@@ -181,13 +247,18 @@ def test_backfill_bootstrap_includes_history_and_is_idempotent(tmp_path):
     asyncio.run(_drain(discovery))
 
     reference, = map(decode_hint, carrier.payloads)
+    slot = _slot(node, workspace)
     assert reference.workspace == workspace
     assert reference.owner == OWNER
     assert reference.generation == GENERATION
-    assert reference.root_oid == h(root)
+    assert reference.device == node.identity_id(workspace)
+    assert reference.base_head is None
+    assert reference.head == slot.head
     assert reference.facts == (event,)
-    assert materialize_hint(reference, root).root == root
-    assert _cursor(discovery.cursor_store).base == h(root)
+    event_raw = discovery.cursor_store.store.get(
+        "obj/" + reference.events[0].oid)
+    assert materialize_hint(reference, (event_raw,)).facts == (event,)
+    assert not discovery.cursor_store.store.list(f"heads/{workspace}")
 
 
 def test_current_bootstrap_skips_history_but_finds_later_facts(tmp_path):
@@ -208,6 +279,29 @@ def test_current_bootstrap_skips_history_but_finds_later_facts(tmp_path):
     assert old not in found
 
 
+def test_two_writer_heads_are_acknowledged_independently(tmp_path):
+    alice, bob, workspace = _forest(tmp_path)
+    alice_event = message.post(
+        alice, workspace, "general", "from alice", ts=30)
+    bob_event = message.post(bob, workspace, "general", "from bob", ts=31)
+    mirrored = asyncio.run(
+        alice.mirror(workspace).sync_from(bob.store(workspace)))
+    assert mirrored.errors == ()
+    carrier = MemoryCarrier([])
+    discovery = _discovery(
+        alice, workspace, FsStore(str(tmp_path / "cursor")), carrier)
+    asyncio.run(discovery.bootstrap_backfill())
+
+    asyncio.run(_drain(discovery))
+
+    references = tuple(map(decode_hint, carrier.payloads))
+    assert {fid for row in references for fid in row.facts} >= {
+        alice_event, bob_event}
+    assert {row.device for row in references} == {
+        alice.identity_id(workspace), bob.identity_id(workspace)}
+    assert asyncio.run(discovery.run_once()).status == "idle"
+
+
 def test_unknown_bootstrap_cas_reconciles_by_reread(tmp_path):
     node, workspace = _world(tmp_path)
     store = UnknownNextCas(FsStore(str(tmp_path / "cursor")))
@@ -220,7 +314,7 @@ def test_unknown_bootstrap_cas_reconciles_by_reread(tmp_path):
     assert asyncio.run(discovery.bootstrap_current()) == cursor
 
 
-def test_bootstrap_mode_and_owner_are_persistent(tmp_path):
+def test_bootstrap_mode_owner_and_state_loss_fail_closed(tmp_path):
     node, workspace = _world(tmp_path)
     store = FsStore(str(tmp_path / "cursor"))
     discovery = _discovery(node, workspace, store, MemoryCarrier([]))
@@ -233,50 +327,9 @@ def test_bootstrap_mode_and_owner_are_persistent(tmp_path):
         owner="d" * 64)
     with pytest.raises(ValueError, match="bootstrap conflict"):
         asyncio.run(foreign.bootstrap_current())
-
-
-def test_state_loss_never_silently_reinitializes(tmp_path):
-    node, workspace = _world(tmp_path)
-    store = FsStore(str(tmp_path / "cursor"))
-    discovery = _discovery(node, workspace, store, MemoryCarrier([]))
-    asyncio.run(discovery.bootstrap_current())
-    store._delete("root")
-
+    store._delete("cursor")
     with pytest.raises(CursorNotInitialized):
         asyncio.run(discovery.run_once())
-
-
-def test_rebootstrap_generation_makes_old_delivery_noncurrent(tmp_path):
-    node, workspace = _world(tmp_path)
-    store = FsStore(str(tmp_path / "cursor"))
-    carrier = MemoryCarrier([])
-    old = _discovery(node, workspace, store, carrier)
-    asyncio.run(old.bootstrap_current())
-    event = message.post(node, workspace, "general", "old wake", ts=3)
-    assert asyncio.run(old.run_once()).status == "published"
-    raw = carrier.payloads[-1]
-    reference = decode_hint(raw)
-    assert reference.facts == (event,)
-    assert asyncio.run(old.state.pending(h(raw))) == PENDING_CURRENT
-
-    store._delete("root")
-    fresh_carrier = MemoryCarrier([])
-    fresh = NotificationDiscovery(
-        node.store(workspace), store, workspace, fresh_carrier,
-        owner=OWNER, generation_factory=lambda: "f" * 64)
-    current = asyncio.run(fresh.bootstrap_backfill())
-    assert asyncio.run(fresh.run_once()).status == "published"
-    new_raw, = fresh_carrier.payloads
-    new_reference = decode_hint(new_raw)
-    assert new_reference.root_oid == reference.root_oid
-    assert new_reference.facts == reference.facts
-    assert h(new_raw) != h(raw)
-    before = store.read_versioned("root")
-
-    assert asyncio.run(fresh.state.pending(h(raw))) == PENDING_NONCURRENT
-    assert asyncio.run(old.state.complete(h(raw))) == PENDING_NONCURRENT
-    assert store.read_versioned("root") == before
-    assert current.generation != reference.generation
 
 
 def test_carrier_failure_and_dropped_wake_republish_exact_body(tmp_path):
@@ -296,23 +349,10 @@ def test_carrier_failure_and_dropped_wake_republish_exact_body(tmp_path):
     carrier = MemoryCarrier([])
     retry = _discovery(node, workspace, store, carrier)
     assert asyncio.run(retry.run_once()).status == "republished"
-    carrier.payloads.clear()  # simulate an expired carrier message/dropped wake
+    carrier.payloads.clear()  # simulate an expired carrier wake
     assert asyncio.run(retry.run_once()).status == "republished"
     assert carrier.payloads == [raw]
     assert _cursor(store).pending == pending
-
-
-def test_crash_after_publish_before_completion_republishes(tmp_path):
-    node, workspace = _world(tmp_path)
-    store = FsStore(str(tmp_path / "cursor"))
-    carrier = MemoryCarrier([])
-    discovery = _discovery(node, workspace, store, carrier)
-    asyncio.run(discovery.bootstrap_current())
-    message.post(node, workspace, "general", "published", ts=3)
-
-    assert asyncio.run(discovery.run_once()).status == "published"
-    assert asyncio.run(discovery.run_once()).status == "republished"
-    assert carrier.payloads[0] == carrier.payloads[1]
 
 
 def test_concurrent_scanners_republish_one_pending_body(tmp_path):
@@ -339,6 +379,27 @@ def test_concurrent_scanners_republish_one_pending_body(tmp_path):
     assert _cursor(store).pending.oid == h(carrier.payloads[0])
 
 
+def test_crash_after_mirror_before_cursor_cas_replays_unacked_head(tmp_path):
+    node, workspace = _world(tmp_path)
+    base = FsStore(str(tmp_path / "cursor"))
+    fault = CrashBeforeSecondCas(base)
+    discovery = _discovery(node, workspace, fault, MemoryCarrier([]))
+    asyncio.run(discovery.bootstrap_current())
+    event = message.post(node, workspace, "general", "unacked", ts=3)
+    fault.arm()
+
+    with pytest.raises(SimulatedCrash):
+        asyncio.run(discovery.run_once())
+    crashed = _cursor(base)
+    assert crashed.scan is not None and crashed.pending is None
+    assert not base.list(f"heads/{workspace}")
+
+    carrier = MemoryCarrier([])
+    retry = _discovery(node, workspace, base, carrier)
+    assert asyncio.run(retry.run_once()).status == "published"
+    assert decode_hint(carrier.payloads[0]).facts == (event,)
+
+
 def test_completion_unknown_and_concurrent_completion_are_safe(tmp_path):
     node, workspace = _world(tmp_path)
     base = FsStore(str(tmp_path / "cursor"))
@@ -347,17 +408,101 @@ def test_completion_unknown_and_concurrent_completion_are_safe(tmp_path):
     asyncio.run(discovery.bootstrap_current())
     message.post(node, workspace, "general", "accepted", ts=3)
     asyncio.run(discovery.run_once())
-    current = _cursor(base)
-    raw = base.get("obj/" + current.pending.oid)
-    args = (h(raw),)
+    raw = base.get("obj/" + _cursor(base).pending.oid)
     fault.unknown = True
 
-    assert asyncio.run(discovery.state.complete(*args)) == PENDING_NONCURRENT
-    assert asyncio.run(discovery.state.complete(*args)) == PENDING_NONCURRENT
+    assert asyncio.run(discovery.state.complete(h(raw))) == PENDING_NONCURRENT
+    assert asyncio.run(discovery.state.complete(h(raw))) == PENDING_NONCURRENT
     assert _cursor(base).pending is None
 
 
-def test_actual_async_stores_preserve_pending_protocol(tmp_path):
+def test_scan_stays_on_exact_head_when_writer_advances_mid_page(tmp_path):
+    node, workspace = _world(tmp_path)
+    store = FsStore(str(tmp_path / "cursor"))
+    carrier = MemoryCarrier([])
+    discovery = _discovery(
+        node, workspace, store, carrier, page_rows=1)
+    asyncio.run(discovery.bootstrap_current())
+    first = message.post(node, workspace, "general", "first", ts=10)
+    second = message.post(node, workspace, "general", "second", ts=11)
+    pinned = _slot(node, workspace).head
+
+    assert asyncio.run(discovery.run_once()).status == "published"
+    first_body = carrier.payloads[-1]
+    assert decode_hint(first_body).head == pinned
+    asyncio.run(_complete(discovery, first_body))
+    later = message.post(node, workspace, "general", "later", ts=12)
+    latest = _slot(node, workspace).head
+    assert latest != pinned
+    asyncio.run(_drain(discovery))
+
+    heads_by_fact = {
+        fid: reference.head
+        for raw in carrier.payloads
+        for reference in (decode_hint(raw),)
+        for fid in reference.facts
+    }
+    assert heads_by_fact[first] == heads_by_fact[second] == pinned
+    assert heads_by_fact[later] == latest
+
+
+def test_malformed_writer_is_quarantined_without_blocking_other_heads(
+        tmp_path):
+    node, other, workspace = _forest(tmp_path)
+    mirrored = asyncio.run(
+        node.mirror(workspace).sync_from(other.store(workspace)))
+    assert mirrored.errors == ()
+    store = FsStore(str(tmp_path / "cursor"))
+    carrier = MemoryCarrier([])
+    discovery = _discovery(node, workspace, store, carrier)
+    asyncio.run(discovery.bootstrap_current())
+    bad = message.post(node, workspace, "general", "corrupt", ts=30)
+    good = message.post(other, workspace, "general", "valid", ts=31)
+    mirrored = asyncio.run(
+        node.mirror(workspace).sync_from(other.store(workspace)))
+    assert mirrored.errors == ()
+
+    slot = _slot(node, workspace)
+    head = decode_head(node.store(workspace).get("obj/" + slot.head))
+    reader = tree_reader(
+        head.tree,
+        workspace,
+        head.device,
+        lambda oid: node.store(workspace).get("obj/" + oid),
+    )
+    pile_oid = reader.get(leaf_key(head.sequence))
+    node.store(workspace)._delete("obj/" + pile_oid)
+
+    results = asyncio.run(_drain(discovery))
+    cursor = _cursor(store)
+    rejected = asyncio.run(discovery._map_points(
+        "rejected", cursor.rejected, (slot.device,)))
+    found = {
+        fid for raw in carrier.payloads for fid in decode_hint(raw).facts}
+    assert "invalid" in {result.status for result in results}
+    assert rejected[slot.device] == slot.head
+    assert cursor.scan is cursor.pending is None
+    assert good in found and bad not in found
+    assert asyncio.run(discovery.run_once()).status == "idle"
+
+
+def test_current_suppression_does_not_erase_historical_discovery(tmp_path):
+    node, workspace = _world(tmp_path)
+    store = FsStore(str(tmp_path / "cursor"))
+    carrier = MemoryCarrier([])
+    discovery = _discovery(node, workspace, store, carrier)
+    asyncio.run(discovery.bootstrap_current())
+    event = message.post(node, workspace, "general", "removed", ts=10)
+    delete.remove(node, workspace, event, ts=11)
+    assert node.sql(workspace).fact_active(event) is False
+
+    asyncio.run(_drain(discovery))
+
+    assert event in {
+        fid for raw in carrier.payloads for fid in decode_hint(raw).facts}
+
+
+def test_actual_async_stores_preserve_writer_cursor_protocol(tmp_path):
     node, workspace = _world(tmp_path)
     repository = AwaitedStore(node.store(workspace))
     state = AwaitedStore(FsStore(str(tmp_path / "cursor")))
@@ -370,167 +515,81 @@ def test_actual_async_stores_preserve_pending_protocol(tmp_path):
     asyncio.run(discovery.run_once())
 
     assert _cursor(state).pending is not None
-    assert {name for name, _key in repository.calls} >= {"get", "read"}
+    assert {name for name, _key in repository.calls} >= {
+        "copy", "get", "list", "read"}
     assert {name for name, _key in state.calls} >= {
         "get", "read", "create", "cas"}
 
 
-def test_type_range_emits_new_resident_trigger_in_one_turn(tmp_path):
+def test_rebootstrap_generation_makes_old_delivery_noncurrent(tmp_path):
     node, workspace = _world(tmp_path)
     store = FsStore(str(tmp_path / "cursor"))
     carrier = MemoryCarrier([])
-    discovery = _discovery(
-        node, workspace, store, carrier,
-        page_rows=merkle_map.LEAF_MAX_ROWS)
-    asyncio.run(discovery.bootstrap_current())
-    event = message.post(node, workspace, "general", "one turn", ts=3)
+    old = _discovery(node, workspace, store, carrier)
+    asyncio.run(old.bootstrap_current())
+    event = message.post(node, workspace, "general", "old wake", ts=3)
+    assert asyncio.run(old.run_once()).status == "published"
+    old_raw = carrier.payloads[-1]
+    old_reference = decode_hint(old_raw)
+    assert old_reference.facts == (event,)
+    assert asyncio.run(old.state.pending(h(old_raw))) == PENDING_CURRENT
 
-    result = asyncio.run(discovery.run_once())
+    store._delete("cursor")
+    fresh_carrier = MemoryCarrier([])
+    fresh = NotificationDiscovery(
+        node.store(workspace), store, workspace, fresh_carrier,
+        owner=OWNER, generation_factory=lambda: "f" * 64)
+    asyncio.run(fresh.bootstrap_backfill())
+    assert asyncio.run(fresh.run_once()).status == "published"
+    new_raw, = fresh_carrier.payloads
+    new_reference = decode_hint(new_raw)
+    assert new_reference.head == old_reference.head
+    assert new_reference.facts == old_reference.facts
+    assert new_reference.generation != old_reference.generation
+    assert h(new_raw) != h(old_raw)
 
-    assert result.status == "published"
-    assert decode_hint(carrier.payloads[0]).facts == (event,)
-    assert _cursor(store).pending is not None
-
-
-def test_target_stays_pinned_when_repository_advances_mid_page(tmp_path):
-    node, workspace = _world(tmp_path)
-    store = FsStore(str(tmp_path / "cursor"))
-    carrier = MemoryCarrier([])
-    discovery = _discovery(
-        node, workspace, store, carrier, page_rows=1)
-    asyncio.run(discovery.bootstrap_current())
-    late = message.post(node, workspace, "general", "late", ts=100)
-    first_root = node.reader(workspace).root_bytes
-
-    for _ in range(100):
-        result = asyncio.run(discovery.run_once())
-        if result.status == "published":
-            asyncio.run(_complete(discovery, carrier.payloads[-1]))
-        current = _cursor(store)
-        if current.target == h(first_root) and current.after is not None:
-            break
-    else:
-        raise AssertionError("first target did not expose a continuation")
-
-    early = message.post(node, workspace, "general", "early", ts=10)
-    latest_root = node.reader(workspace).root_bytes
-    assert latest_root != first_root
-    asyncio.run(_drain(discovery))
-
-    by_fact = {
-        fid: reference.root_oid
-        for raw in carrier.payloads
-        for reference in (decode_hint(raw),)
-        for fid in reference.facts
-    }
-    assert by_fact[late] == h(first_root)
-    assert by_fact[early] == h(latest_root)
+    assert asyncio.run(fresh.state.pending(h(old_raw))) == PENDING_NONCURRENT
+    assert asyncio.run(old.state.complete(h(old_raw))) == PENDING_NONCURRENT
 
 
-def test_large_bao_fact_is_classified_without_fetching_its_blob(tmp_path):
-    node, workspace = _world(tmp_path)
-    store = FsStore(str(tmp_path / "cursor"))
-    initial = _discovery(node, workspace, store, MemoryCarrier([]))
-    asyncio.run(initial.bootstrap_current())
-    send_bytes(
-        node, workspace, "large.bin", b"x" * (_bao.WIDTH + 1), ts=10)
-    slice_fact = max(
-        node.by_type(workspace, file_slice.TAG),
-        key=lambda fact: len(encode(fact)))
-    slice_raw = encode(slice_fact)
-    assert len(slice_raw) > _bao.WIDTH
-
-    repository = AwaitedStore(node.store(workspace))
-    carrier = MemoryCarrier([])
-    discovery = NotificationDiscovery(
-        repository, store, workspace, carrier, owner=OWNER,
-        generation_factory=lambda: GENERATION)
-    asyncio.run(_drain(discovery))
-
-    assert carrier.payloads == []
-    assert ("get", "obj/" + h(slice_raw)) not in repository.calls
-
-
-def test_discovery_reports_residence_after_current_suppression(tmp_path):
-    node, workspace = _world(tmp_path)
-    store = FsStore(str(tmp_path / "cursor"))
-    carrier = MemoryCarrier([])
-    discovery = _discovery(node, workspace, store, carrier)
-    asyncio.run(discovery.bootstrap_current())
-    event = message.post(node, workspace, "general", "removed", ts=10)
-    delete.remove(node, workspace, event, ts=11)
-    assert node.reader(workspace).worker().fact_active(event) is False
-
-    asyncio.run(_drain(discovery))
-
-    assert event in {
-        fid for raw in carrier.payloads for fid in decode_hint(raw).facts}
-
-
-def test_substituted_cross_workspace_root_fails_closed(tmp_path):
-    node, workspace = _world(tmp_path)
-    store = FsStore(str(tmp_path / "cursor"))
-    carrier = MemoryCarrier([])
-    discovery = _discovery(node, workspace, store, carrier)
-    asyncio.run(discovery.bootstrap_current())
-
-    other = FullPeer(str(tmp_path / "other-peer"))
-    other_workspace = facts.auth.workspace.create(other, "mallory", ts=20)
-    other_root = other.reader(other_workspace).root_bytes
-    other_oid = h(other_root)
-    store.put_if_absent("obj/" + other_oid, other_root)
-    version = store.read_versioned("root")
-    current = decode_cursor(version.value)
-    substituted = Cursor(
-        current.workspace, current.owner, current.generation,
-        current.bootstrap, current.base, other_oid)
-    store.cas("root", version.token, encode_cursor(substituted))
-
-    with pytest.raises(ValueError, match="repository reader workspace"):
-        asyncio.run(discovery.run_once())
-    assert carrier.payloads == []
-
-
-def test_malformed_cursor_fails_before_carrier_work(tmp_path):
-    node, workspace = _world(tmp_path)
-    store = FsStore(str(tmp_path / "cursor"))
-    carrier = MemoryCarrier([])
-    discovery = _discovery(node, workspace, store, carrier)
-    asyncio.run(discovery.bootstrap_current())
-    version = store.read_versioned("root")
-    store.cas("root", version.token, b"{}")
-
-    with pytest.raises(ValueError, match="notification cursor shape"):
-        asyncio.run(discovery.run_once())
-    assert carrier.payloads == []
-
-
-def test_maximum_hint_and_generation_bounds_are_canonical():
-    fids = tuple(sorted(
-        h(number.to_bytes(4, "big")) for number in range(MAX_PILE_FACTS)))
+def test_hint_and_cursor_codecs_are_canonical_and_reject_old_shape():
+    events = tuple(
+        EventRef(
+            h(number.to_bytes(4, "big")),
+            h(b"event" + number.to_bytes(4, "big")),
+        )
+        for number in range(MAX_HINT_EVENTS)
+    )
+    events = tuple(sorted(events))
     hint = NotificationHint(
-        "a" * 64, "b" * 64, "c" * 64, "d" * 64, fids)
+        "a" * 64, "b" * 64, "c" * 64, "d" * 64,
+        None, "e" * 64, events)
     raw = encode_hint(hint)
-    assert len(raw) < MAX_HINT_BYTES == 128_000
+    assert len(raw) < MAX_HINT_BYTES
     assert decode_hint(raw) == hint
     with pytest.raises(ValueError, match="notification hint"):
         NotificationHint(
-            "a" * 64, "b" * 64, "not-a-generation", "d" * 64, ())
-    with pytest.raises(PayloadTooLarge, match="notification hint too large"):
-        decode_hint(b"x" * (MAX_HINT_BYTES + 1))
+            "a" * 64, "b" * 64, "c" * 64, "d" * 64,
+            None, "e" * 64, events + (EventRef("f" * 64, "f" * 64),))
 
-
-def test_pending_codec_rejects_nonforward_successor():
-    pending = Pending(
-        "d" * 64, "f" * 64, "a" * 64, "k")
+    empty = empty_descriptor()
     cursor = Cursor(
         "a" * 64, "b" * 64, "c" * 64, BOOTSTRAP_BACKFILL,
-        base="f" * 64, target="a" * 64, after="z")
+        True, empty, empty, empty,
+        Scan("d" * 64, "e" * 64, "f" * 64))
+    encoded_cursor = encode_cursor(cursor)
+    assert b'"removal_root"' in encoded_cursor
+    assert b'"authority_root"' not in encoded_cursor
+    assert decode_cursor(encoded_cursor) == cursor
+    with pytest.raises(ValueError, match="cursor shape"):
+        decode_cursor(canon({"format": "notification-cursor-v3"}))
+
+    changed = {"root": h(b"map"), "count": 1, "depth": 1}
     with pytest.raises(ValueError, match="pending successor"):
         Cursor(
             cursor.workspace, cursor.owner, cursor.generation,
-            cursor.bootstrap, cursor.base, cursor.target,
-            cursor.after, pending)
+            cursor.bootstrap, True, empty, empty, empty, cursor.scan,
+            Pending("f" * 64, changed, empty))
 
 
 def test_discovery_rejects_one_namespace_and_page_over_limit(tmp_path):
@@ -555,4 +614,4 @@ def test_discovery_rejects_one_namespace_and_page_over_limit(tmp_path):
     with pytest.raises(ValueError, match="notification discovery"):
         NotificationDiscovery(
             object(), object(), "a" * 64, MemoryCarrier([]), owner=OWNER,
-            page_rows=merkle_map.MAX_RANGE_ROWS + 1)
+            page_rows=MAX_HINT_EVENTS + 1)

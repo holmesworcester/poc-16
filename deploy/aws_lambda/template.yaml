@@ -37,6 +37,10 @@ Parameters:
     Type: Number
     Default: 100000
     MinValue: 1
+  HeadPageKeys:
+    Type: Number
+    Default: 256
+    AllowedValues: [256]
   KmsKeyArn:
     Type: String
     Default: ""
@@ -55,7 +59,15 @@ Resources:
   GrantSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Description: Stable HMAC secret shared by every POC-16 Lambda sandbox
+      Description: Stable HMAC secret for bearer grants across Lambda sandboxes
+      GenerateSecretString:
+        ExcludePunctuation: true
+        PasswordLength: 64
+
+  PermitSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Stable HMAC secret for exact control-head permits across Lambda sandboxes
       GenerateSecretString:
         ExcludePunctuation: true
         PasswordLength: 64
@@ -71,7 +83,7 @@ Resources:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: ReadOneWorkspace
+        - PolicyName: ServeOneWriterForest
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -83,18 +95,34 @@ Resources:
                 Condition:
                   StringLike:
                     s3:prefix:
-                      - !Sub "${StorePrefix}/root"
+                      - !Sub "${StorePrefix}/removal"
+                      - !Sub "${StorePrefix}/removal-node/*"
                       - !Sub "${StorePrefix}/obj/*"
                       - !Sub "${StorePrefix}/invite/*"
+                      - !Sub "${StorePrefix}/heads/${WorkspaceId}/*"
                   NumericLessThanEquals:
-                    s3:max-keys: 1
-              - Sid: ReadRoot
+                    s3:max-keys: !Ref HeadPageKeys
+              - Sid: ReadPrivateRemovalState
                 Effect: Allow
                 Action: s3:GetObject
-                Resource: !Sub
-                  - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/root"
-                  - Bucket: !Ref BucketName
-                    Prefix: !Ref StorePrefix
+                Resource:
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/removal"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/removal-node/*"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
+              - Sid: ReadWriterHeads
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/heads/${Workspace}/*"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
+                      Workspace: !Ref WorkspaceId
               - Sid: ReadImmutableObjects
                 Effect: Allow
                 Action: s3:GetObject
@@ -107,15 +135,88 @@ Resources:
                     - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/invite/*"
                     - Bucket: !Ref BucketName
                       Prefix: !Ref StorePrefix
+              - Sid: ReadImmutablePacksByScopedRequest
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub
+                  - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/pack/*"
+                  - Bucket: !Ref BucketName
+                    Prefix: !Ref StorePrefix
+                Condition:
+                  NumericLessThanEquals:
+                    s3:signatureAge: 60000
+                  StringEquals:
+                    s3:authType: REST-QUERY-STRING
+                    s3:signatureversion: AWS4-HMAC-SHA256
+              - Sid: CreateImmutableObjects
+                Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/obj/*"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
+                Condition:
+                  Null:
+                    s3:if-none-match: "false"
+              - Sid: CreatePrivateRemovalNodes
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub
+                  - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/removal-node/*"
+                  - Bucket: !Ref BucketName
+                    Prefix: !Ref StorePrefix
+                Condition:
+                  Null:
+                    s3:if-none-match: "false"
+              - Sid: CreateImmutablePacksByScopedRequest
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub
+                  - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/pack/*"
+                  - Bucket: !Ref BucketName
+                    Prefix: !Ref StorePrefix
+                Condition:
+                  Null:
+                    s3:if-none-match: "false"
+                  NumericLessThanEquals:
+                    s3:signatureAge: 60000
+                  StringEquals:
+                    s3:authType: REST-QUERY-STRING
+                    s3:signatureversion: AWS4-HMAC-SHA256
+              - Sid: AdvanceRemovalAndOwnerHeads
+                Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/removal"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/heads/${Workspace}/*"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
+                      Workspace: !Ref WorkspaceId
               - Sid: ReadGrantSecret
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref GrantSecret
+              - Sid: ReadPermitSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref PermitSecret
               - !If
                 - HasKmsKey
                 - Sid: DecryptWorkspaceObjects
                   Effect: Allow
                   Action: kms:Decrypt
+                  Resource: !Ref KmsKeyArn
+                - !Ref AWS::NoValue
+              - !If
+                - HasKmsKey
+                - Sid: CreateEncryptedWriterPacks
+                  Effect: Allow
+                  Action: kms:GenerateDataKey
                   Resource: !Ref KmsKeyArn
                 - !Ref AWS::NoValue
               - Sid: WriteFunctionLogs
@@ -156,18 +257,18 @@ Resources:
             - !Ref KmsKeyArn
             - !Ref AWS::NoValue
           TINYP2P_GRANT_SECRET_ARN: !Ref GrantSecret
+          TINYP2P_PERMIT_SECRET_ARN: !Ref PermitSecret
           TINYP2P_FUNCTION_TIMEOUT_SECONDS: "15"
           TINYP2P_AWS_CONNECT_TIMEOUT_SECONDS: "2"
           TINYP2P_AWS_READ_TIMEOUT_SECONDS: "5"
           TINYP2P_AWS_TOTAL_ATTEMPTS: "1"
           TINYP2P_MAX_REQUEST_BYTES: "524288"
-          TINYP2P_MAX_ROOT_BYTES: "1048576"
+          TINYP2P_MAX_CONTROL_BYTES: "4194304"
           TINYP2P_MAX_OBJECT_BYTES: "4194304"
           TINYP2P_MAX_BATCH_COUNT: "256"
           TINYP2P_MAX_BATCH_BYTES: "4194304"
-          TINYP2P_MINT_MAX_FETCHES: "128"
-          TINYP2P_MINT_MAX_FETCH_BYTES: "4194304"
           TINYP2P_GRANT_TTL: "60000"
+          TINYP2P_PACK_TTL_SECONDS: "60"
       FunctionUrlConfig:
         AuthType: NONE
         InvokeMode: BUFFERED
@@ -231,3 +332,5 @@ Outputs:
     Value: !GetAtt GatewayFunctionUrl.FunctionUrl
   GrantSecretArn:
     Value: !Ref GrantSecret
+  PermitSecretArn:
+    Value: !Ref PermitSecret

@@ -7,9 +7,9 @@ from adapters.cloudflare.notification_state import NotificationStateService
 from adapters.cloudflare.queue import delivery_from_message
 from adapters.cloudflare.read_service import ReadServiceStore
 from core.crypto import load_sk
-from core.limits import MAX_OBJECT_BYTES, MAX_ROOT_BYTES
 from core.shape import valid_fid
 from notifications.carrier import ACK, delivery_disposition
+from notifications.forest import current_repository
 from notifications.worker import NotificationWorker, handle_carrier_delivery
 
 if __package__:
@@ -56,6 +56,7 @@ class Settings:
             raise ValueError("notification services must be segregated")
         if not callable(getattr(canonical, "get_bounded", None)) \
                 or not callable(getattr(canonical, "read_versioned", None)) \
+                or not callable(getattr(canonical, "list_page", None)) \
                 or not callable(getattr(canonical, "release", None)):
             raise ValueError("CANONICAL_READER binding")
         if not all(callable(getattr(state, name, None))
@@ -110,20 +111,13 @@ async def consume(env, batch):
     state = NotificationStateService(settings.state, settings.identity)
     provider = FcmServiceBinding(settings.fcm, local)
 
-    async def current_root(workspace):
+    async def current(workspace):
         if workspace != settings.workspace:
             raise ValueError("notification workspace")
-        return await canonical.get_bounded("root", MAX_ROOT_BYTES)
-
-    async def fetch(workspace, oid):
-        if workspace != settings.workspace or not valid_fid(oid):
-            raise ValueError("notification object")
-        return await canonical.get_bounded(
-            "obj/" + oid, MAX_OBJECT_BYTES)
+        return await current_repository(canonical, workspace)
 
     worker = NotificationWorker(
-        current_root,
-        fetch,
+        current,
         settings.push_secret,
         provider,
         lambda: time_ns() // 1_000_000,
