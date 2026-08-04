@@ -15,10 +15,7 @@ POLICY = FamilyPolicy(
     authority_resident=True,
     suppression=(Self(),),
     authority_liveness_guards=("member", "device"),
-    principal_offers=(
-        SidOffer("member", "member"),
-        SidOffer("device_key", "device"),
-    ),
+    principal_offers=(SidOffer("device_key", "device"),),
 )
 
 
@@ -30,7 +27,6 @@ def device_invite(workspace, user, device_pk, label, ts):
     return Fact(
         TAG, ts,
         author_selectors(POLICY, {}) + [
-         ["offer", "member", device_pk, user],
          ["offer", "device_key", device_pk, user],
          ["offer", "device", user, device_pk]],
         {"user": user, "device": device_pk, "label": label},

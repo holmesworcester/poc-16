@@ -123,13 +123,13 @@ def compile_proof_commands(modules):
 PROOF_COMMANDS = compile_proof_commands(MODULES)
 
 
-def proof_payload(node, workspace, purpose, exp, ts):
+def proof_payload(node, workspace, purpose, exp, ts, **context):
     """Ask the registered fact family to author one ephemeral proof closure."""
     try:
         command = PROOF_COMMANDS[purpose]
     except KeyError:
         raise ValueError(f"unknown proof purpose: {purpose}") from None
-    return command(node, workspace, purpose, exp, ts)
+    return command(node, workspace, purpose, exp, ts, **context)
 
 
 def workspace_for(node, prefix):
@@ -322,7 +322,22 @@ def authorize_writer_head(
     return decisions[0] if len(decisions) == 1 else None
 
 
-def authorize_access(judgment, stream, view, trusted_now, *, purpose):
+def authorize_removal_path(judgment, stream, writer, trusted_now):
+    """Dispatch exactly one historical path request from one signed pile."""
+    valids, current_stream = semantic_evaluation(judgment, stream)
+    requests = []
+    for valid in valids:
+        family = family_for(valid.fact.t)
+        authorize = getattr(family, "authorize_path", None)
+        if callable(authorize):
+            requests.append(authorize(
+                valid, current_stream, writer, trusted_now))
+    accepted = [request for request in requests if request is not None]
+    return accepted[0] if len(requests) == 1 and len(accepted) == 1 else None
+
+
+def authorize_access(
+        judgment, stream, view, trusted_now, *, purpose, writer=None):
     """Dispatch one ephemeral access request from a signed pile judgment.
 
     The caller supplies a verifier-pinned current-authority view.  The pile
@@ -345,6 +360,7 @@ def authorize_access(judgment, stream, view, trusted_now, *, purpose):
         current_stream,
         trusted_now,
         purpose=purpose,
+        writer=writer,
     ) if callable(authorize) else None
 
 

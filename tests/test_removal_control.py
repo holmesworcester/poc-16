@@ -70,7 +70,8 @@ def test_content_ephemeral_and_content_target_signature_reject_whole_control_pil
     founder_secret, founder, root, _member_secret, _member, _membership = world()
     ordinary = message(root.fid, founder, "general", "hello", 5)
     ordinary_sig = signature(founder_secret, founder, ordinary, 5)
-    ephemeral = request(root.fid, founder, "sync", 100, 6)
+    ephemeral = request(
+        root.fid, founder, founder, "sync", 100, b"path", 6)
     ephemeral_sig = signature(founder_secret, founder, ephemeral, 6)
 
     for stream in (

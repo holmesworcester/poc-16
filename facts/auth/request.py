@@ -1,94 +1,93 @@
-"""facts/auth/request.py — ephemeral proof of workspace access."""
-from core.fact import Fact, Need, source_fact
-from .._commands import member_source
+"""facts/auth/request.py — current removal-path proof of workspace access."""
+
+import base64
+
+from core.fact import Fact
+from core.removal_path import verify_clear
+from core.shape import valid_fid
+from .._commands import offer_source
 from .._policy import FamilyPolicy
-from . import signature
+from . import _access, signature
+
 
 TAG = "req"
 POLICY = FamilyPolicy()
 PURPOSES = frozenset({"sync"})
-
-
-# SHAPE
-def request(workspace, pk, verb, exp, ts, owner=None):
-    owner = pk if owner is None else owner
-    return Fact(
-        TAG, ts, [],
-        {"pk": pk, "owner": owner, "verb": verb, "exp": exp}, workspace)
-
-
-# NEEDS
-def needs(f):
-    pk = f.body.get("pk", "")
-    owner = f.body.get("owner", "")
-    return (
-        Need("author", "author", f.fid, pk),
-        Need("member", "member", pk, owner),
-    )
-
-
-# VALIDATE — stable shape and relationship validity only.
-def validate(f, ctx):
-    try:
-        body = f.body
-        return set(body) == {"pk", "owner", "verb", "exp"} \
-            and isinstance(body["pk"], str) \
-            and isinstance(body["owner"], str) \
-            and isinstance(body["verb"], str) \
-            and isinstance(body["exp"], int) \
-            and f == request(
-                f.ws, body["pk"], body["verb"], body["exp"], f.ts,
-                body["owner"])
-    except (KeyError, IndexError, TypeError, ValueError):
-        return False
-
-
-# MODE — requests are judged but never enter durable validated storage.
 DURABLE = False
 
 
-def authorize(view, valid, stream, trusted_now, *, purpose="sync"):
-    """Authorize this ephemeral closure using only bounded Worker reads.
+def _encoded_path(raw):
+    if not isinstance(raw, bytes):
+        raise ValueError("removal path bytes")
+    return base64.b64encode(raw).decode("ascii")
 
-    ``view`` is the database-free capability: authenticated Fact and
-    Suppression tree point reads over one pinned authority root. The selected
-    provider must reside there; a self-contained proof cannot bootstrap it.
-    """
-    body = valid.fact.body
-    if purpose not in PURPOSES or body["verb"] != purpose \
-            or body["exp"] < trusted_now:
-        return None
-    edges = {edge.role: edge.fid for edge in valid.edges}
-    provider = {fact.fid: fact for fact in stream}.get(edges.get("member"))
-    if provider is None or (
-            "member", body["pk"], body["owner"]) not in provider.offers():
-        return None
+
+def request(workspace, device, owner, verb, exp, removal_path, ts):
+    return Fact(
+        TAG, ts, [],
+        {
+            "device": device,
+            "owner": owner,
+            "verb": verb,
+            "exp": exp,
+            "path": _encoded_path(removal_path),
+        },
+        workspace,
+    )
+
+
+def needs(fact):
+    return _access.needs(fact)
+
+
+def validate(fact, _ctx):
     try:
-        current = view.fact_of(provider.fid)
-    except ValueError:
-        return None
-    if source_fact(current) != source_fact(provider) \
-            or not view.fact_active(provider.fid):
-        return None
-    return body["pk"], body["verb"]
+        body = fact.body
+        path = base64.b64decode(body["path"], validate=True)
+        return set(body) == {"device", "owner", "verb", "exp", "path"} \
+            and valid_fid(body["device"]) \
+            and valid_fid(body["owner"]) \
+            and isinstance(body["verb"], str) and body["verb"] \
+            and type(body["exp"]) is int \
+            and fact == request(
+                fact.ws, body["device"], body["owner"], body["verb"],
+                body["exp"], path, fact.ts)
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
-# COMMANDS — build the already-topological request + auth closure for a mint.
-def payload(node, workspace, verb, exp, ts):
-    secret, public = node.identity(workspace)
-    member, owner = member_source(node, workspace, public)
-    if member is None:
+def authorize(view, valid, stream, trusted_now, *, purpose="sync", writer=None):
+    body = valid.fact.body
+    if valid.fact.t != TAG or purpose not in PURPOSES \
+            or body["verb"] != purpose or body["exp"] < trusted_now:
+        return None
+    identity = _access.claim(valid, stream, writer)
+    if identity is None:
+        return None
+    path = base64.b64decode(body["path"], validate=True)
+    verify_clear(view, path, identity.scopes)
+    return identity.device, body["verb"]
+
+
+def payload(node, workspace, verb, exp, ts, *, removal_path):
+    secret, device = node.identity(workspace)
+    binding = node.local_writer_binding(workspace)
+    if binding is None or binding.device != device:
         raise ValueError("local identity is not a workspace member")
-    item = request(workspace, public, verb, exp, ts, owner)
-    sig = signature.signature(secret, public, item, ts)
-    deps = {item.fid: [sig.fid, member], sig.fid: []}
-    return node.sender(workspace).close([sig, item], deps)
+    owner = binding.owner
+    member = offer_source(node, workspace, "member", owner, owner)
+    linked = None if device == owner else offer_source(
+        node, workspace, "device_key", device, owner)
+    if member is None or device != owner and linked is None:
+        raise ValueError("local identity relationship is incomplete")
+    item = request(
+        workspace, device, owner, verb, exp, removal_path, ts)
+    signed = signature.signature(secret, device, item, ts)
+    deps = [signed.fid, member]
+    if linked is not None:
+        deps.append(linked)
+    return node.sender(workspace).close(
+        [signed, item], {item.fid: deps, signed.fid: []})
 
 
-PROOF_COMMANDS = {
-    purpose: payload
-    for purpose in PURPOSES
-}
-
-
-# QUERIES — none.
+PROOF_COMMANDS = {purpose: payload for purpose in PURPOSES}
