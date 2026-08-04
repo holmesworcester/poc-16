@@ -9,13 +9,22 @@ peers with equal coverage prune in one comparison.
 import hashlib
 from dataclasses import dataclass
 
-from core.limits import PAGE_BATCH
+from core.fact import canon
+from core.limits import (
+    MAX_MERKLE_PAGE_BYTES,
+    MAX_ROOT_BYTES,
+    PAGE_BATCH,
+    decode_json,
+)
 from core.shape import FACT_TS_MAX, FACT_TS_MIN, valid_fid
 
 from .coverage import Coverage, allows
 
 
-_EMPTY = hashlib.sha256(b"peerlog/treap/empty/v1").digest()
+EMPTY = hashlib.sha256(b"peerlog/treap/empty/v1").digest()
+NODE_FORMAT = "peerlog-treap-node-v1"
+EXACT_FORMAT = "peerlog-treap-exact-v1"
+ROOT_FORMAT = "peerlog-treap-root-v1"
 
 
 def _valid_ts(value):
@@ -44,16 +53,41 @@ class _Node:
     right: "_Node | None" = None
 
 
-def _root_hash(entries):
-    """Merkle root of the canonical Cartesian treap for sorted entries.
+@dataclass(frozen=True)
+class Snapshot:
+    """One immutable page set plus the current-root document that names it."""
+
+    root: bytes
+    objects: tuple[tuple[bytes, bytes], ...]
+
+
+@dataclass(frozen=True)
+class Root:
+    coverage: Coverage
+    covered: tuple[tuple[int, int, bytes], ...]
+    islands: tuple[bytes, ...]
+
+
+def _node_bytes(node, left, right):
+    return canon([
+        NODE_FORMAT,
+        node.ts,
+        node.fact_id.decode("ascii"),
+        left.hex(),
+        right.hex(),
+    ])
+
+
+def _page_tree(entries):
+    """Return (root, immutable pages) for one sorted entry interval.
 
     This is the reusable core of the pre-forest treap: content-derived
     priority makes the shape independent of insertion order. Rebuilding this
-    small in-memory view is intentional for the first phase; stable page
-    persistence can use the same node hash without changing the fingerprint.
+    in-memory view does not rewrite stable pages: every node's canonical bytes
+    are addressed by their own digest, so unchanged subtrees retain identity.
     """
     if not entries:
-        return _EMPTY
+        return EMPTY, {}
     stack = []
     for ts, fact_id in entries:
         encoded = _entry_bytes(ts, fact_id)
@@ -73,6 +107,7 @@ def _root_hash(entries):
     root = stack[0]
 
     hashes = {}
+    objects = {}
     todo = [(root, False)]
     while todo:
         node, visited = todo.pop()
@@ -83,15 +118,153 @@ def _root_hash(entries):
             if node.left is not None:
                 todo.append((node.left, False))
             continue
-        left = _EMPTY if node.left is None else hashes[id(node.left)]
-        right = _EMPTY if node.right is None else hashes[id(node.right)]
-        hashes[id(node)] = hashlib.sha256(
-            b"peerlog/treap/node/v1"
-            + _entry_bytes(node.ts, node.fact_id)
-            + left
-            + right
-        ).digest()
-    return hashes[id(root)]
+        left = EMPTY if node.left is None else hashes[id(node.left)]
+        right = EMPTY if node.right is None else hashes[id(node.right)]
+        raw = _node_bytes(node, left, right)
+        if len(raw) > MAX_MERKLE_PAGE_BYTES:
+            raise ValueError("treap node too large")
+        oid = hashlib.sha256(raw).digest()
+        hashes[id(node)] = oid
+        objects[oid] = raw
+    return hashes[id(root)], objects
+
+
+def _root_hash(entries):
+    return _page_tree(entries)[0]
+
+
+def _exact_bytes(entries):
+    raw = canon([
+        EXACT_FORMAT,
+        [[ts, fact_id.decode("ascii")] for ts, fact_id in entries],
+    ])
+    if len(raw) > MAX_MERKLE_PAGE_BYTES:
+        raise ValueError("treap exact page too large")
+    return raw
+
+
+def _in_coverage(coverage, ts):
+    return any(lo <= ts < hi for lo, hi in coverage.ranges)
+
+
+def snapshot(tree, coverage):
+    """Build the stable served view for one ingest snapshot.
+
+    Covered intervals receive independently fingerprintable treap roots.
+    Resident rows outside those claims are paged as exact islands; their
+    absence is never summarized by a fingerprint.
+    """
+    if not isinstance(tree, Treap) or not isinstance(coverage, Coverage):
+        raise ValueError("treap snapshot")
+    objects = {}
+    covered = []
+    for lo, hi in coverage.ranges:
+        oid, pages = _page_tree(tree.members(lo, hi))
+        objects.update(pages)
+        covered.append([lo, hi, oid.hex()])
+
+    island_rows = tuple(
+        row for row in tree.entries()
+        if not _in_coverage(coverage, row[0])
+    )
+    islands = []
+    for offset in range(0, len(island_rows), PAGE_BATCH):
+        raw = _exact_bytes(island_rows[offset:offset + PAGE_BATCH])
+        oid = hashlib.sha256(raw).digest()
+        objects[oid] = raw
+        islands.append(oid.hex())
+    root = canon({
+        "covered": covered,
+        "format": ROOT_FORMAT,
+        "islands": islands,
+    })
+    if len(root) > MAX_ROOT_BYTES:
+        raise ValueError("treap root too large")
+    return Snapshot(root, tuple(sorted(objects.items())))
+
+
+def decode_root(raw):
+    value = decode_json(raw, MAX_ROOT_BYTES, "treap root")
+    if not isinstance(value, dict) or set(value) != {
+            "covered", "format", "islands"} \
+            or value.get("format") != ROOT_FORMAT or canon(value) != raw \
+            or not isinstance(value.get("covered"), list) \
+            or not isinstance(value.get("islands"), list):
+        raise ValueError("treap root")
+    ranges = []
+    covered = []
+    for item in value["covered"]:
+        if not isinstance(item, list) or len(item) != 3:
+            raise ValueError("treap root")
+        lo, hi, encoded = item
+        oid = _decode_oid(encoded)
+        ranges.append((lo, hi))
+        covered.append((lo, hi, oid))
+    coverage = Coverage(tuple(ranges))
+    islands = tuple(_decode_oid(item) for item in value["islands"])
+    if len(set(islands)) != len(islands):
+        raise ValueError("treap root")
+    return Root(coverage, tuple(covered), islands)
+
+
+def decode_node(raw, oid):
+    _verify_object(raw, oid, "treap node")
+    value = decode_json(raw, MAX_MERKLE_PAGE_BYTES, "treap node")
+    if not isinstance(value, list) or len(value) != 5 \
+            or value[0] != NODE_FORMAT or canon(value) != raw \
+            or not _valid_ts(value[1]):
+        raise ValueError("treap node")
+    try:
+        fact_id = value[2].encode("ascii")
+    except (AttributeError, UnicodeError):
+        raise ValueError("treap node") from None
+    if not _valid_fid_bytes(fact_id):
+        raise ValueError("treap node")
+    return value[1], fact_id, _decode_oid(value[3]), _decode_oid(value[4])
+
+
+def decode_exact(raw, oid):
+    _verify_object(raw, oid, "treap exact page")
+    value = decode_json(raw, MAX_MERKLE_PAGE_BYTES, "treap exact page")
+    if not isinstance(value, list) or len(value) != 2 \
+            or value[0] != EXACT_FORMAT or canon(value) != raw \
+            or not isinstance(value[1], list) \
+            or len(value[1]) > PAGE_BATCH:
+        raise ValueError("treap exact page")
+    rows = []
+    for item in value[1]:
+        if not isinstance(item, list) or len(item) != 2 \
+                or not _valid_ts(item[0]):
+            raise ValueError("treap exact page")
+        try:
+            fact_id = item[1].encode("ascii")
+        except (AttributeError, UnicodeError):
+            raise ValueError("treap exact page") from None
+        if not _valid_fid_bytes(fact_id):
+            raise ValueError("treap exact page")
+        rows.append((item[0], fact_id))
+    rows = tuple(rows)
+    if not rows or tuple(sorted(set(rows))) != rows:
+        raise ValueError("treap exact page")
+    return rows
+
+
+def _decode_oid(value):
+    if not isinstance(value, str) or len(value) != 64:
+        raise ValueError("treap object id")
+    try:
+        oid = bytes.fromhex(value)
+    except ValueError:
+        raise ValueError("treap object id") from None
+    if value != oid.hex():
+        raise ValueError("treap object id")
+    return oid
+
+
+def _verify_object(raw, oid, label):
+    if not isinstance(raw, bytes) or not isinstance(oid, bytes) \
+            or len(oid) != 32 or hashlib.sha256(raw).digest() != oid:
+        raise ValueError(f"{label} integrity")
 
 
 class Treap:
@@ -144,6 +317,10 @@ class Treap:
             for fact_id, ts in self._by_fid.items()
             if lo <= ts < hi
         ))
+
+    def entries(self) -> tuple[tuple[int, bytes], ...]:
+        """The exact resident set, in reconciliation-key order."""
+        return tuple(sorted((ts, fact_id) for fact_id, ts in self._by_fid.items()))
 
     def __len__(self):
         return len(self._by_fid)

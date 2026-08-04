@@ -7,13 +7,61 @@ bypass, no store fakes that serialize.
 """
 import hashlib
 import random
+import threading
 
 import pytest
 
 from peerlog.coverage import Coverage, intersect
-from peerlog.treap import Treap
+from peerlog.treap import Treap, decode_root, snapshot
+from peerlog.walk import (
+    OBJECT_PREFIX,
+    ROOT_KEY,
+    diff,
+    diff_entries,
+    publish,
+)
 
 skeleton = pytest.mark.skip(reason="phase-1 skeleton: contract named, body unwritten")
+
+
+class EndpointStore:
+    """A responder-shaped GET/PUT endpoint with immutable object semantics."""
+
+    def __init__(self):
+        self.values = {}
+        self.get_calls = []
+        self.put_calls = []
+        self.lock = threading.Lock()
+
+    def get(self, key, rng=None):
+        assert rng is None
+        with self.lock:
+            self.get_calls.append(key)
+            return self.values.get(key)
+
+    def put(self, key, val):
+        assert isinstance(val, bytes)
+        with self.lock:
+            if key.startswith(OBJECT_PREFIX):
+                assert key.removeprefix(OBJECT_PREFIX) == hashlib.sha256(val).hexdigest()
+                incumbent = self.values.setdefault(key, val)
+                if incumbent != val:
+                    raise ValueError("immutable collision")
+            else:
+                assert key == ROOT_KEY
+                self.values[key] = val
+            self.put_calls.append(key)
+
+
+def _fid(label):
+    return hashlib.sha256(label.encode()).hexdigest().encode()
+
+
+def _tree(rows):
+    tree = Treap()
+    for ts, label in rows:
+        tree.insert(ts, _fid(label))
+    return tree
 
 
 @skeleton
@@ -25,7 +73,20 @@ def test_two_partial_peers_converge_to_coverage_union():
 @skeleton
 def test_identical_sets_cost_one_conditional_get():
     """Equal coverage and equal sets: one conditional root GET, zero
-    ranges recursed, zero bytes transferred."""
+    ranges recursed, zero bytes transferred. The conditional cache token
+    belongs to the session wrapper, which is not implemented yet."""
+
+
+def test_identical_sets_cost_one_root_get_and_no_page_reads():
+    """The live core already provides the prune behind conditional GET."""
+    rows = tuple((ts, f"same:{ts}") for ts in range(1, 500))
+    coverage = Coverage(((0, 1_000),))
+    remote = EndpointStore()
+    publish(_tree(reversed(rows)), coverage, remote)
+    remote.get_calls.clear()
+
+    assert diff(_tree(rows), coverage, remote) == ()
+    assert remote.get_calls == [ROOT_KEY]
 
 
 @skeleton
@@ -134,6 +195,116 @@ def test_coverage_and_treap_reject_ambiguous_protocol_shapes():
     points = tree.split_points(0, 40, 4)
     assert points == tuple(sorted(set(points)))
     assert len(points) == 3
+
+
+def test_stable_self_addressed_pages_survive_arrival_order_and_append():
+    """A rebuild reuses every subtree untouched by a new Cartesian path."""
+    rows = tuple((ts, f"page:{ts}") for ts in range(1, 300))
+    coverage = Coverage(((0, 1_000),))
+    ordered = _tree(rows)
+    shuffled_rows = list(rows)
+    random.Random(89).shuffle(shuffled_rows)
+    shuffled = _tree(shuffled_rows)
+
+    first = snapshot(ordered, coverage)
+    same = snapshot(shuffled, coverage)
+    assert same == first
+    assert all(
+        hashlib.sha256(raw).digest() == oid
+        for oid, raw in first.objects
+    )
+
+    ordered.insert(350, _fid("page:350"))
+    changed = snapshot(ordered, coverage)
+    old_oids = {oid for oid, _ in first.objects}
+    new_oids = {oid for oid, _ in changed.objects}
+    assert len(old_oids & new_oids) > 250
+    assert changed.root != first.root
+
+
+def test_driver_walk_learns_both_sides_and_exact_partial_islands():
+    """Only the driver walks; remote pages reveal pull and push candidates."""
+    remote_tree = _tree((
+        (2, "common:2"),
+        (4, "common:4"),
+        (14, "remote:island"),
+        (22, "common:22"),
+        (24, "remote:covered"),
+    ))
+    local_tree = _tree((
+        (2, "common:2"),
+        (4, "common:4"),
+        (16, "local:island"),
+        (22, "common:22"),
+        (26, "local:covered"),
+    ))
+    remote_coverage = Coverage(((0, 10), (20, 30)))
+    local_coverage = Coverage(((0, 8), (12, 18), (20, 30)))
+    remote = EndpointStore()
+    publish(remote_tree, remote_coverage, remote)
+    remote.get_calls.clear()
+
+    result = diff_entries(local_tree, local_coverage, remote)
+    assert result.remote_only == (
+        (14, _fid("remote:island")),
+        (24, _fid("remote:covered")),
+    )
+    assert result.local_only == (
+        (16, _fid("local:island")),
+        (26, _fid("local:covered")),
+    )
+    assert result.gets == len(remote.get_calls)
+    assert remote.get_calls[0] == ROOT_KEY
+    assert all(
+        key == ROOT_KEY or key.startswith(OBJECT_PREFIX)
+        for key in remote.get_calls
+    )
+
+
+def test_one_sided_walk_matches_naive_symmetric_difference():
+    """Random arrival and coverage shapes cannot hide either side's news."""
+    coverage_shapes = (
+        Coverage(((0, 200),)),
+        Coverage(((0, 50), (100, 150))),
+        Coverage(((25, 75), (125, 175))),
+        Coverage(()),
+    )
+    universe = tuple((ts, f"random:{ts}") for ts in range(1, 180))
+    for seed in range(20):
+        rng = random.Random(seed)
+        remote_rows = [row for row in universe if rng.random() < 0.72]
+        local_rows = [row for row in universe if rng.random() < 0.68]
+        rng.shuffle(remote_rows)
+        rng.shuffle(local_rows)
+        remote = EndpointStore()
+        publish(
+            _tree(remote_rows),
+            coverage_shapes[seed % len(coverage_shapes)],
+            remote,
+        )
+        result = diff_entries(
+            _tree(local_rows),
+            coverage_shapes[(seed + 1) % len(coverage_shapes)],
+            remote,
+        )
+        remote_set = {(ts, _fid(label)) for ts, label in remote_rows}
+        local_set = {(ts, _fid(label)) for ts, label in local_rows}
+        assert set(result.remote_only) == remote_set - local_set
+        assert set(result.local_only) == local_set - remote_set
+
+
+def test_publish_orders_objects_before_root_and_walk_rejects_tampering():
+    coverage = Coverage(((0, 100),))
+    remote = EndpointStore()
+    publish(_tree(((10, "remote"),)), coverage, remote)
+    assert remote.put_calls[-1] == ROOT_KEY
+    assert all(key.startswith(OBJECT_PREFIX) for key in remote.put_calls[:-1])
+
+    served = decode_root(remote.values[ROOT_KEY])
+    page_key = OBJECT_PREFIX + served.covered[0][2].hex()
+    remote.values[page_key] += b" "
+    with pytest.raises(ValueError, match="integrity"):
+        diff_entries(Treap(), coverage, remote)
 
 
 @skeleton
