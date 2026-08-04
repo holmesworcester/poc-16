@@ -69,20 +69,13 @@ def sync(node, workspace, url):
             node.store(workspace),
             remote,
             make_proof,
+            peer.issue_head_permit,
+            peer.commit_head_permit,
             peer.advance_head,
         )
         published = _run(publisher.publish())
         if published.status == "retryable":
             raise ValueError("concurrent owner-head publication")
-        control = () if published.head is None else node.control_leaves(
-            workspace,
-            device,
-            published.head,
-            published.piles,
-        )
-        for sequence in control:
-            if peer.advance_removal(device, sequence) == "retryable":
-                raise ValueError("concurrent recipient removal advancement")
         pushed_count = published.piles
 
     node._ensure_projection(workspace)

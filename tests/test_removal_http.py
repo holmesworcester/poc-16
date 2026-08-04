@@ -5,10 +5,14 @@ import base64
 import json
 
 from core.access import AccessGate
-from core import peer_capability
 from core.crypto import h
-from core.grants import make_token
-from core.http import AsyncFromSyncReader, HttpGate
+from core.http import (
+    MAX_HEAD_CONTROL_REQUEST_BYTES,
+    AsyncFromSyncReader,
+    HttpGate,
+    encode_head_commit_request,
+    encode_head_permit_request,
+)
 from core.limits import MAX_CONTROL_PILE_BYTES
 from core.store import FsStore
 from core.suppression import scoped_id, suppression_slot
@@ -39,6 +43,13 @@ def envelope(workspace, pile):
 
 def gateway(root, store):
     access = AccessGate(root.fid, store)
+    head_gate = OpaqueHeadGate(store, access.authorize_head)
+
+    async def commit_permit(permit, proposed, controls, secret):
+        grant = await access.authorize_permitted_head(
+            permit, proposed, controls, secret)
+        return await head_gate.advance_grant(grant, proposed)
+
     return access, HttpGate(
         AsyncFromSyncReader(store),
         root.fid,
@@ -47,9 +58,9 @@ def gateway(root, store):
         path_authorize=access.removal_path,
         mint_authorize=access.authorize_access,
         removal_bootstrap=access.state.bootstrap,
-        removal_apply=access.state.apply_control,
-        head_advance=OpaqueHeadGate(
-            store, access.authorize_head).advance,
+        head_advance=head_gate.advance,
+        head_permit_issue=access.issue_head_permit,
+        head_permit_commit=commit_permit,
     )
 
 
@@ -160,7 +171,7 @@ def test_bootstrap_rejects_content_and_bounds_before_provider_work(tmp_path):
     assert store.list("") == []
 
 
-def test_authenticated_exact_control_apply_precedes_head_publication(tmp_path):
+def test_exact_control_permit_commits_removal_before_head(tmp_path):
     root, secret, member, membership = world()
     store = FsStore(str(tmp_path / "repository"))
     access, http = gateway(root, store)
@@ -171,37 +182,36 @@ def test_authenticated_exact_control_apply_precedes_head_publication(tmp_path):
     control = signed(
         secret, member, root,
         (*membership, primary_signature, primary))
-    token = make_token(
-        b"removal-http-secret" * 2,
-        member,
-        root.fid,
-        capability=peer_capability.OWNER,
-        issued_at=0,
-        ttl_ms=1_000,
-    )
-    headers = {"Authorization": "Bearer " + token}
+    path = run(access.removal_path(
+        path_proof(secret, member, root, membership), 10))
+    proposed = h(b"control-bearing writer head")
+    store.put_if_absent("obj/" + proposed, b"control-bearing writer head")
+    proof = head_proof(
+        secret, member, root, membership, path, proposed)
+    permit_route = f"/head/{proposed}/permit"
+    commit_route = f"/head/{proposed}/commit"
+    before = run(access.state.pin()).root_oid
 
+    issued = run(http.handle(
+        "POST", permit_route, {"ws": root.fid}, {},
+        encode_head_permit_request(proof, (control,))))
+    assert issued.status == 200
+    assert run(access.state.pin()).root_oid == before
+    assert run(http.handle(
+        "POST", commit_route, {"ws": root.fid}, {},
+        encode_head_commit_request(issued.body, (control,)))).status == 201
+    assert run(access.state.pin()).root_oid != before
+    assert run(http.handle(
+        "POST", commit_route, {"ws": root.fid}, {},
+        encode_head_commit_request(issued.body, (control,)))).status == 204
+
+    assert HttpGate.request_limit("POST", "/removal/apply") == 0
     assert run(http.handle(
         "POST", "/removal/apply", {"ws": root.fid}, {},
         control)).status == 401
-    read_only = make_token(
-        b"removal-http-secret" * 2,
-        member,
-        root.fid,
-        capability=peer_capability.READ_ONLY,
-        issued_at=0,
-        ttl_ms=1_000,
-    )
     assert run(http.handle(
-        "POST", "/removal/apply", {"ws": root.fid},
-        {"Authorization": "Bearer " + read_only},
-        control)).status == 401
+        "POST", permit_route, {"ws": root.fid}, {}, b"malformed"
+    )).status == 403
     assert run(http.handle(
-        "POST", "/removal/apply", {"ws": root.fid}, headers,
-        control)).status == 201
-    assert run(http.handle(
-        "POST", "/removal/apply", {"ws": root.fid}, headers,
-        control)).status == 204
-    assert run(http.handle(
-        "POST", "/removal/apply", {"ws": root.fid}, headers,
-        b"x" * (MAX_CONTROL_PILE_BYTES + 1))).status == 413
+        "POST", permit_route, {"ws": root.fid}, {},
+        b"x" * (MAX_HEAD_CONTROL_REQUEST_BYTES + 1))).status == 413

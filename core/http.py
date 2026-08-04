@@ -12,11 +12,15 @@ import json
 import re
 
 from . import peer_capability
+from .access import ControlHeadRetry
 from .crypto import h, seal_to
 from .grants import check_token, make_token
 from .limits import (
     MAX_INVITE_BYTES,
     MAX_CONTROL_PILE_BYTES,
+    MAX_HEAD_CONTROL_BYTES,
+    MAX_HEAD_CONTROL_PILES,
+    MAX_HEAD_PERMIT_BYTES,
     MAX_MINT_FETCHES,
     MAX_MINT_FETCH_BYTES,
     MAX_MINT_REQUEST_BYTES,
@@ -56,6 +60,87 @@ from .writer_head import (
 OID_RE = re.compile(r"^[0-9a-f]{64}$")
 INVITE_RE = re.compile(
     rf"^[a-z0-9._-]{{1,{MAX_INVITE_ID_BYTES}}}$")
+HEAD_CONTROL_FRAME_MAGIC = b"poc16-head-control-v1\0"
+HEAD_CONTROL_FRAME_WORD_BYTES = 4
+MAX_HEAD_CONTROL_REQUEST_BYTES = (
+    len(HEAD_CONTROL_FRAME_MAGIC)
+    + (2 + MAX_HEAD_CONTROL_PILES) * HEAD_CONTROL_FRAME_WORD_BYTES
+    + MAX_MINT_REQUEST_BYTES
+    + MAX_HEAD_CONTROL_BYTES
+)
+
+
+def _frame_word(value):
+    if type(value) is not int or not 0 <= value < 1 << (
+            8 * HEAD_CONTROL_FRAME_WORD_BYTES):
+        raise ValueError("control-head frame length")
+    return value.to_bytes(HEAD_CONTROL_FRAME_WORD_BYTES, "big")
+
+
+def _encode_head_control(primary, control_piles, primary_limit):
+    """Encode one exact proof/permit plus an ordered raw control tuple."""
+    try:
+        piles = tuple(control_piles)
+    except TypeError as error:
+        raise ValueError("control-head piles") from error
+    if not isinstance(primary, bytes) or not 0 < len(primary) <= primary_limit \
+            or not 0 < len(piles) <= MAX_HEAD_CONTROL_PILES \
+            or any(not isinstance(raw, bytes) or not raw for raw in piles) \
+            or sum(map(len, piles)) > MAX_HEAD_CONTROL_BYTES:
+        raise ValueError("control-head frame")
+    return b"".join((
+        HEAD_CONTROL_FRAME_MAGIC,
+        _frame_word(len(primary)),
+        _frame_word(len(piles)),
+        *map(lambda raw: _frame_word(len(raw)), piles),
+        primary,
+        *piles,
+    ))
+
+
+def _decode_head_control(raw, primary_limit):
+    """Decode a bounded canonical frame without base64 expansion."""
+    if not isinstance(raw, bytes) \
+            or len(raw) > MAX_HEAD_CONTROL_REQUEST_BYTES \
+            or not raw.startswith(HEAD_CONTROL_FRAME_MAGIC):
+        raise ValueError("control-head frame")
+    offset = len(HEAD_CONTROL_FRAME_MAGIC)
+
+    def word():
+        nonlocal offset
+        end = offset + HEAD_CONTROL_FRAME_WORD_BYTES
+        if end > len(raw):
+            raise ValueError("control-head frame")
+        value = int.from_bytes(raw[offset:end], "big")
+        offset = end
+        return value
+
+    primary_bytes, count = word(), word()
+    if not 0 < primary_bytes <= primary_limit \
+            or not 0 < count <= MAX_HEAD_CONTROL_PILES:
+        raise ValueError("control-head frame")
+    lengths = tuple(word() for _ in range(count))
+    if any(length <= 0 for length in lengths) \
+            or sum(lengths) > MAX_HEAD_CONTROL_BYTES \
+            or offset + primary_bytes + sum(lengths) != len(raw):
+        raise ValueError("control-head frame")
+    primary = raw[offset:offset + primary_bytes]
+    offset += primary_bytes
+    piles = []
+    for length in lengths:
+        piles.append(raw[offset:offset + length])
+        offset += length
+    return primary, tuple(piles)
+
+
+def encode_head_permit_request(proof, control_piles):
+    return _encode_head_control(
+        proof, control_piles, MAX_MINT_REQUEST_BYTES)
+
+
+def encode_head_commit_request(permit, control_piles):
+    return _encode_head_control(
+        permit, control_piles, MAX_HEAD_PERMIT_BYTES)
 
 
 @dataclass(frozen=True)
@@ -119,10 +204,11 @@ class HttpGate:
             *, sync_profile=peer_capability.READ_ONLY,
             mirror=None,
             head_advance=None,
+            head_permit_issue=None,
+            head_permit_commit=None,
             mint_authorize=None,
             path_authorize=None,
             removal_bootstrap=None,
-            removal_apply=None,
             object_open=None,
             pack_open=None,
             max_request_bytes=MAX_MINT_REQUEST_BYTES,
@@ -146,18 +232,20 @@ class HttpGate:
         self.head_advance = head_advance
         self.mint_authorize = mint_authorize
         callbacks = (
+            ("head permit issuer", head_permit_issue),
+            ("head permit committer", head_permit_commit),
             ("path authorizer", path_authorize),
             ("removal bootstrap", removal_bootstrap),
-            ("removal control applier", removal_apply),
         )
         if any(value is not None and not callable(value)
                for _label, value in callbacks):
             raise ValueError(next(
                 label for label, value in callbacks
                 if value is not None and not callable(value)))
+        self.head_permit_issue = head_permit_issue
+        self.head_permit_commit = head_permit_commit
         self.path_authorize = path_authorize
         self.removal_bootstrap = removal_bootstrap
-        self.removal_apply = removal_apply
         if object_open is not None and not callable(object_open):
             raise ValueError("object OPEN issuer")
         if pack_open is not None and not callable(pack_open):
@@ -337,26 +425,6 @@ class HttpGate:
             return Response(403)
         return self._removal_result(result)
 
-    async def _apply_removal(self, body, writer):
-        """Evaluate one exact authenticated control pile, then discard it."""
-        if self.removal_apply is None:
-            return Response(405)
-        if not isinstance(body, bytes) or len(body) > MAX_CONTROL_PILE_BYTES:
-            return Response(413)
-        try:
-            if inspect.iscoroutinefunction(self.removal_apply):
-                result = await self.removal_apply(body, writer=writer)
-            else:
-                result = await _to_thread(
-                    self.removal_apply, body, writer=writer)
-                if inspect.isawaitable(result):
-                    result = await result
-        except (PayloadTooLarge, StoreError):
-            return Response(503)
-        except Exception:
-            return Response(403)
-        return self._removal_result(result)
-
     @staticmethod
     def _removal_result(result):
         status = getattr(result, "status", None)
@@ -368,6 +436,92 @@ class HttpGate:
             return Response(409)
         if status == "rejected":
             return Response(403)
+        return Response(503)
+
+    async def _issue_head_permit(
+            self, proposed_head, body, trusted_now):
+        """Preauthorize one exact control-bearing head while still current."""
+        if self.head_permit_issue is None:
+            return Response(405)
+        if not isinstance(body, bytes) \
+                or len(body) > MAX_HEAD_CONTROL_REQUEST_BYTES:
+            return Response(413)
+        if not OID_RE.fullmatch(proposed_head):
+            return Response(400)
+        try:
+            proof, controls = _decode_head_control(
+                body, MAX_MINT_REQUEST_BYTES)
+            if inspect.iscoroutinefunction(self.head_permit_issue):
+                permit = await self.head_permit_issue(
+                    proof, proposed_head, controls,
+                    trusted_now, self.secret)
+            else:
+                permit = await _to_thread(
+                    self.head_permit_issue,
+                    proof, proposed_head, controls,
+                    trusted_now, self.secret,
+                )
+                if inspect.isawaitable(permit):
+                    permit = await permit
+        except ProofRefreshRequired:
+            return self._json(409, {"error": "proof_refresh_required"})
+        except RemovalDenied:
+            return Response(403)
+        except (PayloadTooLarge, StoreError):
+            return Response(503)
+        except ValueError:
+            return Response(403)
+        except Exception:
+            return Response(503)
+        if not isinstance(permit, bytes) \
+                or not 0 < len(permit) <= MAX_HEAD_PERMIT_BYTES:
+            return Response(403 if permit is None else 503)
+        return Response(200, permit, {
+            "Cache-Control": "no-store",
+            "Content-Type": "application/octet-stream",
+        })
+
+    async def _commit_head_permit(self, proposed_head, body):
+        """Join exact permitted controls, then CAS only their bound head."""
+        if self.head_permit_commit is None:
+            return Response(405)
+        if not isinstance(body, bytes) \
+                or len(body) > MAX_HEAD_CONTROL_REQUEST_BYTES:
+            return Response(413)
+        if not OID_RE.fullmatch(proposed_head):
+            return Response(400)
+        try:
+            permit, controls = _decode_head_control(
+                body, MAX_HEAD_PERMIT_BYTES)
+            if inspect.iscoroutinefunction(self.head_permit_commit):
+                result = await self.head_permit_commit(
+                    permit, proposed_head, controls, self.secret)
+            else:
+                result = await _to_thread(
+                    self.head_permit_commit,
+                    permit, proposed_head, controls, self.secret,
+                )
+                if inspect.isawaitable(result):
+                    result = await result
+        except ControlHeadRetry:
+            return Response(409)
+        except (PayloadTooLarge, StoreError):
+            return Response(503)
+        except ValueError:
+            return Response(403)
+        except Exception:
+            return Response(503)
+        return self._head_result(result)
+
+    @staticmethod
+    def _head_result(result):
+        status = getattr(result, "status", None)
+        if status == "applied":
+            return Response(201)
+        if status == "noop":
+            return Response(204)
+        if status == "retryable":
+            return Response(409)
         return Response(503)
 
     async def _advance_head(self, proposed_head, body, trusted_now):
@@ -397,14 +551,7 @@ class HttpGate:
             return Response(403)
         except Exception:
             return Response(503)
-        status = getattr(result, "status", None)
-        if status == "applied":
-            return Response(201)
-        if status == "noop":
-            return Response(204)
-        if status == "retryable":
-            return Response(409)
-        return Response(503)
+        return self._head_result(result)
 
     @staticmethod
     def _decode_batch(body):
@@ -684,9 +831,10 @@ class HttpGate:
             return MAX_MINT_REQUEST_BYTES
         if method == "POST" and path == "/removal/bootstrap":
             return MAX_CONTROL_PILE_BYTES
-        if method == "POST" and path == "/removal/apply":
-            return MAX_CONTROL_PILE_BYTES
         if method == "POST" and path.startswith("/head/"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 3 and parts[2] in {"permit", "commit"}:
+                return MAX_HEAD_CONTROL_REQUEST_BYTES
             return MAX_MINT_REQUEST_BYTES
         if method == "POST" and path == "/obj":
             return MAX_PAGE_REQUEST_BYTES
@@ -722,8 +870,16 @@ class HttpGate:
         if path == "/removal/bootstrap" and method == "POST":
             return await self._bootstrap_removal(body)
         if path.startswith("/head/") and method == "POST":
-            return await self._advance_head(
-                path.removeprefix("/head/"), body, trusted_now)
+            parts = path.strip("/").split("/")
+            if len(parts) == 3 and parts[2] == "permit":
+                return await self._issue_head_permit(
+                    parts[1], body, trusted_now)
+            if len(parts) == 3 and parts[2] == "commit":
+                return await self._commit_head_permit(parts[1], body)
+            if len(parts) == 2:
+                return await self._advance_head(
+                    parts[1], body, trusted_now)
+            return Response(404)
         if path.startswith("/invite/") and method == "GET":
             invite = path.removeprefix("/invite/")
             if not INVITE_RE.fullmatch(invite):
@@ -752,12 +908,6 @@ class HttpGate:
             return await self._open_object(body, headers, trusted_now)
         if path.startswith("/ctl"):
             return Response(405)
-        if path == "/removal/apply" and method == "POST":
-            writer = self._member(
-                headers, trusted_now, require_object_put=True)
-            if writer is None:
-                return Response(401)
-            return await self._apply_removal(body, writer)
         if method == "PUT" and path.startswith("/mirror/"):
             if not self._member(
                     headers, trusted_now, require_push=True):

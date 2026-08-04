@@ -41,6 +41,9 @@ from full_peer.walk import Peer
 from tests.util import add_member
 
 
+_HOSTED_PERMIT_SECRET = b"hosted owner permit contract secret" * 2
+
+
 def _run(awaitable):
     return asyncio.run(awaitable)
 
@@ -157,12 +160,12 @@ def _canonical_store(peer, workspace):
 class _HostedEndpoint:
     """In-process hosted peer implementing the exact RemoteStore surface."""
 
-    def __init__(self, node, workspace, url, store, access, advances):
+    def __init__(self, node, workspace, url, store, access, events):
         self.node = node
         self.ws = workspace
         self.store = store
         self.access = access
-        self.advances = advances
+        self.events = events
         self._opened = None
         self._observed = {}
         self._complete = False
@@ -234,14 +237,37 @@ class _HostedEndpoint:
             proof, int(time.time() * 1000)))
 
     async def advance_head(self, proof, proposed):
+        self.events.append((
+            "head", self.node.identity_id(self.ws), proposed))
         result = await OpaqueHeadGate(
             self.store, self.access.authorize_head).advance(
                 proof, proposed, int(time.time() * 1000))
         return result.status
 
-    def advance_removal(self, device, sequence):
-        self.advances.append((device, sequence))
-        return _run(self.access.state.advance_leaf(device, sequence)).status
+    async def issue_head_permit(self, proof, proposed, control_piles):
+        permit = await self.access.issue_head_permit(
+            proof,
+            proposed,
+            control_piles,
+            int(time.time() * 1000),
+            _HOSTED_PERMIT_SECRET,
+        )
+        self.events.append((
+            "permit", self.node.identity_id(self.ws), proposed))
+        return permit
+
+    async def commit_head_permit(self, permit, proposed, control_piles):
+        grant = await self.access.authorize_permitted_head(
+            permit, proposed, control_piles, _HOSTED_PERMIT_SECRET)
+        writer = self.node.identity_id(self.ws)
+        self.events.extend(
+            ("control", writer, h(raw), "applied")
+            for raw in control_piles)
+        self.events.append(("head", writer, proposed))
+        result = await OpaqueHeadGate(
+            self.store, self.access.authorize_head).advance_grant(
+                grant, proposed)
+        return result.status
 
 
 def test_full_peer_http_exposes_writer_directory_and_exact_transfer(tmp_path):
@@ -588,6 +614,41 @@ def test_read_only_peer_pulls_writer_forest_without_any_reverse_put(
     assert not hasattr(bob, "sync_cache")
 
 
+def test_hosted_owner_http_uses_exact_permit_only_for_control_head(
+        tmp_path, monkeypatch):
+    workspace, alice, _bob, carol = _forest_fixture(tmp_path)
+    requests = []
+
+    class CountingPeer(Peer):
+        def _http(self, method, path, *args, **kwargs):
+            requests.append((method, path))
+            return super()._http(method, path, *args, **kwargs)
+
+    monkeypatch.setattr(sync_module, "Peer", CountingPeer)
+    with _serve(
+            carol, sync_profile=peer_capability.OWNER) as (url, _secret):
+        sync_module.sync(alice, workspace, url)
+        proposed = decode_slot_at(
+            head_slot_key(workspace, alice.identity_id(workspace)),
+            alice.store(workspace).get(head_slot_key(
+                workspace, alice.identity_id(workspace))),
+        ).head
+        assert ("POST", f"/head/{proposed}/permit") in requests
+        assert ("POST", f"/head/{proposed}/commit") in requests
+        assert not [path for _method, path in requests
+                    if path == "/removal/apply"]
+
+        requests.clear()
+        facts.content.message.post(
+            alice, workspace, "general", "hosted over HTTP", ts=50)
+        sync_module.sync(alice, workspace, url)
+
+    assert not [path for _method, path in requests
+                if path.endswith(("/permit", "/commit"))]
+    assert any(method == "POST" and path.startswith("/head/")
+               for method, path in requests)
+
+
 def test_each_sync_turn_mints_fresh_and_never_publishes_authority(
         tmp_path, monkeypatch):
     workspace, alice, bob, _carol = _forest_fixture(tmp_path)
@@ -612,9 +673,10 @@ def test_missing_remote_state_attempts_one_original_bootstrap_without_cache(
         tmp_path):
     workspace, _alice, bob, _carol = _forest_fixture(tmp_path)
     calls = []
+    expected_bootstrap = bob.removal_bootstrap_pile(workspace)
 
-    def reject(method, path, *_args, **_kwargs):
-        calls.append((method, path))
+    def reject(method, path, data=None, *_args, **_kwargs):
+        calls.append((method, path, data))
         raise urllib.error.HTTPError(
             "http://lost/mint", 403, "unknown member", {}, None)
 
@@ -624,13 +686,72 @@ def test_missing_remote_state_attempts_one_original_bootstrap_without_cache(
         peer.mint()
 
     assert denied.value.code == 403
-    assert calls == [
+    assert [(method, path) for method, path, _body in calls] == [
         ("POST", "/removal/path"),
         ("POST", "/removal/bootstrap"),
     ]
+    assert calls[1][2] == expected_bootstrap
     assert peer._token is peer._sync_profile is None
     assert not hasattr(peer, "authority_recover")
     assert not hasattr(peer, "publish_authority")
+
+
+def test_local_publish_applies_exact_control_before_head_and_skips_content(
+        tmp_path, monkeypatch):
+    workspace, alice, _bob, carol = _forest_fixture(tmp_path)
+    access = alice.access_gate(workspace)
+    original_issue = access.issue_head_permit
+    original_authorize = access.authorize_permitted_head
+    original_head_gate = alice.head_gate(workspace)
+    events = []
+
+    async def issue_permit(
+            proof, proposed, controls, trusted_now, secret):
+        permit = await original_issue(
+            proof, proposed, controls, trusted_now, secret)
+        events.append(("permit", alice.identity_id(workspace), proposed))
+        return permit
+
+    async def authorize_permit(permit, proposed, controls, secret):
+        grant = await original_authorize(
+            permit, proposed, controls, secret)
+        events.extend(
+            ("control", alice.identity_id(workspace), raw)
+            for raw in controls)
+        return grant
+
+    class RecordingHeadGate:
+        async def advance(self, proof, proposed, trusted_now):
+            events.append(("head", alice.identity_id(workspace), proposed))
+            return await original_head_gate.advance(
+                proof, proposed, trusted_now)
+
+        async def advance_grant(self, grant, proposed):
+            events.append(("head", alice.identity_id(workspace), proposed))
+            return await original_head_gate.advance_grant(grant, proposed)
+
+    monkeypatch.setattr(access, "issue_head_permit", issue_permit)
+    monkeypatch.setattr(
+        access, "authorize_permitted_head", authorize_permit)
+    monkeypatch.setattr(
+        alice, "head_gate", lambda candidate: RecordingHeadGate())
+
+    facts.auth.removal.evict(alice, workspace, carol.member)
+    assert [event[0] for event in events] == [
+        "permit", "control", "head"]
+
+    device = alice.identity_id(workspace)
+    key = head_slot_key(workspace, device)
+    slot = decode_slot_at(key, alice.store(workspace).get(key))
+    head = decode_head(alice.store(workspace).get("obj/" + slot.head))
+    exact = _run(open_accepted_pile(
+        alice.store(workspace), workspace, device, head.sequence))
+    assert events[1][1:] == (device, exact)
+
+    events.clear()
+    facts.content.message.post(
+        alice, workspace, "general", "local ordinary", ts=50)
+    assert [event[0] for event in events] == ["head"]
 
 
 def test_hosted_mode_pulls_all_writers_but_publishes_only_the_dialer(
@@ -644,7 +765,7 @@ def test_hosted_mode_pulls_all_writers_but_publishes_only_the_dialer(
 
     cloud = FsStore(str(tmp_path / "hosted-cloud"))
     access = AccessGate(workspace, cloud)
-    advances = []
+    events = []
     # Hosted enrollment consumes original signed clear-only control piles,
     # never an aggregate authority snapshot or SQL-derived reclosure.
     for source in (alice, bob):
@@ -661,7 +782,7 @@ def test_hosted_mode_pulls_all_writers_but_publishes_only_the_dialer(
     def endpoint(node, candidate_workspace, candidate_url):
         assert candidate_workspace == workspace and candidate_url == url
         return _HostedEndpoint(
-            node, workspace, url, cloud, access, advances)
+            node, workspace, url, cloud, access, events)
 
     monkeypatch.setattr(sync_module, "Peer", endpoint)
 
@@ -685,18 +806,27 @@ def test_hosted_mode_pulls_all_writers_but_publishes_only_the_dialer(
         head_slot_key(workspace, peer.identity_id(workspace))
         for peer in (alice, bob, carol)
     }
-    assert advances
+
+    # Every recipient-state join is an exact original control pile and occurs
+    # before the corresponding writer head becomes visible.
     for source in (alice, bob, carol):
         device = source.identity_id(workspace)
-        key = head_slot_key(workspace, device)
-        slot = decode_slot_at(key, source.store(workspace).get(key))
-        head = decode_head(source.store(workspace).get("obj/" + slot.head))
-        assert [
-            sequence for writer, sequence in advances
-            if writer == device
-        ] == list(source.control_leaves(
-            workspace,
-            device,
-            slot.head,
-            head.sequence,
-        ))
+        first_head = next(
+            index for index, event in enumerate(events)
+            if event[0] == "head" and event[1] == device)
+        assert any(
+            event[0] == "control" and event[1] == device
+            and event[3] in {"applied", "noop"}
+            for event in events[:first_head]
+        )
+
+    # An ordinary suffix still advances its signed writer head, but is never
+    # offered to the recipient's private removal-state join.
+    control_before = [event for event in events if event[0] == "control"]
+    head_before = sum(event[0] == "head" for event in events)
+    facts.content.message.post(
+        alice, workspace, "general", "hosted ordinary", ts=50)
+    assert sync_module.sync(alice, workspace, url)[1] == 1
+    assert [event for event in events if event[0] == "control"] \
+        == control_before
+    assert sum(event[0] == "head" for event in events) == head_before + 1

@@ -12,10 +12,15 @@ import facts as families
 
 from core import peer_capability
 from core.crypto import h, unseal
+from core.http import (
+    encode_head_commit_request,
+    encode_head_permit_request,
+)
 from core.http_body import read_bounded
 from core.limits import (
     MAX_CONTROL_BYTES,
     MAX_DIRECT_OBJECT_BYTES,
+    MAX_HEAD_PERMIT_BYTES,
     MAX_MINT_REQUEST_BYTES,
     MAX_OBJECT_BYTES,
     MAX_PAGE_BATCH_BYTES,
@@ -257,16 +262,28 @@ class Peer:
         self._token = token
         self._sync_profile = peer_capability.negotiate(token, o)
 
-    def advance_removal(self, device, sequence):
-        """Poke one already accepted control leaf without supplying state."""
-        if not isinstance(device, str) or type(sequence) is not int \
-                or sequence <= 0:
-            raise ValueError("removal leaf")
+    def issue_head_permit(self, proof, proposed_head, control_piles):
+        """Obtain one exact non-expiring permit before control takes effect."""
+        body = encode_head_permit_request(proof, control_piles)
+        status, permit, _ = self._http(
+            "POST",
+            f"/head/{proposed_head}/permit",
+            body,
+            auth=False,
+            response_limit=MAX_HEAD_PERMIT_BYTES,
+        )
+        if status != 200 or not permit:
+            raise ValueError("control-head permit issuance")
+        return permit
+
+    def commit_head_permit(self, permit, proposed_head, control_piles):
+        """Hold and replay one permit until its removal-first CAS completes."""
+        body = encode_head_commit_request(permit, control_piles)
         try:
             status, _, _ = self._http(
                 "POST",
-                f"/removal/advance/{device}/{sequence}",
-                b"",
+                f"/head/{proposed_head}/commit",
+                body,
                 auth=False,
                 response_limit=MAX_CONTROL_BYTES,
             )
@@ -278,7 +295,7 @@ class Peer:
             return "applied"
         if status == 204:
             return "noop"
-        raise ValueError("removal leaf advance")
+        raise ValueError("control-head permit commit")
 
     def advance_head(self, proof, proposed_head):
         """Submit one exact owner proof to the public mechanical CAS route."""
