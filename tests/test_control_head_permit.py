@@ -407,7 +407,7 @@ def test_two_preissued_terminal_heads_share_base_but_only_one_cas_wins(
         second = await head_gate.advance_grant(grants[1])
 
         assert first.status == "applied"
-        assert second.status == "retryable"
+        assert second.status == "conflict"
         slot = decode_slot_at(
             head_slot_key(root.fid, founder),
             store.get(head_slot_key(root.fid, founder)),

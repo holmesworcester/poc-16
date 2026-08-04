@@ -91,6 +91,8 @@ def sync(node, workspace, url):
             retry_pause=_control_head_retry_pause,
         )
         published = _run(publisher.publish())
+        if published.status == "conflict":
+            raise ValueError("owner-head publication requires rebase")
         if published.status == "retryable":
             raise ValueError("concurrent owner-head publication")
         pushed_count = published.piles

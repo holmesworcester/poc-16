@@ -111,6 +111,31 @@ class SlotResult:
     status: str
     slot: HeadSlot
 
+    def __post_init__(self):
+        if self.status not in {"applied", "noop", "retryable", "conflict"} \
+                or not isinstance(self.slot, HeadSlot):
+            raise ValueError("head slot result")
+
+
+def _reconcile_head_cas(opened, grant, proposed, exact_status):
+    """Classify one failed/unknown CAS from an exact register reread."""
+    if exact_status not in {"applied", "noop"}:
+        raise ValueError("head reconciliation status")
+    if opened is ABSENT:
+        status = "retryable" if grant.base_head is None else "conflict"
+        return SlotResult(status, proposed)
+    if not isinstance(opened, Versioned):
+        raise TypeError("writer slot read")
+    current = decode_slot_at(
+        head_slot_key(grant.workspace, grant.device), opened.value)
+    if opened.value == encode_slot(proposed):
+        return SlotResult(exact_status, current)
+    if current.head == grant.head:
+        return SlotResult("noop", current)
+    if current.head == grant.base_head:
+        return SlotResult("retryable", proposed)
+    return SlotResult("conflict", current)
+
 
 @dataclass(frozen=True, slots=True)
 class MirrorResult:
@@ -131,7 +156,8 @@ class OwnerPublishResult:
     piles: int
 
     def __post_init__(self):
-        if self.status not in {"applied", "noop", "retryable"} \
+        if self.status not in {
+                "applied", "noop", "retryable", "conflict"} \
                 or self.head is not None and not valid_fid(self.head) \
                 or type(self.objects) is not int or self.objects < 0 \
                 or type(self.piles) is not int or self.piles < 0:
@@ -534,7 +560,7 @@ class OpaqueHeadGate:
         opened = await self.store.read_versioned(key)
         if opened is ABSENT:
             if grant.base_head is not None:
-                return SlotResult("retryable", slot)
+                return SlotResult("conflict", slot)
             token = ABSENT
         elif isinstance(opened, Versioned):
             if opened.value == raw:
@@ -546,19 +572,26 @@ class OpaqueHeadGate:
             if current.head == grant.head:
                 return SlotResult("noop", current)
             if current.head != grant.base_head:
-                return SlotResult("retryable", slot)
+                return SlotResult("conflict", current)
             token = opened.token
         else:
             raise TypeError("writer slot read")
         try:
             result = await self.store.cas(key, token, raw)
         except OutcomeUnknown:
-            current = await self.store.read_versioned(key)
-            if isinstance(current, Versioned) and current.value == raw:
-                return SlotResult("applied", slot)
-            return SlotResult("retryable", slot)
+            return _reconcile_head_cas(
+                await self.store.read_versioned(key),
+                grant,
+                slot,
+                "applied",
+            )
         if result is STALE:
-            return SlotResult("retryable", slot)
+            return _reconcile_head_cas(
+                await self.store.read_versioned(key),
+                grant,
+                slot,
+                "noop",
+            )
         if not isinstance(result, Applied):
             raise TypeError("writer slot CAS")
         return SlotResult("applied", slot)
@@ -704,7 +737,7 @@ class OwnerPublisher:
             outcome = await _maybe_await(
                 self.advance(proof, local_slot.head))
         status = getattr(outcome, "status", outcome)
-        if status not in {"applied", "noop", "retryable"}:
+        if status not in {"applied", "noop", "retryable", "conflict"}:
             raise ValueError("owner head advance result")
         return OwnerPublishResult(
             status,

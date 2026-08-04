@@ -64,7 +64,7 @@ SCALE_BYTES = {
 
 RACE_BYTES = {
     "candidate_upload": 7_625,
-    "contention_read": 698,
+    "contention_read": 1_047,
     "contention_write": 698,
     "rebase_read": 3_223,
     "rebase_write": 4_254,
@@ -435,7 +435,7 @@ async def scale_scenario(kind, tmp_path, root, specs):
 
 
 class ReadBarrierStore:
-    """Hold two exact slot reads so both contenders reach provider CAS."""
+    """Hold initial reads; the CAS loser then rereads the exact winner."""
 
     def __init__(self, store, key):
         self.store = store
@@ -513,18 +513,19 @@ async def race_scenario(kind, tmp_path, root, specs):
         for request, candidate in zip(requests, candidates)
     ))
     statuses = [outcome.status for outcome in outcomes]
-    assert statuses.count("applied") == statuses.count("retryable") == 1
-    assert barrier_store.arrivals == 2
+    assert statuses.count("applied") == statuses.count("conflict") == 1
+    assert barrier_store.arrivals == 3
     contention = run.cloud.snapshot()
     candidate_slots = tuple(encode_slot(outcome.slot) for outcome in outcomes)
+    winning_slot = encode_slot(outcomes[statuses.index("applied")].slot)
     assert contention == CostVector(
-        slot_gets=2,
+        slot_gets=3,
         object_gets=2,
         slot_cas=2,
-        read_bytes=2 * len(initial_slot),
+        read_bytes=2 * len(initial_slot) + len(winning_slot),
         write_bytes=sum(map(len, candidate_slots)),
     )
-    assert contention.read_bytes == 2 * len(initial_slot)
+    assert contention.read_bytes == 3 * len(initial_slot)
 
     winner = statuses.index("applied")
     loser = 1 - winner
@@ -623,7 +624,7 @@ def test_directory_costs_scale_with_writers_and_only_one_changed_tree(
     asyncio.run(scenario())
 
 
-def test_same_writer_contention_retries_and_rebases_without_lost_piles(
+def test_same_writer_contention_conflicts_and_rebases_without_lost_piles(
         tmp_path):
     async def scenario():
         root, specs = fixture(1)

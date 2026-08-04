@@ -18,7 +18,7 @@ from core.limits import (
     MAX_REPOSITORY_OBJECT_BYTES,
     PayloadTooLarge,
 )
-from core.object_store import ABSENT
+from core.object_store import ABSENT, STALE, OutcomeUnknown
 from core.store import FsStore
 from core.writer_head import (
     HeadSlot,
@@ -401,6 +401,118 @@ def test_same_writer_objects_converge_through_normal_and_opaque_cloud_modes(
     run(scenario())
 
 
+@pytest.mark.parametrize(("failure", "visible", "expected"), (
+    ("stale", "proposed", "noop"),
+    ("unknown", "proposed", "applied"),
+    ("stale", "base", "retryable"),
+    ("unknown", "base", "retryable"),
+    ("stale", "winner", "conflict"),
+    ("unknown", "winner", "conflict"),
+))
+def test_head_cas_reread_distinguishes_success_retry_and_conflict(
+        tmp_path, failure, visible, expected):
+    class RacedStore(FsStore):
+        armed = False
+        replacement = None
+
+        def cas(self, key, token, value):
+            if not self.armed:
+                return super().cas(key, token, value)
+            self.armed = False
+            if self.replacement is not None:
+                assert super().cas(key, token, self.replacement) is not STALE
+            if failure == "unknown":
+                raise OutcomeUnknown("lost head CAS response")
+            return STALE
+
+    async def scenario():
+        _secret, device, root, _device_signature, _device = world()
+        store = RacedStore(str(tmp_path / f"{failure}-{visible}"))
+        removal_root = h(b"head reconciliation removal root")
+        base = h(b"accepted base head")
+        proposed = h(b"proposed next head")
+        winner = h(b"competing next head")
+        for oid, raw in (
+                (base, b"accepted base head"),
+                (proposed, b"proposed next head"),
+                (winner, b"competing next head")):
+            store.put_if_absent("obj/" + oid, raw)
+        key = head_slot_key(root.fid, device)
+        assert store.cas(key, ABSENT, encode_slot(HeadSlot(
+            root.fid, device, base, removal_root))) is not STALE
+        proposed_slot = HeadSlot(
+            root.fid, device, proposed, removal_root)
+        winner_slot = HeadSlot(
+            root.fid, device, winner, removal_root)
+        store.replacement = {
+            "base": None,
+            "proposed": encode_slot(proposed_slot),
+            "winner": encode_slot(winner_slot),
+        }[visible]
+        store.armed = True
+
+        result = await OpaqueHeadGate(
+            store, lambda *_args: None).advance_grant(HeadGrant(
+                root.fid, device, base, proposed, removal_root))
+
+        assert result.status == expected
+        assert result.slot.head == (
+            winner if expected == "conflict" else proposed)
+
+    run(scenario())
+
+
+def test_head_with_missing_required_base_is_terminal_conflict(tmp_path):
+    async def scenario():
+        _secret, device, root, _device_signature, _device = world()
+        store = FsStore(str(tmp_path / "missing-required-base"))
+        proposed_raw = b"proposed after missing base"
+        proposed = h(proposed_raw)
+        store.put_if_absent("obj/" + proposed, proposed_raw)
+
+        result = await OpaqueHeadGate(
+            store, lambda *_args: None).advance_grant(HeadGrant(
+                root.fid,
+                device,
+                h(b"missing base"),
+                proposed,
+                h(b"removal root"),
+            ))
+
+        assert result.status == "conflict"
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("failure", ("stale", "unknown"))
+def test_head_create_failure_rereads_absent_as_retryable(tmp_path, failure):
+    class AbsentStore(FsStore):
+        def cas(self, _key, _token, _value):
+            if failure == "unknown":
+                raise OutcomeUnknown("lost absent head CAS response")
+            return STALE
+
+    async def scenario():
+        _secret, device, root, _device_signature, _device = world()
+        store = AbsentStore(str(tmp_path / f"absent-{failure}"))
+        proposed_raw = b"first proposed head"
+        proposed = h(proposed_raw)
+        store.put_if_absent("obj/" + proposed, proposed_raw)
+
+        result = await OpaqueHeadGate(
+            store, lambda *_args: None).advance_grant(HeadGrant(
+                root.fid,
+                device,
+                None,
+                proposed,
+                h(b"removal root"),
+            ))
+
+        assert result.status == "retryable"
+
+    run(scenario())
+
+
 def test_owner_publisher_diffs_then_advances_cloud_head_last(tmp_path):
     async def scenario():
         secret, public, root, device_signature, device = world()
@@ -608,6 +720,93 @@ def test_owner_publisher_retries_control_before_head_without_a_cursor(
             (update.pile_oids[0], public),
             (update.pile_oids[0], public),
         ]
+
+    run(scenario())
+
+
+def test_owner_publisher_stops_on_same_base_competing_control_head(
+        tmp_path):
+    async def scenario():
+        secret, public, root, device_signature, device = world()
+        binding = WriterBinding(
+            root.fid, public, public, h(b"competing publisher store"))
+        removal_root = h(b"competing publisher removal root")
+        local = FsStore(str(tmp_path / "competing-local"))
+        cloud = FsStore(str(tmp_path / "competing-cloud"))
+        writer = WriterLog(
+            root.fid,
+            public,
+            public,
+            binding.store,
+            secret,
+            local,
+        )
+        update = await writer.prepare(((root, device_signature, device),))
+        await writer.establish(update)
+        proof = proof_for(
+            secret,
+            public,
+            root,
+            device_signature,
+            device,
+            update.head_oid,
+        )
+        assert (await OpaqueHeadGate(
+            local,
+            mechanical_head_authorizer(root.fid, removal_root),
+        ).advance(proof, update.head_oid, 10)).status == "applied"
+
+        cloud_gate = OpaqueHeadGate(
+            cloud,
+            mechanical_head_authorizer(root.fid, removal_root),
+        )
+        winner_raw = b"same-base competing head"
+        winner = h(winner_raw)
+        issues = []
+        commits = []
+
+        async def issue_permit(
+                exact_proof, proposed, control_piles):
+            issues.append((exact_proof, proposed, control_piles))
+            return b"one exact losing permit"
+
+        async def commit_permit(permit, proposed, control_piles):
+            commits.append((permit, proposed, control_piles))
+            cloud.put_if_absent("obj/" + winner, winner_raw)
+            won = await cloud_gate.advance_grant(HeadGrant(
+                root.fid,
+                public,
+                None,
+                winner,
+                removal_root,
+            ))
+            assert won.status == "applied"
+            return await cloud_gate.advance(issues[0][0], proposed, 10)
+
+        def retry_pause(_attempt):
+            raise AssertionError("terminal conflict was retried")
+
+        published = await OwnerPublisher(
+            root.fid,
+            public,
+            binding,
+            local,
+            cloud,
+            lambda _base, _proposed: proof,
+            issue_permit,
+            commit_permit,
+            lambda *_args: None,
+            retry_pause,
+        ).publish()
+
+        assert published.status == "conflict"
+        assert len(issues) == len(commits) == 1
+        assert commits[0][0] == b"one exact losing permit"
+        slot = decode_slot_at(
+            head_slot_key(root.fid, public),
+            cloud.get(head_slot_key(root.fid, public)),
+        )
+        assert slot.head == winner
 
     run(scenario())
 

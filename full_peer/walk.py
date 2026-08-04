@@ -288,6 +288,8 @@ class Peer:
                 response_limit=MAX_CONTROL_BYTES,
             )
         except urllib.error.HTTPError as error:
+            if error.code == 412:
+                return "conflict"
             if error.code == 409 or 500 <= error.code < 600:
                 return "retryable"
             raise
@@ -317,6 +319,8 @@ class Peer:
                 "POST", "/head/" + proposed_head, proof, auth=False,
                 response_limit=MAX_CONTROL_BYTES)
         except urllib.error.HTTPError as error:
+            if error.code == 412:
+                return "conflict"
             if error.code == 409:
                 return "retryable"
             raise

@@ -522,6 +522,8 @@ class HttpGate:
             return Response(204)
         if status == "retryable":
             return Response(409)
+        if status == "conflict":
+            return Response(412)
         return Response(503)
 
     async def _advance_head(self, proposed_head, body, trusted_now):

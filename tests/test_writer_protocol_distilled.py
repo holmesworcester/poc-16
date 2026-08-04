@@ -118,7 +118,7 @@ def message_texts(consumer):
     }
 
 
-def test_same_device_stale_base_race_has_one_winner_and_retryable_loser(
+def test_same_device_stale_base_race_has_one_winner_and_conflict_loser(
         tmp_path):
     async def scenario():
         secret, writer, root, authority = primary_authority()
@@ -177,7 +177,7 @@ def test_same_device_stale_base_race_has_one_winner_and_retryable_loser(
             for ordinal, candidate in enumerate(candidates)
         ))
         statuses = tuple(outcome.status for outcome in outcomes)
-        assert sorted(statuses) == ["applied", "retryable"]
+        assert sorted(statuses) == ["applied", "conflict"]
 
         winner = statuses.index("applied")
         loser = 1 - winner
@@ -199,10 +199,10 @@ def test_same_device_stale_base_race_has_one_winner_and_retryable_loser(
             candidates[loser].head_oid,
             10,
         )
-        assert stale_again.status == "retryable"
+        assert stale_again.status == "conflict"
         assert decode_slot_at(key, source.get(key)).head == winning_head
 
-        # Retry means rebase, not force: the losing closure appends after the
+        # Conflict means rebase, not force: the losing closure appends after
         # winner and both publications become visible through ordinary sync.
         rebased = await log.prepare((closures[loser],))
         assert rebased.base_head == winning_head

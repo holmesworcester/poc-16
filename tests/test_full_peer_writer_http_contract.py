@@ -29,6 +29,7 @@ from core.object_store import ABSENT, CREATED, Versioned
 from core.store import FsStore, RemoteStore
 from core.writer_head import decode_head, decode_slot_at, head_slot_key
 from core.writer_repository import (
+    HeadGrant,
     OpaqueHeadGate,
     RepositoryMirror,
     open_accepted_pile,
@@ -671,6 +672,77 @@ def test_hosted_owner_http_uses_exact_permit_only_for_control_head(
                for method, path in requests)
 
 
+def test_hosted_owner_same_base_loser_gets_412_and_stops_for_rebase(
+        tmp_path, monkeypatch):
+    workspace, alice, _bob, carol = _forest_fixture(tmp_path)
+    device = alice.identity_id(workspace)
+    proposed = decode_slot_at(
+        head_slot_key(workspace, device),
+        alice.store(workspace).get(head_slot_key(workspace, device)),
+    ).head
+    original = carol.head_gate(workspace)
+    winner_raw = b"hosted same-base winning head"
+    winner = h(winner_raw)
+    requests = []
+    outcomes = []
+    winner_installed = False
+
+    class CompetingGate:
+        async def advance(self, proof, candidate, trusted_now):
+            return await original.advance(proof, candidate, trusted_now)
+
+        async def advance_grant(self, grant, candidate):
+            nonlocal winner_installed
+            if not winner_installed:
+                winner_installed = True
+                carol.store(workspace).put_if_absent(
+                    "obj/" + winner, winner_raw)
+                competing = await original.advance_grant(HeadGrant(
+                    workspace,
+                    grant.device,
+                    grant.base_head,
+                    winner,
+                    grant.removal_root,
+                ))
+                assert competing.status == "applied"
+            return await original.advance_grant(grant, candidate)
+
+    monkeypatch.setattr(
+        carol, "head_gate", lambda candidate: CompetingGate())
+
+    class CountingPeer(Peer):
+        def _http(self, method, path, *args, **kwargs):
+            requests.append((method, path))
+            return super()._http(method, path, *args, **kwargs)
+
+        def commit_head_permit(self, *args, **kwargs):
+            outcome = super().commit_head_permit(*args, **kwargs)
+            outcomes.append(outcome)
+            return outcome
+
+    monkeypatch.setattr(sync_module, "Peer", CountingPeer)
+
+    async def conflict_must_not_pause(_attempt):
+        raise AssertionError("terminal HTTP 412 was retried")
+
+    monkeypatch.setattr(
+        sync_module, "_control_head_retry_pause", conflict_must_not_pause)
+    with _serve(
+            carol, sync_profile=peer_capability.OWNER) as (url, _secret):
+        with pytest.raises(ValueError, match="requires rebase"):
+            sync_module.sync(alice, workspace, url)
+
+    assert winner_installed
+    assert outcomes == ["conflict"]
+    assert requests.count(("POST", f"/head/{proposed}/permit")) == 1
+    assert requests.count(("POST", f"/head/{proposed}/commit")) == 1
+    accepted = decode_slot_at(
+        head_slot_key(workspace, device),
+        carol.store(workspace).get(head_slot_key(workspace, device)),
+    )
+    assert accepted.head == winner
+
+
 def test_peer_control_commit_replays_503_and_dropped_response_but_not_4xx():
     peer = Peer(object(), h(b"workspace"), "http://peer.invalid")
     proposed = h(b"proposed head")
@@ -713,6 +785,22 @@ def test_peer_control_commit_replays_503_and_dropped_response_but_not_4xx():
     assert peer.commit_head_permit(
         permit, proposed, controls) == "applied"
     assert len(bodies) == 2 and bodies[0] == bodies[1]
+
+    def competing_head(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            "http://peer.invalid", 412, "rebase required", {}, None)
+
+    peer._http = competing_head
+    assert peer.commit_head_permit(
+        permit, proposed, controls) == "conflict"
+    assert peer.advance_head(b"ordinary proof", proposed) == "conflict"
+
+    def ordinary_contention(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            "http://peer.invalid", 409, "retry", {}, None)
+
+    peer._http = ordinary_contention
+    assert peer.advance_head(b"ordinary proof", proposed) == "retryable"
 
     def permanent_denial(*_args, **_kwargs):
         raise urllib.error.HTTPError(
