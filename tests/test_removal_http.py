@@ -7,7 +7,7 @@ import json
 from core.access import AccessGate
 from core.crypto import h
 from core.http import AsyncFromSyncReader, HttpGate
-from core.limits import MAX_AUTHORITY_PILE_BYTES
+from core.limits import MAX_CONTROL_PILE_BYTES
 from core.store import FsStore
 from core.suppression import scoped_id, suppression_slot
 from core.writer_head import decode_slot_at, head_slot_key
@@ -153,7 +153,7 @@ def test_bootstrap_rejects_content_and_bounds_before_provider_work(tmp_path):
     assert store.list("") == []
     assert run(http.handle(
         "POST", "/removal/bootstrap", {"ws": root.fid}, {},
-        b"x" * (MAX_AUTHORITY_PILE_BYTES + 1))).status == 413
+        b"x" * (MAX_CONTROL_PILE_BYTES + 1))).status == 413
     assert store.list("") == []
 
 

@@ -16,7 +16,7 @@ from .crypto import h, seal_to
 from .grants import check_token, make_token
 from .limits import (
     MAX_INVITE_BYTES,
-    MAX_AUTHORITY_PILE_BYTES,
+    MAX_CONTROL_PILE_BYTES,
     MAX_MINT_FETCHES,
     MAX_MINT_FETCH_BYTES,
     MAX_MINT_REQUEST_BYTES,
@@ -322,7 +322,7 @@ class HttpGate:
         """Evaluate one original direct-member control closure, then discard."""
         if self.removal_bootstrap is None:
             return Response(405)
-        if not isinstance(body, bytes) or len(body) > MAX_AUTHORITY_PILE_BYTES:
+        if not isinstance(body, bytes) or len(body) > MAX_CONTROL_PILE_BYTES:
             return Response(413)
         try:
             if inspect.iscoroutinefunction(self.removal_bootstrap):
@@ -687,7 +687,7 @@ class HttpGate:
         if method == "POST" and path == "/removal/path":
             return MAX_MINT_REQUEST_BYTES
         if method == "POST" and path == "/removal/bootstrap":
-            return MAX_AUTHORITY_PILE_BYTES
+            return MAX_CONTROL_PILE_BYTES
         if method == "POST" and path.startswith("/removal/advance/"):
             return 0
         if method == "POST" and path.startswith("/head/"):

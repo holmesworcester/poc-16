@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import facts
 
 from .close import ClosedPileEvaluator
-from .limits import MAX_AUTHORITY_PILE_BYTES
+from .limits import MAX_CONTROL_PILE_BYTES
 from .shape import valid_fid
 from .suppression_tree import SuppressionTree
 from .writer_repository import open_accepted_pile
@@ -42,7 +42,7 @@ class RecipientRemovalState:
         self.store = store
         self.tree = SuppressionTree(workspace, store)
         self.evaluator = ClosedPileEvaluator(
-            workspace, max_bytes=MAX_AUTHORITY_PILE_BYTES)
+            workspace, max_bytes=MAX_CONTROL_PILE_BYTES)
 
     async def pin(self):
         """Pin the current private root for subsequent point proofs."""
@@ -97,7 +97,7 @@ class RecipientRemovalState:
                 self.workspace,
                 device,
                 sequence,
-                max_bytes=MAX_AUTHORITY_PILE_BYTES,
+                max_bytes=MAX_CONTROL_PILE_BYTES,
             )
             _evaluated, groups = self._groups(raw, writer=device)
         except ValueError:

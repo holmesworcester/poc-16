@@ -21,7 +21,7 @@ MAX_WRITER_PACK_BYTES = MAX_PILE_BYTES
 # deliberately small budget. Content pull is the only path that needs the full
 # writer-pile ceiling, and it must use the direct data plane.
 MAX_BUFFERED_PILE_BYTES = 5 * MIB
-MAX_AUTHORITY_PILE_BYTES = MAX_BUFFERED_PILE_BYTES
+MAX_CONTROL_PILE_BYTES = MAX_BUFFERED_PILE_BYTES
 
 # Writer-log physical layout and streaming bounds. Keep these provider-neutral
 # so codecs, stores, FullPeer, Lambda, R2, and benchmarks cannot drift by

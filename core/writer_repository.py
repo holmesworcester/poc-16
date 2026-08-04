@@ -349,7 +349,7 @@ class WriterLog:
 
     This is writer-side work. Hosted storage never invokes it: a cloud writer
     prepares locally, uploads :attr:`PreparedUpdate.objects`, then submits only
-    an authority pile and proposed head OID to :class:`OpaqueHeadGate`.
+    a current-removal proof and proposed head OID to :class:`OpaqueHeadGate`.
     """
 
     def __init__(
