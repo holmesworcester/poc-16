@@ -6,9 +6,10 @@ database-free authority, object, head, and HTTP core. A hosted owner target
 needs an object store but no database. SQLite exists only as a disposable
 full-client query and authorship accelerator.
 
-The writer forest and the two-phase self-confined removal-path gate described
-here are the running protocol. There is no predecessor authority repository or
-compatibility route behind them.
+The writer forest is the running publication protocol. Section 7's two-phase
+self-confined removal-path gate is the accepted target while
+`poc-16-6j4.16` remains open; no predecessor authority repository or
+compatibility route is retained behind the cut.
 
 The implementation is deliberately strict about authority and direction:
 
@@ -23,6 +24,9 @@ The implementation is deliberately strict about authority and direction:
   return only that member/device pair's current removal path, then accepts a
   second device-signed current-member proof carrying that path. Both judgments
   are discarded; neither synchronizes or mutates recipient authority state.
+- A control head is evaluated once at `/permit`. Its stable-secret HMAC permit
+  carries the bounded aggregate removal plan; `/commit` reserves an invisible
+  pending writer slot, applies that plan, and exposes the final slot afterward.
 - Removal roots and proof nodes are private authenticated point-read state,
   never generic `obj/` or pack objects. A slot may record a root hash for audit,
   but only the self-confined path endpoint can read the private tree, and its
@@ -33,6 +37,8 @@ The implementation is deliberately strict about authority and direction:
 There is no workspace-global mutable content root, ingress queue, upload
 broker, or hosted pile-to-root compiler. Hosted devices upload immutable
 objects directly and may CAS only their own writer slot.
+There is no `POST /authority`, `AuthorityRepository`, or mirror/replay
+authority-publication hook.
 
 ## Read the code in this order
 
@@ -680,8 +686,10 @@ mint one current sync grant from a device-signed proof carrying the current remo
   -> PUT missing pile/tree/head objects directly to S3 or R2
   -> ordinary head: POST /head/<proposed-head-oid> with an exact closed proof
   -> control head: POST /head/<oid>/permit with proof + exact control piles
-  -> control head: POST /head/<oid>/commit with permit + those same piles
-  -> CAS heads/<workspace>/<device>
+  -> control head: POST /head/<oid>/commit with exactly the returned permit
+  -> reserve pending heads/<workspace>/<device>
+  -> one aggregate removal-root CAS
+  -> finalize heads/<workspace>/<device>
 ```
 
 `OwnerPublisher` compares the local and hosted signed writer trees, transfers
@@ -690,12 +698,12 @@ that binds the observed base and proposed head. A retry rereads the one slot;
 an exact repeat is a no-op, and a same-writer race requires rebase. Different
 writers never share a mutable content key.
 
-The section 7 hosted gate will validate membership, member-signed device ownership,
-non-removal, expiry, and the exact proposed head against its pinned removal
-root. It checks that
-the proposed head object exists, but deliberately does not parse or validate
-the writer's content tree. A consuming peer does that later through
-`RepositoryMirror` and `FactConsumer`.
+In the accepted section 7 flow, the hosted gate validates membership,
+member-signed device ownership, non-removal, expiry, and the exact proposed
+head against its pinned removal root. It checks that the proposed head object
+exists, but deliberately does not parse or validate the writer's content tree.
+A consuming peer does that later through `RepositoryMirror` and
+`FactConsumer`.
 
 There is no ingress namespace, upload session, journal, broker, finalize call,
 bucket event, content queue, or hosted pile compiler. File descriptors and Bao
@@ -740,20 +748,24 @@ the shared `HttpGate` with the `owner` capability: it can read the recipient's
 removal tree and writer forest, create content-addressed objects/packs, and
 conditionally advance writer slots. A public `/removal/bootstrap` accepts only
 an original direct-member CLEAR closure. A control-bearing head first obtains
-a stateless permit from `/head/<oid>/permit`, bound to its current proof, exact
-base/head, and immutable control piles. `/head/<oid>/commit` evaluates those
-same control-only piles, joins their private removal cells, and only then
-attempts the head CAS. The active sender retains one exact permit/body across
-retryable removal-root contention, 5xx, and lost-response retries with bounded
-full jitter. A competing-head HTTP 412 is terminal and requires rebase.
+a self-contained HMAC permit from `/head/<oid>/permit`. Issuance evaluates the
+current proof and original signed control piles exactly once and binds the
+workspace, device, exact base/head, issue-time removal root, canonical
+aggregate CLEAR/ACTIVE plan, and terminal suppression IDs. The commit body is
+only those authenticated permit bytes. `/head/<oid>/commit` reserves the exact
+writer slot as privately pending before one removal-root CAS, then finalizes
+the slot with the resulting root and permit hash. Generic readers see the
+previous final value while pending. The active sender retains one exact permit
+across retryable removal-root contention, 5xx, and lost-response retries with
+bounded full jitter. A competing-head HTTP 412 is terminal and requires rebase.
 Ordinary content and malformed control piles are rejected, and exact retries
 are idempotent. A
 closed head proof confines each slot update to its authenticated device. The
 Function URL adapter applies named request and aggregate control-pile bounds so
 base64 expansion and event metadata remain within Lambda's buffered invocation
-envelope; other metadata requests remain capped at 512 KiB. The template creates
-the grant secret, role, Function URL, logs, and alarm; it never creates or
-deletes the bucket.
+envelope; other metadata requests remain capped at 512 KiB. The template
+creates distinct stable grant and permit secrets, the role, Function URL,
+logs, and alarm; it never creates or deletes the bucket.
 
 Prerequisites are Python 3.13, AWS CLI, SAM CLI, Docker for the reproducible
 build, and credentials for the target account. Inspect the deny-guard policy
@@ -792,9 +804,10 @@ binding. Large GETs use scoped R2 S3/SigV4 URLs; large create-only PUTs use a
 short-lived HMAC ticket at a minimal streaming Worker route backed by the
 native R2 binding. Neither body enters the Python Worker heap. The owner
 gateway uses the same `/head/<oid>/permit` and `/head/<oid>/commit` control turn
-to join private `removal` state before advancing its writer slot, but it has no
-generic authority-publication route and no delete path. Control-pile count and
-aggregate bytes are bounded by
+to evaluate control piles once, reserve a private pending writer slot, apply
+one authenticated aggregate plan to private `removal` state, and then finalize
+the visible slot. It has no generic authority-publication route and no delete
+path. Control-pile count and aggregate bytes are bounded by
 named portable constants; ordinary metadata remains capped at 512 KiB.
 
 Set the non-secret deployment inputs:
@@ -811,11 +824,14 @@ export CF_R2_ENDPOINT='https://ACCOUNT32.r2.cloudflarestorage.com'
 export CF_PACK_PUT_ENDPOINT='https://sync.example.com'
 ```
 
-Set a deploy-only `CLOUDFLARE_API_TOKEN`, then provide `GRANT_SECRET` and
-`PACK_TICKET_SECRET` as base64-encoded 32-byte values plus bucket-confined
-`R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY`. The R2 credentials exist only
-to issue exact short-lived direct requests; the control token is never a
-Worker secret. For first creation set:
+Set a deploy-only `CLOUDFLARE_API_TOKEN`, then provide distinct stable
+`GRANT_SECRET` and `PERMIT_SECRET` values plus `PACK_TICKET_SECRET`, each as a
+base64-encoded 32-byte value, and bucket-confined `R2_ACCESS_KEY_ID` and
+`R2_SECRET_ACCESS_KEY`. The R2 credentials exist only to issue exact
+short-lived direct requests. The deployment control token is not runtime
+authority; the Worker's permit secret authenticates only self-contained
+control permits and remains distinct from bearer-grant material. For first
+creation set:
 
 ```sh
 export CF_CREATE=1
