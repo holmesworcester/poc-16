@@ -59,7 +59,15 @@ Resources:
   GrantSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Description: Stable HMAC secret shared by every POC-16 Lambda sandbox
+      Description: Stable HMAC secret for bearer grants across Lambda sandboxes
+      GenerateSecretString:
+        ExcludePunctuation: true
+        PasswordLength: 64
+
+  PermitSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Stable HMAC secret for exact control-head permits across Lambda sandboxes
       GenerateSecretString:
         ExcludePunctuation: true
         PasswordLength: 64
@@ -193,6 +201,10 @@ Resources:
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref GrantSecret
+              - Sid: ReadPermitSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref PermitSecret
               - !If
                 - HasKmsKey
                 - Sid: DecryptWorkspaceObjects
@@ -245,6 +257,7 @@ Resources:
             - !Ref KmsKeyArn
             - !Ref AWS::NoValue
           TINYP2P_GRANT_SECRET_ARN: !Ref GrantSecret
+          TINYP2P_PERMIT_SECRET_ARN: !Ref PermitSecret
           TINYP2P_FUNCTION_TIMEOUT_SECONDS: "15"
           TINYP2P_AWS_CONNECT_TIMEOUT_SECONDS: "2"
           TINYP2P_AWS_READ_TIMEOUT_SECONDS: "5"
@@ -319,3 +332,5 @@ Outputs:
     Value: !GetAtt GatewayFunctionUrl.FunctionUrl
   GrantSecretArn:
     Value: !Ref GrantSecret
+  PermitSecretArn:
+    Value: !Ref PermitSecret

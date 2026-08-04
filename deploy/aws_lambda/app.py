@@ -37,7 +37,6 @@ from deploy.aws_lambda.pack_issuer import (
 from core.http import (
     AsyncFromSyncReader,
     HttpGate,
-    MAX_HEAD_CONTROL_REQUEST_BYTES,
     Response,
 )
 from core.writer_repository import OpaqueHeadGate
@@ -126,12 +125,13 @@ def _botocore_config():
     )
 
 
-def _secret():
+def _secret(arn_environment, label):
+    """Load one stable authority secret from its exact configured ARN."""
     import boto3
 
     response = boto3.client(
         "secretsmanager", config=_botocore_config()).get_secret_value(
-        SecretId=_required("TINYP2P_GRANT_SECRET_ARN"))
+        SecretId=_required(arn_environment))
     if isinstance(response.get("SecretString"), str):
         value = response["SecretString"].encode()
     else:
@@ -139,7 +139,7 @@ def _secret():
         if isinstance(value, str):
             value = base64.b64decode(value, validate=True)
     if not isinstance(value, bytes) or len(value) < 32:
-        raise RuntimeError("grant secret must contain at least 32 bytes")
+        raise RuntimeError(f"{label} secret must contain at least 32 bytes")
     return value
 
 
@@ -188,20 +188,24 @@ def _gateway():
         clock = lambda: int(time.time() * 1000)
         gate = AccessGate(workspace, store)
         heads = OpaqueHeadGate(store, gate.authorize_head)
+        grant_secret = _secret("TINYP2P_GRANT_SECRET_ARN", "grant")
+        permit_secret = _secret("TINYP2P_PERMIT_SECRET_ARN", "permit")
+        if grant_secret == permit_secret:
+            raise RuntimeError("grant and permit secrets must be distinct")
 
-        async def commit_permit(permit, proposed, controls, secret):
-            grant = await gate.authorize_permitted_head(
-                permit, proposed, controls, secret)
-            return await heads.advance_grant(grant, proposed)
+        async def commit_permit(permit, proposed, secret):
+            return await gate.commit_head_permit(
+                heads, permit, proposed, secret)
 
         _gateway_cache = HttpGate(
             store,
             workspace,
-            _secret(),
+            grant_secret,
             clock,
             head_advance=heads.advance,
             head_permit_issue=gate.issue_head_permit,
             head_permit_commit=commit_permit,
+            permit_secret=permit_secret,
             mint_authorize=gate.authorize_access,
             path_authorize=gate.removal_path,
             removal_bootstrap=gate.state.bootstrap,

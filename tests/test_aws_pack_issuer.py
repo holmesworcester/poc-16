@@ -652,7 +652,11 @@ def test_lambda_gateway_composes_one_store_namespace_with_pack_issuer(
     pack_issuer = PackIssuer()
     monkeypatch.setattr(app, "_s3_config", lambda: config)
     monkeypatch.setattr(app, "_store", lambda value: object())
-    monkeypatch.setattr(app, "_secret", lambda: b"s" * 32)
+    monkeypatch.setattr(
+        app, "_secret",
+        lambda name, _label: (
+            b"p" * 32 if name == "TINYP2P_PERMIT_SECRET_ARN"
+            else b"g" * 32))
     monkeypatch.setattr(app, "_pack_issuer", lambda value: (
         issued.append(value) or pack_issuer))
     monkeypatch.setenv("TINYP2P_WORKSPACE_ID", WORKSPACE)

@@ -19,7 +19,12 @@ from core import peer_capability
 from core.access import AccessGate
 from core.crypto import h, unseal
 from core.grants import check_token
+from core.head_permit import (
+    decode as decode_head_permit,
+    encode as encode_head_permit,
+)
 from core.limits import (
+    MAX_HEAD_PERMIT_BYTES,
     MAX_MINT_REQUEST_BYTES,
     PAGE_BATCH,
 )
@@ -64,6 +69,7 @@ from core.object_store import (
 )
 from deploy.python_role_modules import HOSTED_GATE_CORE_MODULES
 from core.suppression_tree import decode_root
+from core.writer_head import PendingHeadSlot, decode_slot_state
 from core.writer_repository import OpaqueHeadGate
 from facts.auth.removal import removal
 from facts.auth.removal_path_request import removal_path_request
@@ -158,10 +164,9 @@ def local_gateway(node, workspace, now):
     gate = AccessGate(workspace, store)
     heads = OpaqueHeadGate(store, gate.authorize_head)
 
-    async def commit_permit(permit, proposed, controls, secret):
-        grant = await gate.authorize_permitted_head(
-            permit, proposed, controls, secret)
-        return await heads.advance_grant(grant, proposed)
+    async def commit_permit(permit, proposed, secret):
+        return await gate.commit_head_permit(
+            heads, permit, proposed, secret)
 
     return HttpGate(
         store,
@@ -171,6 +176,7 @@ def local_gateway(node, workspace, now):
         head_advance=heads.advance,
         head_permit_issue=gate.issue_head_permit,
         head_permit_commit=commit_permit,
+        permit_secret=b"p" * 32,
         mint_authorize=gate.authorize_access,
         path_authorize=gate.removal_path,
         removal_bootstrap=gate.state.bootstrap,
@@ -241,7 +247,12 @@ def test_lambda_permit_commits_one_terminal_self_removal_head(
             open_pack=lambda *_args: None,
             open_object=lambda *_args: None,
         ))
-    monkeypatch.setattr(app, "_secret", lambda: b"s" * 32)
+    secrets = {
+        "TINYP2P_GRANT_SECRET_ARN": b"g" * 32,
+        "TINYP2P_PERMIT_SECRET_ARN": b"p" * 32,
+    }
+    monkeypatch.setattr(
+        app, "_secret", lambda name, _label: secrets[name])
     monkeypatch.setattr(app.time, "time", lambda: 0.010)
     monkeypatch.setenv("TINYP2P_WORKSPACE_ID", value.root.fid)
     app._gateway_cache = None
@@ -358,25 +369,51 @@ def test_lambda_permit_commits_one_terminal_self_removal_head(
     tampered[len(tampered) // 2] ^= 1
     assert response(app.handler(event(
         "POST", f"/head/{proposed}/commit", value.root.fid,
-        encode_head_commit_request(bytes(tampered), (control,))), None))[0] \
+        encode_head_commit_request(bytes(tampered))), None))[0] \
         == 403
     assert store.get(REMOVAL_ROOT_KEY) == removal_before
+
+    # The retired frame could resubmit changed controls at commit time. The
+    # hard-cut route accepts only the exact issue-time authenticated permit.
+    retired_frame = encode_head_permit_request(permit, (control,))
+    assert len(retired_frame) <= MAX_HEAD_PERMIT_BYTES
+    assert response(app.handler(event(
+        "POST", f"/head/{proposed}/commit", value.root.fid,
+        retired_frame), None))[0] == 403
+    assert store.get(REMOVAL_ROOT_KEY) == removal_before
+
+    grant_signed = encode_head_permit(
+        decode_head_permit(
+            permit, secrets["TINYP2P_PERMIT_SECRET_ARN"]),
+        secrets["TINYP2P_GRANT_SECRET_ARN"],
+    )
+    assert response(app.handler(event(
+        "POST", f"/head/{proposed}/commit", value.root.fid,
+        grant_signed), None))[0] == 403
+    assert store.get(REMOVAL_ROOT_KEY) == removal_before
+
+    # A new cold Lambda sandbox can finish a permit issued by the old one: all
+    # durable authority is in S3 and the permit key is stable outside memory.
+    app._gateway_cache = None
 
     store.fail_removal_once = True
     assert response(app.handler(event(
         "POST", f"/head/{proposed}/commit", value.root.fid,
-        encode_head_commit_request(permit, (control,))), None))[0] == 409
+        encode_head_commit_request(permit)), None))[0] == 409
     assert store.get(REMOVAL_ROOT_KEY) == removal_before
-    assert store.get(
-        f"heads/{value.root.fid}/{value.founder}") is None
+    pending = decode_slot_state(store.get(
+        f"heads/{value.root.fid}/{value.founder}"))
+    assert isinstance(pending, PendingHeadSlot)
+    assert (pending.workspace, pending.device, pending.head) == (
+        value.root.fid, value.founder, proposed)
     assert response(app.handler(event(
         "POST", f"/head/{proposed}/commit", value.root.fid,
-        encode_head_commit_request(permit, (control,))), None))[0] == 201
+        encode_head_commit_request(permit)), None))[0] == 201
     accepted_slot = store.get(
         f"heads/{value.root.fid}/{value.founder}")
     assert response(app.handler(event(
         "POST", f"/head/{proposed}/commit", value.root.fid,
-        encode_head_commit_request(permit, (control,))), None))[0] == 204
+        encode_head_commit_request(permit)), None))[0] == 204
     assert store.get(
         f"heads/{value.root.fid}/{value.founder}") == accepted_slot
     assert store.page_reads == []
@@ -430,9 +467,10 @@ def test_lambda_applies_route_specific_exact_body_limits(monkeypatch):
             return Response(200)
 
     app._gateway_cache = Probe()
-    monkeypatch.setenv("TINYP2P_MAX_REQUEST_BYTES", "3")
-    monkeypatch.setenv("TINYP2P_MAX_CONTROL_BYTES", "5")
+    monkeypatch.setenv("TINYP2P_MAX_REQUEST_BYTES", "5")
+    monkeypatch.setenv("TINYP2P_MAX_CONTROL_BYTES", "7")
     route = "/head/" + "b" * 64 + "/commit"
+    permit_route = "/head/" + "b" * 64 + "/permit"
 
     assert response(app.handler(event(
         "POST", route, workspace, b"12345"), None))[0] == 200
@@ -440,10 +478,14 @@ def test_lambda_applies_route_specific_exact_body_limits(monkeypatch):
     assert response(app.handler(event(
         "POST", route, workspace, b"123456"), None))[0] == 413
     assert response(app.handler(event(
-        "POST", "/mint", workspace, b"123"), None))[0] == 200
+        "POST", permit_route, workspace, b"1234567"), None))[0] == 200
     assert response(app.handler(event(
-        "POST", "/mint", workspace, b"1234"), None))[0] == 413
-    assert len(calls) == 2
+        "POST", permit_route, workspace, b"12345678"), None))[0] == 413
+    assert response(app.handler(event(
+        "POST", "/mint", workspace, b"12345"), None))[0] == 200
+    assert response(app.handler(event(
+        "POST", "/mint", workspace, b"123456"), None))[0] == 413
+    assert len(calls) == 3
 
 
 def test_lambda_mints_and_serves_writer_directory_objects(tmp_path):
@@ -633,7 +675,7 @@ def test_lambda_failure_telemetry_has_exact_attacker_field_bounds(caplog):
         for record in caplog.records[-2:])
 
 
-def test_lambda_cold_sandboxes_load_one_stable_external_secret(
+def test_lambda_cold_sandboxes_load_distinct_stable_external_secrets(
         tmp_path, monkeypatch):
     node, workspace, _, _ = world(tmp_path)
     calls = []
@@ -643,7 +685,10 @@ def test_lambda_cold_sandboxes_load_one_stable_external_secret(
     class Secrets:
         def get_secret_value(self, **request):
             calls.append(request)
-            return {"SecretString": "z" * 64}
+            return {"SecretString": {
+                "grant-secret": "g" * 64,
+                "permit-secret": "p" * 64,
+            }[request["SecretId"]]}
 
     class Boto:
         @staticmethod
@@ -666,15 +711,47 @@ def test_lambda_cold_sandboxes_load_one_stable_external_secret(
             open_object=lambda *_args: None,
         ))
     monkeypatch.setenv("TINYP2P_WORKSPACE_ID", workspace)
-    monkeypatch.setenv("TINYP2P_GRANT_SECRET_ARN", "stable-secret")
+    monkeypatch.setenv("TINYP2P_GRANT_SECRET_ARN", "grant-secret")
+    monkeypatch.setenv("TINYP2P_PERMIT_SECRET_ARN", "permit-secret")
     app._gateway_cache = None
 
     first = app._gateway()
-    second = app._gateway()
+    assert app._gateway() is first
+    app._gateway_cache = None
+    restarted = app._gateway()
 
-    assert first is second
-    assert first.secret == b"z" * 64
-    assert calls == [{"SecretId": "stable-secret"}]
+    assert restarted is not first
+    assert first.secret == restarted.secret == b"g" * 64
+    assert first.permit_secret == restarted.permit_secret == b"p" * 64
+    assert first.secret != first.permit_secret
+    assert calls == [
+        {"SecretId": "grant-secret"},
+        {"SecretId": "permit-secret"},
+        {"SecretId": "grant-secret"},
+        {"SecretId": "permit-secret"},
+    ]
+
+
+def test_lambda_refuses_one_secret_for_grants_and_permits(
+        tmp_path, monkeypatch):
+    node, workspace, _, _ = world(tmp_path)
+    config = S3Config("test-bucket", "tenant")
+    monkeypatch.setattr(app, "_s3_config", lambda: config)
+    monkeypatch.setattr(
+        app, "_store",
+        lambda value: AsyncFromSyncReader(node.store(workspace)))
+    monkeypatch.setattr(
+        app, "_pack_issuer",
+        lambda value: SimpleNamespace(
+            open_pack=lambda *_args: None,
+            open_object=lambda *_args: None,
+        ))
+    monkeypatch.setattr(app, "_secret", lambda _name, _label: b"x" * 32)
+    monkeypatch.setenv("TINYP2P_WORKSPACE_ID", workspace)
+    app._gateway_cache = None
+
+    with pytest.raises(RuntimeError, match="must be distinct"):
+        app._gateway()
 
 
 def test_lambda_sdk_deadline_budget_precedes_hard_timeout(monkeypatch):
@@ -769,6 +846,15 @@ def test_lambda_template_bounds_direct_immutable_writes_to_obj_and_pack():
     assert "AuthType: NONE" in template
     assert "CodeUri: stage/" in template
     assert "secretsmanager:GetSecretValue" in template
+    assert template.count("Type: AWS::SecretsManager::Secret") == 2
+    assert "TINYP2P_GRANT_SECRET_ARN: !Ref GrantSecret" in template
+    assert "TINYP2P_PERMIT_SECRET_ARN: !Ref PermitSecret" in template
+    assert "- Sid: ReadGrantSecret" in template
+    assert "Resource: !Ref GrantSecret" in template
+    assert "- Sid: ReadPermitSecret" in template
+    assert "Resource: !Ref PermitSecret" in template
+    assert "GrantSecretArn:" in template
+    assert "PermitSecretArn:" in template
     assert "s3:GetObject" in template
     assert template.count("Action: s3:PutObject") == 4
     assert "s3:DeleteObject" not in template
