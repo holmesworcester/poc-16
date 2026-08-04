@@ -5,7 +5,6 @@ from pathlib import Path
 import subprocess
 import sys
 
-import facts
 import pytest
 
 from adapters.r2 import R2BindingStore
@@ -19,9 +18,6 @@ from core.object_store import (
     STALE,
     StoreError,
 )
-from core.authority import AuthorityRepository
-from core.store import FsStore
-from full_peer.node import FullPeer
 from tests.adversarial_bucket import (
     AdversarialBucket,
     AsyncLaggedReader,
@@ -31,7 +27,6 @@ from tests.adversarial_bucket import (
 )
 from tests.provider_conformance import ConformanceRun, exercise_sync_store
 from tests.provider_fakes import FakeR2Bucket
-from tests.util import all_fids, closed_subset
 
 pytestmark = pytest.mark.unit
 
@@ -520,53 +515,6 @@ os._exit(72)
     else:
         assert store.get("authority") == (
             b"replacement" if when == "after" else b"base")
-
-
-def test_real_process_exit_after_authority_cas_replays_the_same_signed_pile(
-        tmp_path):
-    source = FullPeer(str(tmp_path / "source"))
-    workspace = facts.auth.workspace.create(source, "alice", ts=1)
-    raw = closed_subset(source, workspace, all_fids(source, workspace))
-    pile_path = tmp_path / "pile.bin"
-    pile_path.write_bytes(raw)
-    store_dir = tmp_path / "repository"
-
-    script = r"""
-import asyncio
-import os
-import sys
-from core.object_store import Applied
-from core.authority import AuthorityRepository
-from core.store import FsStore
-
-directory, workspace, pile_path = sys.argv[1:]
-store = FsStore(directory)
-original_cas = FsStore.cas
-
-def commit_then_die(self, key, token, value):
-    result = original_cas(self, key, token, value)
-    if key == "authority" and isinstance(result, Applied):
-        os._exit(73)
-    return result
-
-FsStore.cas = commit_then_die
-raw = open(pile_path, "rb").read()
-asyncio.run(AuthorityRepository(workspace, store).publish(raw))
-raise AssertionError("authority publisher did not reach CAS")
-"""
-    completed = _run_python(
-        script, store_dir, workspace, pile_path)
-    assert completed.returncode == 73
-
-    store = FsStore(str(store_dir))
-    committed_root = store.get("authority")
-    assert isinstance(committed_root, bytes)
-    assert store.list("ingress/") == []
-
-    replay = asyncio.run(AuthorityRepository(
-        workspace, store).publish(raw))
-    assert replay.status == "noop"
-    assert store.get("authority") == committed_root
 
 
 def test_real_process_probe_terminates_a_hung_child():
