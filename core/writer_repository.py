@@ -11,8 +11,10 @@ import inspect
 
 import facts
 
+from . import merkle_map
 from .close import (
     ClosedPileEvaluator,
+    decode_signed_pile,
     encode_signed_pile,
     make_signed_pile,
     signed_pile_oid,
@@ -58,8 +60,10 @@ from .writer_head import (
 from .writer_tree import (
     EMPTY_TREE,
     append_piles_awaited,
+    leaf_key,
     reachable_staged_pages,
     validate_extension_awaited,
+    writer_tree_seed,
 )
 
 
@@ -158,25 +162,72 @@ async def _object(store, oid, maximum=MAX_REPOSITORY_OBJECT_BYTES):
     return raw
 
 
-async def _copy_pile_object(store, oid, write):
+async def _copy_pile_object(
+        store, oid, write, maximum=MAX_PILE_BYTES):
     """Copy one pile through the required streaming data plane."""
-    if not valid_fid(oid) or not callable(write):
+    if not valid_fid(oid) or not callable(write) \
+            or type(maximum) is not int \
+            or not 0 < maximum <= MAX_PILE_BYTES:
         raise ValueError("repository pile copy")
     copied = await _maybe_await(
-        store.copy_pile_object(oid, MAX_PILE_BYTES, write))
+        store.copy_pile_object(oid, maximum, write))
     if copied is None:
         return None
-    if type(copied) is not int or not 0 <= copied <= MAX_PILE_BYTES:
+    if type(copied) is not int or not 0 <= copied <= maximum:
         raise ValueError("repository pile copy result")
     return copied
 
 
-async def _pile_object(store, oid):
+async def _pile_object(store, oid, maximum=MAX_PILE_BYTES):
     value = bytearray()
-    copied = await _copy_pile_object(store, oid, value.extend)
+    copied = await _copy_pile_object(
+        store, oid, value.extend, maximum)
     raw = None if copied is None else bytes(value)
     if raw is None or copied != len(raw) or h(raw) != oid:
         raise ValueError("repository pile integrity")
+    return raw
+
+
+async def open_accepted_pile(
+        store, workspace, device, sequence, *, max_bytes=MAX_PILE_BYTES):
+    """Open one original pile through the recipient's current accepted head."""
+    if type(max_bytes) is not int or not 0 < max_bytes <= MAX_PILE_BYTES:
+        raise ValueError("accepted pile byte limit")
+    leaf = leaf_key(sequence)
+    store = async_store(store)
+    key = head_slot_key(workspace, device)
+    opened = await store.read_versioned(key)
+    if not isinstance(opened, Versioned):
+        raise ValueError("accepted writer slot is missing")
+    slot = decode_slot_at(key, opened.value)
+    head_raw = await _object(store, slot.head)
+    decoded = decode_head(head_raw)
+    head = require_bound_head(decoded, WriterBinding(
+        workspace,
+        device,
+        decoded.owner,
+        writer_store_binding(workspace, device),
+    ))
+    if head_oid(head_raw) != slot.head or sequence > head.sequence:
+        raise ValueError("accepted writer head integrity")
+
+    async def fetch(oid):
+        return await _object(store, oid)
+
+    answers, _pages = await merkle_map.get_many_awaited(
+        head.tree.root,
+        writer_tree_seed(workspace, device),
+        (leaf,),
+        fetch,
+        max_page_depth=head.tree.depth,
+        expected_count=head.tree.count,
+        expected_depth=head.tree.depth,
+    )
+    pile_oid = answers[leaf]
+    if not valid_fid(pile_oid):
+        raise ValueError("accepted writer leaf is missing")
+    raw = await _pile_object(store, pile_oid, max_bytes)
+    decode_signed_pile(raw, workspace=workspace, writer=device)
     return raw
 
 
@@ -1043,4 +1094,5 @@ __all__ = (
     "SlotResult",
     "ValidatedBatch",
     "WriterLog",
+    "open_accepted_pile",
 )

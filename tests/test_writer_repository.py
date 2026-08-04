@@ -4,13 +4,20 @@ import asyncio
 import pytest
 
 from core.close import (
+    decode_signed_pile,
     encode_signed_pile,
     make_signed_pile,
     signed_pile_oid,
 )
 from core.crypto import h, keypair
 from core.fact import canon
-from core.limits import MAX_FACT_BYTES, MAX_REPOSITORY_OBJECT_BYTES
+from core.limits import (
+    MAX_AUTHORITY_PILE_BYTES,
+    MAX_FACT_BYTES,
+    MAX_PILE_BYTES,
+    MAX_REPOSITORY_OBJECT_BYTES,
+    PayloadTooLarge,
+)
 from core.object_store import ABSENT
 from core.store import FsStore
 from core.writer_head import (
@@ -31,9 +38,10 @@ from core.writer_repository import (
     OwnerPublisher,
     RepositoryMirror,
     WriterLog,
+    open_accepted_pile,
 )
 from tests.util import mechanical_head_authorizer
-from core.writer_tree import EMPTY_TREE, append_piles
+from core.writer_tree import EMPTY_TREE, WriterTree, append_piles
 from facts.auth.device import device as device_fact
 from facts.auth.head_request import head_request
 from facts.auth.signature import signature as signature_fact
@@ -77,6 +85,200 @@ def binding_for(workspace, public, store_binding):
         return WriterBinding(
             workspace, public, public, store_binding)
     return resolve
+
+
+async def _accepted_history(path, store_type=FsStore):
+    secret, public, root, device_signature, device = world()
+    store = store_type(str(path))
+    binding = writer_store_binding(root.fid, public)
+    log = WriterLog(
+        root.fid, public, public, binding, secret, store)
+    closures = []
+    for timestamp, text in ((10, "first"), (11, "second")):
+        item = message_fact(
+            root.fid, public, "general", text, timestamp)
+        item_signature = signature_fact(
+            secret, public, item, timestamp)
+        closures.append((
+            root, device_signature, device, item_signature, item))
+    update = await log.prepare(closures)
+    await log.establish(update)
+    gate = OpaqueHeadGate(
+        store,
+        mechanical_head_authorizer(root.fid, h(b"authority"), 100),
+    )
+    outcome = await gate.advance(
+        proof_for(
+            secret, public, root, device_signature,
+            device, update.head_oid),
+        update.head_oid,
+    )
+    assert outcome.status == "applied"
+    return store, secret, public, root, update
+
+
+def _install_candidate(
+        path, secret, workspace, device, pile_oid, *,
+        head_secret=None, head_workspace=None, head_device=None, tree=None,
+        pile_raw=None):
+    """Install one hostile mechanically advertised candidate for open tests."""
+    store = FsStore(str(path))
+    if pile_raw is not None:
+        store.put_if_absent("obj/" + pile_oid, pile_raw)
+    if tree is None:
+        pages = {}
+
+        def emit(raw):
+            oid = h(raw)
+            pages[oid] = raw
+            return oid
+
+        tree = append_piles(
+            EMPTY_TREE, workspace, device, (pile_oid,), None, emit)
+        for oid, raw in pages.items():
+            store.put_if_absent("obj/" + oid, raw)
+    candidate = make_head(
+        secret if head_secret is None else head_secret,
+        workspace if head_workspace is None else head_workspace,
+        device if head_device is None else head_device,
+        device,
+        tree.count,
+        tree,
+        writer_store_binding(workspace, device),
+    )
+    raw = encode_head(candidate)
+    oid = head_oid(raw)
+    store.put_if_absent("obj/" + oid, raw)
+    key = head_slot_key(workspace, device)
+    store.cas(key, ABSENT, encode_slot(HeadSlot(
+        workspace, device, oid, h(b"authority"))))
+    return store
+
+
+def test_open_accepted_pile_reads_one_exact_historical_leaf(tmp_path):
+    class PointOnlyStore(FsStore):
+        def __init__(self, root):
+            super().__init__(root)
+            self.pile_reads = []
+
+        def list_page(self, *_args, **_kwargs):
+            raise AssertionError("accepted pile lookup must not LIST")
+
+        def copy_pile_object(self, oid, maximum, write):
+            self.pile_reads.append(oid)
+            return super().copy_pile_object(oid, maximum, write)
+
+    async def scenario():
+        store, _secret, public, root, update = await _accepted_history(
+            tmp_path / "accepted", PointOnlyStore)
+        store.pile_reads.clear()
+
+        raw = await open_accepted_pile(
+            store, root.fid, public, 1)
+
+        assert raw == encode_signed_pile(update.piles[0])
+        assert decode_signed_pile(
+            raw, workspace=root.fid, writer=public) == update.piles[0]
+        assert store.pile_reads == [update.pile_oids[0]]
+
+    run(scenario())
+
+
+def test_open_accepted_pile_rejects_forged_identity_and_sequence(tmp_path):
+    async def scenario():
+        store, _secret, public, root, _update = await _accepted_history(
+            tmp_path / "accepted")
+        for workspace, device, sequence in (
+                (h(b"other workspace"), public, 1),
+                (root.fid, h(b"other device"), 1),
+                (root.fid, public, 0),
+                (root.fid, public, 3)):
+            with pytest.raises(ValueError):
+                await open_accepted_pile(
+                    store, workspace, device, sequence)
+
+    run(scenario())
+
+
+def test_open_accepted_pile_authenticates_head_tree_oid_and_outer_pile(
+        tmp_path):
+    async def scenario():
+        secret, public, root, device_signature, device = world()
+        good = encode_signed_pile(make_signed_pile(
+            secret, root.fid, public,
+            (root, device_signature, device)))
+        good_oid = signed_pile_oid(good)
+
+        attacker_secret, attacker = keypair()
+        forged_head = _install_candidate(
+            tmp_path / "head", secret, root.fid, public, good_oid,
+            head_secret=attacker_secret, pile_raw=good)
+        with pytest.raises(ValueError, match="authority binding"):
+            await open_accepted_pile(
+                forged_head, root.fid, public, 1)
+
+        for name, fields in (
+                ("workspace", {"head_workspace": h(b"other workspace")}),
+                ("device", {"head_device": attacker})):
+            rebound_head = _install_candidate(
+                tmp_path / name, secret, root.fid, public, good_oid,
+                pile_raw=good, **fields)
+            with pytest.raises(ValueError, match="authority binding"):
+                await open_accepted_pile(
+                    rebound_head, root.fid, public, 1)
+
+        missing_tree = _install_candidate(
+            tmp_path / "tree", secret, root.fid, public, good_oid,
+            tree=WriterTree(h(b"missing tree"), 1, 1), pile_raw=good)
+        with pytest.raises(ValueError, match="object integrity"):
+            await open_accepted_pile(
+                missing_tree, root.fid, public, 1)
+
+        missing_oid = _install_candidate(
+            tmp_path / "oid", secret, root.fid, public,
+            h(b"missing pile"))
+        with pytest.raises(ValueError, match="pile integrity"):
+            await open_accepted_pile(
+                missing_oid, root.fid, public, 1)
+
+        hostile = encode_signed_pile(make_signed_pile(
+            attacker_secret, root.fid, attacker,
+            (root, device_signature, device)))
+        hostile_oid = signed_pile_oid(hostile)
+        forged_pile = _install_candidate(
+            tmp_path / "pile", secret, root.fid, public,
+            hostile_oid, pile_raw=hostile)
+        with pytest.raises(ValueError, match="signed pile binding"):
+            await open_accepted_pile(
+                forged_pile, root.fid, public, 1)
+
+    run(scenario())
+
+
+def test_open_accepted_pile_enforces_the_explicit_streaming_byte_bound(
+        tmp_path):
+    async def scenario():
+        store, _secret, public, root, update = await _accepted_history(
+            tmp_path / "accepted")
+        raw = encode_signed_pile(update.piles[0])
+
+        assert await open_accepted_pile(
+            store, root.fid, public, 1,
+            max_bytes=len(raw)) == raw
+        assert await open_accepted_pile(
+            store, root.fid, public, 1,
+            max_bytes=MAX_AUTHORITY_PILE_BYTES) == raw
+
+        with pytest.raises(PayloadTooLarge, match="exceeds byte limit"):
+            await open_accepted_pile(
+                store, root.fid, public, 1,
+                max_bytes=len(raw) - 1)
+        with pytest.raises(ValueError, match="byte limit"):
+            await open_accepted_pile(
+                store, root.fid, public, 1,
+                max_bytes=MAX_PILE_BYTES + 1)
+
+    run(scenario())
 
 
 def test_writer_binding_proof_reads_current_form_offers(monkeypatch):
