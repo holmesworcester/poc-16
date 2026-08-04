@@ -95,11 +95,25 @@ def test_fs_put_if_absent_is_one_atomic_immutable_create(tmp_path):
         stores[1].put_if_absent("obj/" + "0" * 64, raw)
 
 
+@pytest.mark.parametrize("key", ("root", "root/old", ".root.lock"))
+def test_removed_root_namespace_stays_reserved(tmp_path, key):
+    store = FsStore(str(tmp_path))
+
+    with pytest.raises(ValueError, match="reserved key"):
+        store.put(key, b"obsolete")
+    with pytest.raises(ValueError, match="reserved key"):
+        store.put_if_absent(key, b"obsolete")
+    with pytest.raises(ValueError, match="reserved key"):
+        store.get(key)
+    with pytest.raises(ValueError, match="reserved key"):
+        store.delete(key)
+
+
 def test_fs_get_bounded_never_accepts_a_whole_oversized_value(
         tmp_path, monkeypatch):
     store = FsStore(str(tmp_path))
     store.put("pile/member/value", b"12345")
-    store.cas("root", ABSENT, b"root")
+    store.cas("authority", ABSENT, b"authority")
 
     assert store.get_bounded("pile/member/value", 5) == b"12345"
     assert store.get_bounded("pile/member/missing", 5) is None
@@ -115,7 +129,7 @@ def test_fs_get_bounded_never_accepts_a_whole_oversized_value(
         lambda _key: pytest.fail("bounded read called whole-object get"),
     )
     assert store.get_bounded("pile/member/value", 5) == b"12345"
-    assert store.read_versioned("root").value == b"root"
+    assert store.read_versioned("authority").value == b"authority"
 
 
 def test_immutable_create_reconciles_ambiguity_and_verifies_collision():
@@ -179,33 +193,33 @@ def test_verified_repository_object_enforces_the_hosted_reader_ceiling():
         verified_object(h(oversized), lambda _oid: oversized)
 
 
-def test_fs_root_cas_lock_is_shared_by_independent_handles(tmp_path):
+def test_fs_cas_lock_is_shared_by_independent_handles(tmp_path):
     first, second = FsStore(str(tmp_path)), FsStore(str(tmp_path))
-    result = first.cas("root", ABSENT, b"base")
+    result = first.cas("authority", ABSENT, b"base")
     assert result == Applied(VersionToken(h(b"base")))
-    base = first.read_versioned("root").token
+    base = first.read_versioned("authority").token
 
     # Holding the bucket's stable lock prevents another handle from even
-    # comparing the root. This distinguishes a shared CAS from two per-object
+    # comparing the cell. This distinguishes a shared CAS from two per-object
     # Python locks without relying on a lucky thread race.
-    with open(first._root_lock, "a+b") as held, \
+    with open(first._cas_lock, "a+b") as held, \
             ThreadPoolExecutor(max_workers=1) as pool:
         fcntl.flock(held, fcntl.LOCK_EX)
         with pytest.raises(ValueError, match="reserved"):
-            first.delete(".root.lock")
+            first.delete(".cas.lock")
         attempt = pool.submit(
-            second.cas, "root", base, b"after-lock")
+            second.cas, "authority", base, b"after-lock")
         with pytest.raises(TimeoutError):
             attempt.result(timeout=0.1)
         fcntl.flock(held, fcntl.LOCK_UN)
         assert isinstance(attempt.result(timeout=5), Applied)
 
-    expected = first.read_versioned("root").token
+    expected = first.read_versioned("authority").token
     start = threading.Barrier(2)
 
     def advance(store, value):
         start.wait(timeout=5)
-        return store.cas("root", expected, value)
+        return store.cas("authority", expected, value)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = [
@@ -217,23 +231,23 @@ def test_fs_root_cas_lock_is_shared_by_independent_handles(tmp_path):
         ]
     assert sum(isinstance(result, Applied) for result in results) == 1
     assert sum(result is STALE for result in results) == 1
-    assert first.get("root") in {b"alice", b"bob"}
-    assert ".root.lock" not in first.list("")
+    assert first.get("authority") in {b"alice", b"bob"}
+    assert ".cas.lock" not in first.list("")
     for key in (
-            ".root.lock", ".root.lock/child", "./.root.lock",
-            "root/child", "/outside", "../outside"):
+            ".cas.lock", ".cas.lock/child", "./.cas.lock",
+            "authority/child", "/outside", "../outside"):
         with pytest.raises(ValueError, match="key"):
             first.put(key, b"clobber")
     with pytest.raises(ValueError, match="CAS register"):
         first.cas("obj/" + h(b"x"), ABSENT, b"x")
     with pytest.raises(ValueError, match="conditional"):
-        first.put("root", b"clobber")
+        first.put("authority", b"clobber")
     with pytest.raises(ValueError, match="compare-and-swap"):
-        first.put_if_absent("root", b"clobber")
+        first.put_if_absent("authority", b"clobber")
     with pytest.raises(ValueError, match="conditional"):
         first.put("obj/" + h(b"x"), b"x")
     with pytest.raises(ValueError, match="not deletable"):
-        first.delete("root")
+        first.delete("authority")
     with pytest.raises(ValueError, match="not deletable"):
         first.delete("obj/" + h(b"x"))
 
@@ -284,7 +298,7 @@ def test_remote_store_object_existence_maps_http_missing_to_false():
     assert asyncio.run(store.has("obj/" + h(body)))
     assert not asyncio.run(store.has("obj/" + h(b"missing")))
     with pytest.raises(TypeError, match="object-only"):
-        asyncio.run(store.has("root"))
+        asyncio.run(store.has("authority"))
 
 
 def test_remote_store_batches_object_gets_in_bounded_order():
@@ -421,10 +435,11 @@ def test_peer_caps_an_untrusted_response_while_streaming(monkeypatch):
             return b"x" * count
 
     monkeypatch.setattr(
-        walk.urllib.request, "urlopen",
+        walk._DIRECT_OPENER, "open",
         lambda *_args, **_kwargs: Response())
     peer = object.__new__(WalkPeer)
-    peer.url, peer.ws, peer.cache = "https://peer", "workspace", {}
+    peer.url, peer.ws = "https://peer", "workspace"
+    peer._token = peer._sync_profile = None
 
     with pytest.raises(ValueError, match="response too large"):
         peer._http(
@@ -448,11 +463,12 @@ def test_remote_bounded_read_drives_the_peer_stream_limit(monkeypatch):
             return b"x" * count
 
     monkeypatch.setattr(
-        walk.urllib.request, "urlopen",
+        walk._DIRECT_OPENER, "open",
         lambda *_args, **_kwargs: Response())
     peer = object.__new__(WalkPeer)
     peer.url, peer.ws = "https://peer", "workspace"
-    peer.cache = {"token": "already-minted"}
+    peer._token = "already-minted"
+    peer._sync_profile = None
 
     with pytest.raises(ValueError, match="response too large"):
         asyncio.run(RemoteStore(peer).get_bounded("obj/" + "a" * 64, 8))

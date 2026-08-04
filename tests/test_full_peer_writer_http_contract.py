@@ -1,6 +1,6 @@
 """Real-socket contract for the FullPeer per-writer forest.
 
-This intentionally names only the target writer protocol.  The predecessor
+This intentionally names only the running writer protocol.  The predecessor
 ``/root``, ``/page``, ``/pile``, and RepositoryApplier surfaces are not valid
 fallbacks for these tests.
 """
@@ -13,9 +13,11 @@ from pathlib import Path
 import threading
 import time
 from http.server import ThreadingHTTPServer
+import urllib.error
 from urllib.parse import urlencode, urlsplit
 
 import facts
+import pytest
 
 from core import peer_capability
 from core.authority import AuthorityRepository
@@ -23,7 +25,7 @@ from core.crypto import h, keypair
 from core.fact import canon
 from core.grants import make_token
 from core.limits import MAX_FACT_BYTES, MAX_OBJECT_BYTES
-from core.object_store import ABSENT, CREATED, Versioned
+from core.object_store import ABSENT, AUTHORITY_ROOT_KEY, CREATED, Versioned
 from core.store import FsStore, RemoteStore
 from core.writer_head import decode_slot_at, head_slot_key
 from core.writer_repository import OpaqueHeadGate, RepositoryMirror
@@ -154,8 +156,6 @@ class _HostedEndpoint:
     def __init__(self, node, workspace, url, store, authority):
         self.node = node
         self.ws = workspace
-        self.cache = node.sync_state(workspace, url)
-        self.cache["sync_profile"] = peer_capability.OWNER
         self.store = store
         self.authority = authority
         self._opened = None
@@ -169,12 +169,6 @@ class _HostedEndpoint:
     @property
     def accepts_owner_publish(self):
         return True
-
-    def publish_authority(self, raw):
-        result = _run(self.authority.publish(raw))
-        if result.status not in {"applied", "noop"}:
-            raise ValueError("hosted authority publication")
-        return 201 if result.status == "applied" else 204
 
     def heads(self, cursor=None, limit=256):
         page = self.store.list_page(
@@ -494,16 +488,14 @@ def test_bundled_head_page_isolates_one_oversized_slot(tmp_path):
 
     with _serve(alice) as (url, secret):
         remote = Peer(carol, workspace, url)
-        remote.cache.update({
-            "sync_profile": "sync-v1/full",
-            "token": make_token(
-                secret,
-                carol.member,
-                workspace,
-                issued_at=int(time.time() * 1000),
-                ttl_ms=60_000,
-            ),
-        })
+        remote._sync_profile = "sync-v1/full"
+        remote._token = make_token(
+            secret,
+            carol.member,
+            workspace,
+            issued_at=int(time.time() * 1000),
+            ttl_ms=60_000,
+        )
         result = _run(carol.mirror(workspace).sync_from(
             RemoteStore(remote)))
 
@@ -535,16 +527,14 @@ def test_reverse_noop_reuses_the_directory_tops_from_the_pull(tmp_path):
                 return super()._http(*args, **kwargs)
 
         peer = CountingPeer(carol, workspace, url)
-        peer.cache.update({
-            "sync_profile": "sync-v1/full",
-            "token": make_token(
-                secret,
-                carol.member,
-                workspace,
-                issued_at=int(time.time() * 1000),
-                ttl_ms=60_000,
-            ),
-        })
+        peer._sync_profile = "sync-v1/full"
+        peer._token = make_token(
+            secret,
+            carol.member,
+            workspace,
+            issued_at=int(time.time() * 1000),
+            ttl_ms=60_000,
+        )
         remote = RemoteStore(peer)
         pulled = _run(carol.mirror(workspace).sync_from(remote))
         assert pulled.errors == ()
@@ -583,8 +573,49 @@ def test_read_only_peer_pulls_writer_forest_without_any_reverse_put(
     assert "from bob" not in _messages(alice, workspace)
     assert requests
     assert not [request for request in requests if request[0] == "PUT"]
-    assert bob.sync_state(workspace, url)["sync_profile"] \
-        == peer_capability.READ_ONLY
+    assert not [request for request in requests if request[1] == "/authority"]
+    assert not hasattr(bob, "sync_cache")
+
+
+def test_each_sync_turn_mints_fresh_and_never_publishes_authority(
+        tmp_path, monkeypatch):
+    workspace, alice, bob, _carol = _forest_fixture(tmp_path)
+    requests = []
+
+    class CountingPeer(Peer):
+        def _http(self, method, path, *args, **kwargs):
+            requests.append((method, path))
+            return super()._http(method, path, *args, **kwargs)
+
+    monkeypatch.setattr(sync_module, "Peer", CountingPeer)
+    with _serve(alice) as (url, _secret):
+        sync_module.sync(bob, workspace, url)
+        sync_module.sync(bob, workspace, url)
+
+    assert requests.count(("POST", "/mint")) == 2
+    assert not [request for request in requests if request[1] == "/authority"]
+
+
+def test_lost_remote_authority_fails_without_a_recovery_state_machine(
+        tmp_path):
+    workspace, _alice, bob, _carol = _forest_fixture(tmp_path)
+    calls = []
+
+    def reject(method, path, *_args, **_kwargs):
+        calls.append((method, path))
+        raise urllib.error.HTTPError(
+            "http://lost/mint", 403, "unknown member", {}, None)
+
+    peer = Peer(bob, workspace, "http://lost")
+    peer._http = reject
+    with pytest.raises(urllib.error.HTTPError) as denied:
+        peer.mint()
+
+    assert denied.value.code == 403
+    assert calls == [("POST", "/mint")]
+    assert peer._token is peer._sync_profile is None
+    assert not hasattr(peer, "authority_recover")
+    assert not hasattr(peer, "publish_authority")
 
 
 def test_hosted_mode_pulls_all_writers_but_publishes_only_the_dialer(
@@ -597,6 +628,15 @@ def test_hosted_mode_pulls_all_writers_but_publishes_only_the_dialer(
     assert mirrored.errors == ()
 
     cloud = FsStore(str(tmp_path / "hosted-cloud"))
+    # Provider enrollment is a separate authority-plane operation.  Seed the
+    # disposable hosted fixture explicitly; an ordinary content sync must not
+    # mutate this repository as a side effect.
+    for key in alice.store(workspace).list("obj/"):
+        cloud.put_if_absent(key, alice.store(workspace).get(key))
+    authority_value = alice.store(workspace).read_versioned(
+        AUTHORITY_ROOT_KEY)
+    assert isinstance(authority_value, Versioned)
+    cloud.cas(AUTHORITY_ROOT_KEY, ABSENT, authority_value.value)
     authority = AuthorityRepository(workspace, cloud)
     url = "memory://hosted-owner-cloud"
 
@@ -606,6 +646,12 @@ def test_hosted_mode_pulls_all_writers_but_publishes_only_the_dialer(
             node, workspace, url, cloud, authority)
 
     monkeypatch.setattr(sync_module, "Peer", endpoint)
+
+    def no_retained_authority(*_args, **_kwargs):
+        raise AssertionError(
+            "owner publication must derive its binding from validated SQL")
+
+    monkeypatch.setattr(alice, "authority", no_retained_authority)
 
     assert sync_module.sync(alice, workspace, url)[1] >= 1
     assert cloud.list(f"heads/{workspace}") == [

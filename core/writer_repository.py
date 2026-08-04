@@ -684,7 +684,7 @@ class RepositoryMirror:
 
     def __init__(
             self, workspace, store, binding_for, consumer,
-            *, current_binding_for=None, authority_publish=None):
+            *, current_binding_for=None):
         consumer_ok = consumer is None or (
             getattr(consumer, "workspace", None) == workspace
             and all(callable(getattr(consumer, method, None))
@@ -693,8 +693,6 @@ class RepositoryMirror:
         )
         if not valid_fid(workspace) or not callable(binding_for) \
                 or not consumer_ok \
-                or authority_publish is not None \
-                and (consumer is None or not callable(authority_publish)) \
                 or current_binding_for is not None \
                 and not callable(current_binding_for):
             raise ValueError("repository mirror")
@@ -703,14 +701,6 @@ class RepositoryMirror:
         self.binding_for = binding_for
         self.current_binding_for = current_binding_for or binding_for
         self.consumer = consumer
-        self.authority_publish = authority_publish
-
-    async def _publish_authority(self, pile_values):
-        """Offer already-validated original piles to the authority repository."""
-        if self.authority_publish is None:
-            return
-        for _oid, raw in pile_values:
-            await _maybe_await(self.authority_publish(raw))
 
     async def _binding(
             self, workspace, device, authority_root, head, *, current=False):
@@ -823,12 +813,11 @@ class RepositoryMirror:
                 ((raw, device) for _oid, raw in pile_values),
                 owner=candidate.owner,
             )
-        await self._publish_authority(pile_values)
         if bootstrapping:
-            current_binding = await self._binding(
-                workspace, device, slot.authority_root, decoded_candidate,
-                current=True)
-            if current_binding != binding:
+            # No auxiliary authority publication may make an incoming head
+            # valid.  The consumer just proved the exact member/device binding
+            # from every independently closed pile in the candidate suffix.
+            if self.consumer is None:
                 raise ValueError("unknown writer binding")
         for pile_oid, raw in pile_values:
             await ensure_pile_async(self.store, pile_oid, raw)
@@ -907,7 +896,6 @@ class RepositoryMirror:
             ((raw, device) for _oid, raw in pile_values),
             owner=candidate.owner,
         )
-        await self._publish_authority(pile_values)
         facts = self.consumer.commit(
             batch, device=device, head=slot.head)
         return len(additions), len(facts)

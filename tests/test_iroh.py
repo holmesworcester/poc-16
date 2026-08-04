@@ -28,7 +28,6 @@ from core.limits import (
 )
 from core.pack_access import MAX_OBJECT_OPEN_BYTES
 from facts.auth import request
-from full_peer import walk as walk_module
 from full_peer.daemon import FullPeerService
 from full_peer.iroh_forwarders import IrohForwarders
 from full_peer.iroh_process import STOP_SECONDS
@@ -1242,7 +1241,7 @@ def test_four_supervised_full_peers_gossip_independent_writers_over_iroh(
             )
 
 
-def test_changed_private_iroh_urls_discard_each_superseded_sync_walk(tmp_path):
+def test_changed_private_iroh_urls_need_no_retained_sync_walk(tmp_path):
     class CyclingForwarders:
         def __init__(self):
             self.urls = iter([
@@ -1262,33 +1261,15 @@ def test_changed_private_iroh_urls_discard_each_superseded_sync_walk(tmp_path):
     peer = iroh_peer("b" * 64, "B")
     node.add_workspace(workspace, "workspace", [peer])
     node.use_iroh(iroh_peer("c" * 64, "C"), CyclingForwarders())
-    url = node.resolve_peer(workspace, peer)
-    unrelated = {"keep": True}
-    node.sync_cache[("d" * 64, "http://127.0.0.1:49999")] = unrelated
-
-    for expected in (
-            "http://127.0.0.1:41002",
-            "http://127.0.0.1:41003"):
-        superseded = {"walk": object()}
-        node.sync_cache[(workspace, url)] = superseded
-        url = node.resolve_peer(workspace, peer)
-        assert url == expected
-        assert "walk" in superseded
-        assert (workspace, url) not in node.sync_cache
-
-    current = {"current": True}
-    node.sync_cache[(workspace, url)] = current
-    assert [
-        key for key in node.sync_cache if key[0] == workspace
-    ] == [(workspace, "http://127.0.0.1:41003")]
-    assert node.sync_cache == {
-        (workspace, "http://127.0.0.1:41003"): current,
-        ("d" * 64, "http://127.0.0.1:49999"): unrelated,
-    }
+    assert [node.resolve_peer(workspace, peer) for _ in range(3)] == [
+        "http://127.0.0.1:41001",
+        "http://127.0.0.1:41002",
+        "http://127.0.0.1:41003",
+    ]
+    assert not hasattr(node, "sync_cache")
 
 
-def test_set_and_remove_detach_cache_without_mutating_an_active_http_walk(
-        tmp_path, monkeypatch):
+def test_set_and_remove_leave_only_an_inflight_peers_turn_state(tmp_path):
     private_url = "http://127.0.0.1:41001"
 
     class StaticForwarders:
@@ -1298,76 +1279,27 @@ def test_set_and_remove_detach_cache_without_mutating_an_active_http_walk(
         def resolve(self, workspace, peer):
             return private_url
 
-    class Response:
-        status = 200
-        headers = {}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            pass
-
-        def read(self, _maximum):
-            return b'{"cursor":null,"heads":[]}'
-
-    class BarrierCache(dict):
-        def __init__(self):
-            super().__init__(token="ordinary-grant")
-            self.entered = threading.Event()
-            self.resume = threading.Event()
-
-        def __contains__(self, key):
-            present = super().__contains__(key)
-            if key == "token":
-                self.entered.set()
-                if not self.resume.wait(5):
-                    raise TimeoutError("cache race barrier")
-            return present
-
-    monkeypatch.setattr(
-        walk_module.urllib.request,
-        "urlopen",
-        lambda *_args, **_kwargs: Response(),
-    )
     node = FullPeer(str(tmp_path / "peer"))
     workspace = "a" * 64
     endpoint = "b" * 64
     peer = iroh_peer(endpoint, "A")
     node.add_workspace(workspace, "workspace", [peer])
     node.use_iroh(iroh_peer("c" * 64, "C"), StaticForwarders())
+    url = node.resolve_peer(workspace, peer)
+    client = Peer(node, workspace, url)
+    client._token = "ordinary-grant"
+    client._sync_profile = "sync-v1/full"
 
-    def race(configured_peer, edit):
-        url = node.resolve_peer(workspace, configured_peer)
-        cache = BarrierCache()
-        with node.lock:
-            node.sync_cache[(workspace, url)] = cache
-        client = Peer(node, workspace, url)
-        errors = []
-        thread = threading.Thread(
-            target=lambda: _capture_error(
-                errors,
-                lambda: client.heads(limit=1),
-            ),
-        )
-        thread.start()
-        assert cache.entered.wait(5)
-        try:
-            edit()
-        finally:
-            cache.resume.set()
-        thread.join(5)
-
-        assert not thread.is_alive()
-        assert errors == []
-        assert cache == {"token": "ordinary-grant"}
-        assert (workspace, url) not in node.sync_cache
-        assert Peer(node, workspace, url).cache is not cache
-        node._evict_sync_cache(workspace, url)
-
-    race(peer, lambda: node.set_iroh_peer(workspace, endpoint, "B"))
+    node.set_iroh_peer(workspace, endpoint, "B")
+    assert (client._token, client._sync_profile) == (
+        "ordinary-grant", "sync-v1/full")
     replacement = node.keyring["workspaces"][workspace]["peers"][0]
-    race(replacement, lambda: node.remove_iroh_peer(workspace, endpoint))
+    fresh = Peer(node, workspace, node.resolve_peer(workspace, replacement))
+    assert fresh._token is fresh._sync_profile is None
+
+    node.remove_iroh_peer(workspace, endpoint)
+    assert (client._token, client._sync_profile) == (
+        "ordinary-grant", "sync-v1/full")
 
 
 def test_outbound_startup_is_bounded_cancelled_and_reaped_on_close(tmp_path):

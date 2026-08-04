@@ -13,6 +13,7 @@ from full_peer.keychain import (
 )
 from full_peer import keychain as keychain_module
 from full_peer.node import FullPeer, now_ms
+from full_peer.walk import Peer
 
 from .util import add_member
 
@@ -220,21 +221,20 @@ def test_commands_author_with_the_workspace_bound_identity(tmp_path):
     assert facts.content.message.messages(node, workspace)[-1]["text"] == "from the bound device"
 
 
-def test_rebinding_a_workspace_invalidates_its_cached_peer_grants(tmp_path):
+def test_rebinding_a_workspace_has_no_retained_peer_grants(tmp_path):
     node = FullPeer(str(tmp_path / "rebind"))
     workspace = facts.auth.workspace.create(node, "alice")
-    other_workspace = "f" * 64
     replacement = node.keychain.add_identity()
-    stale = {"token": "minted-for-old-identity", "etag": "old"}
-    unrelated = {"token": "keep"}
-    node.sync_cache[(workspace, "http://peer-a")] = stale
-    node.sync_cache[(other_workspace, "http://peer-b")] = unrelated
+    in_flight = Peer(node, workspace, "http://peer-a")
+    in_flight._token = "minted-for-old-identity"
+    in_flight._sync_profile = "sync-v1/full"
 
     node.bind_identity(workspace, replacement)
 
-    assert stale == {"token": "minted-for-old-identity", "etag": "old"}
-    assert (workspace, "http://peer-a") not in node.sync_cache
-    assert node.sync_cache[(other_workspace, "http://peer-b")] is unrelated
+    assert in_flight._token == "minted-for-old-identity"
+    fresh = Peer(node, workspace, "http://peer-a")
+    assert fresh._token is fresh._sync_profile is None
+    assert not hasattr(node, "sync_cache")
 
 
 def test_publish_fails_closed_if_workspace_identity_changes_mid_command(tmp_path):

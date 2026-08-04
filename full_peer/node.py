@@ -1,6 +1,5 @@
 """Stateful peer composition over the complete database-free writer core."""
 import asyncio
-from dataclasses import asdict
 import os
 import threading
 import time
@@ -8,9 +7,10 @@ import time
 import facts
 
 from core import fact_index
-from core.close import decode_signed_pile, encode_signed_pile, make_signed_pile
+from core.close import encode_signed_pile, make_signed_pile
 from core.fact import Fact
 from core.authority import AuthorityRepository, authority_resident
+from core.limits import MAX_MINT_FETCHES, MAX_MINT_FETCH_BYTES
 from core.store import FsStore
 from core.writer_head import WriterBinding, writer_store_binding
 from core.writer_repository import (
@@ -21,7 +21,6 @@ from core.writer_repository import (
 )
 from facts.auth.head_request import head_request
 from facts.auth.signature import signature as signature_fact
-from full_peer.upload_journal import UploadSource
 
 from . import bao_native, sql_store
 from .keychain import (
@@ -59,7 +58,6 @@ class FullPeer:
         self._stores, self._sql, self._senders = {}, {}, {}
         self._consumers, self._mirrors, self._writers = {}, {}, {}
         self._authorities = {}
-        self.sync_cache = {}  # (ws, peer_url) -> walk state
         self._iroh_peer_urls = {}  # (ws, endpoint) -> disposable loopback URL
         self._sync_errors = {}
         for ws in self.workspaces():
@@ -123,7 +121,6 @@ class FullPeer:
                     self.writer_binding,
                     self.consumer(workspace),
                     current_binding_for=self.current_writer_binding,
-                    authority_publish=self._consume_authority,
                 )
             return self._mirrors[workspace]
 
@@ -134,27 +131,6 @@ class FullPeer:
                 self._authorities[workspace] = AuthorityRepository(
                     workspace, self.store(workspace))
             return self._authorities[workspace]
-
-    async def _consume_authority(self, raw):
-        """Join one authority-only signed pile; ignore ordinary content piles."""
-        try:
-            pile = decode_signed_pile(raw)
-            if not pile.facts or any(
-                    facts.family_for(fact.t) is None
-                    or facts.family_for(fact.t).DURABLE
-                    and not authority_resident(fact)
-                    for fact in pile.facts):
-                return None
-        except Exception:
-            return None
-        repository = self.authority(pile.workspace)
-        for _ in range(8):
-            result = await repository.publish(raw)
-            if result.status in {"applied", "noop"}:
-                return result
-            if result.status != "retryable":
-                raise ValueError("authority publication rejected")
-        raise RuntimeError("authority publication contention")
 
     def add_workspace(self, workspace, name, peers, identity=None):
         """Record the locally trusted anchor before its first pile is opened."""
@@ -178,7 +154,6 @@ class FullPeer:
                 "peers": peers, "name": name,
                 "identity": identity}
             self._save_workspace(workspace, entry)
-            self._evict_sync_cache(workspace)
             self._forget_iroh_workspace(workspace)
             self._peers_changed()
 
@@ -212,46 +187,6 @@ class FullPeer:
     def attachment_io(self):
         return bao_native
 
-    def create_upload(self, workspace, pile):
-        return UploadSource.create(
-            os.path.join(self.dir, "uploads"),
-            workspace,
-            self.member_for(workspace),
-            pile,
-        )
-
-    def load_upload(self, upload_id):
-        return UploadSource.load(
-            os.path.join(self.dir, "uploads", upload_id))
-
-    def upload_status(self, workspace, cursor=None):
-        """Return one bounded page of local delivery state, never publication."""
-        page = UploadSource.discover(
-            os.path.join(self.dir, "uploads"), self.now_ms(), cursor)
-        return {
-            "cursor": page.cursor,
-            "uploads": [
-                asdict(status)
-                for status in page.uploads
-                if status.workspace == workspace
-            ],
-        }
-
-    def abandon_upload(self, workspace, upload_id):
-        source = self.load_upload(upload_id)
-        if source.workspace != workspace:
-            raise ValueError("upload source workspace")
-        return asdict(source.abandon(self.now_ms()))
-
-    def collect_upload(self, workspace, upload_id):
-        return UploadSource.collect(
-            os.path.join(self.dir, "uploads"),
-            workspace, upload_id, self.now_ms())
-
-    def run_upload(self, source, broker_url, provider_origin, proof):
-        from full_peer.upload_client_http import run_http
-        return run_http(source, broker_url, provider_origin, proof)
-
     def resolve_peer(self, workspace, peer):
         """Resolve local reachability; callers still use the ordinary HTTP client."""
         peer = normalize_peer(peer)
@@ -264,9 +199,6 @@ class FullPeer:
         url = self._forwarders.resolve(workspace, peer)
         key = workspace, peer["endpoint"]
         with self.lock:
-            previous = self._iroh_peer_urls.get(key)
-            if previous is not None and previous != url:
-                self._evict_sync_cache(workspace, previous)
             self._iroh_peer_urls[key] = url
         return url
 
@@ -334,28 +266,10 @@ class FullPeer:
     def bind_identity(self, workspace, identity):
         with self.lock:
             self.keychain.bind(workspace, identity)
-            self._evict_sync_cache(workspace)
-
-    def _evict_sync_cache(self, workspace, url=None):
-        """Detach reachability state without mutating an in-flight walk."""
-        with self.lock:
-            for key in [
-                key for key in self.sync_cache
-                if key[0] == workspace
-                and (url is None or key[1] == url)
-            ]:
-                self.sync_cache.pop(key)
-
-    def sync_state(self, workspace, url):
-        """Acquire one walk state at the same lock boundary used for eviction."""
-        with self.lock:
-            return self.sync_cache.setdefault((workspace, url), {})
 
     def _forget_iroh_peer(self, workspace, endpoint):
         with self.lock:
-            previous = self._iroh_peer_urls.pop((workspace, endpoint), None)
-            if previous is not None:
-                self._evict_sync_cache(workspace, previous)
+            self._iroh_peer_urls.pop((workspace, endpoint), None)
 
     def _forget_iroh_workspace(self, workspace):
         with self.lock:
@@ -449,18 +363,57 @@ class FullPeer:
     def ingest_new(self, ws, news, deps_new, *, owner=None):
         return self.sender(ws).send(news, deps_new, owner=owner)
 
+    def _projected_writer_binding(self, workspace, device, owner=None):
+        """Read one live writer identity from already-validated local facts."""
+        projection = self.sql(workspace)
+        owners = {
+            offered_owner
+            for fact in projection.indexed("member", device)
+            if not projection.suppresses(fact)
+            for name, key, offered_owner in fact.offers()
+            if name == "member" and key == device and offered_owner
+            and (owner is None or offered_owner == owner)
+        }
+        if len(owners) > 1:
+            raise ValueError("ambiguous writer ownership")
+        if not owners:
+            return None
+        selected = next(iter(owners))
+        if device != selected and not any(
+                not projection.suppresses(fact)
+                and ("device_key", device, selected) in fact.offers()
+                for fact in projection.indexed(
+                    "device_key", device, selected)):
+            return None
+        return WriterBinding(
+            workspace,
+            device,
+            selected,
+            writer_store_binding(workspace, device),
+        )
+
     async def writer_binding(
-            self, workspace, device, authority_root, candidate):
-        """Resolve one already-accepted head at its recorded authority pin."""
+            self, workspace, device, _authority_root, candidate):
+        """Resolve an accepted writer from the validated local projection."""
         owner = None if candidate is None else candidate.owner
-        return await self.authority(workspace).writer_binding_at(
-            authority_root, device, owner)
+        with self.lock:
+            return self._projected_writer_binding(
+                workspace, device, owner)
 
     async def current_writer_binding(
             self, workspace, device, _authority_root, candidate):
-        """Resolve an incoming head only through current authenticated state."""
+        """Resolve an incoming head through current validated local facts."""
         owner = None if candidate is None else candidate.owner
-        return await self.authority(workspace).writer_binding(device, owner)
+        with self.lock:
+            return self._projected_writer_binding(
+                workspace, device, owner)
+
+    def local_writer_binding(self, workspace):
+        """Return this peer's live owner binding for one publication turn."""
+        with self.lock:
+            self._ensure_projection(workspace)
+            _secret, device = self.identity(workspace)
+            return self._projected_writer_binding(workspace, device)
 
     def _writer(self, workspace, owner):
         secret, device = self.identity(workspace)
@@ -566,36 +519,6 @@ class FullPeer:
         return encode_signed_pile(make_signed_pile(
             secret, workspace, device, authority))
 
-    def authority_publication(self, workspace):
-        """Reclose current durable authority for idempotent peer bootstrap.
-
-        The authority repository stores facts, not historical validation
-        paths.  A stateful peer can therefore rebuild one ordinary closed
-        pile from its disposable projection whenever a peer needs bootstrap
-        or retry; no upload journal or admission witness is required.
-        """
-        with self.lock:
-            self._ensure_projection(workspace)
-            pin = _run_core(self.authority(workspace).pin())
-            if pin is None:
-                raise ValueError("workspace has no authority root")
-            projection = self.sql(workspace)
-            current = tuple(sorted(
-                (
-                    fact
-                    for fid in projection.fact_ids()
-                    if (fact := projection.fact_of(fid)) is not None
-                    and authority_resident(fact)
-                ),
-                key=lambda fact: (fact.key, fact.fid),
-            ))
-            if not current:
-                raise ValueError("workspace has no authority facts")
-            closed = self.sender(workspace).close(current, {})
-            if any(not authority_resident(fact) for fact in closed):
-                raise ValueError("authority closure escaped its repository")
-            return pin.root_oid, self.sender(workspace).pack(closed)
-
     def publish_closed(self, workspace, closures, *, owner=None):
         """Publish and consume one batch through the same core as a pull."""
         closures = tuple(tuple(closure) for closure in closures)
@@ -603,8 +526,8 @@ class FullPeer:
             return []
         with self.lock:
             _secret, device = self.identity(workspace)
-            binding = _run_core(
-                self.authority(workspace).writer_binding(device))
+            binding = self._projected_writer_binding(
+                workspace, device)
             if owner is not None:
                 if binding is not None and binding.owner != owner:
                     raise ValueError("publishing identity owner mismatch")
@@ -645,9 +568,18 @@ class FullPeer:
                 )
             )
 
-            async def publish_authority():
+            async def join_local_authority():
                 for raw in publications:
-                    await self._consume_authority(raw)
+                    for _ in range(8):
+                        result = await authority_repository.publish(raw)
+                        if result.status in {"applied", "noop"}:
+                            break
+                        if result.status != "retryable":
+                            raise ValueError(
+                                "authority publication rejected")
+                    else:
+                        raise RuntimeError(
+                            "authority publication contention")
 
             async def authorize(raw, proposed):
                 return await authority_repository.authorize_head(
@@ -656,28 +588,32 @@ class FullPeer:
             grant = _run_core(authorize(proof, update.head_oid))
             published_first = grant is None and bool(publications)
             if published_first:
-                _run_core(publish_authority())
+                _run_core(join_local_authority())
             outcome = _run_core(OpaqueHeadGate(
                 self.store(workspace), authorize).advance(
                     proof, update.head_oid))
             if outcome.status not in {"applied", "noop"}:
                 raise RuntimeError("writer head advance requires rebase")
             if not published_first:
-                _run_core(publish_authority())
+                _run_core(join_local_authority())
             replay = _run_core(self.mirror(workspace).replay_local())
             if replay.errors:
                 raise ValueError(
                     f"writer projection failed: {replay.errors[0][1]}")
-            self._evict_sync_cache(workspace)
             return sorted(self.sql(workspace).fact_ids() - before)
 
-    def authorize_access(self, workspace, proof_raw, purpose):
+    def authorize_access(
+            self, workspace, proof_raw, purpose, *,
+            max_unique_fetches=MAX_MINT_FETCHES,
+            max_fetch_bytes=MAX_MINT_FETCH_BYTES):
         """Run one signed access proof through the shared discarded gate."""
         with self.lock:
             return _run_core(self.authority(workspace).authorize_access(
                 proof_raw,
                 now_ms(),
                 purpose=purpose,
+                max_unique_fetches=max_unique_fetches,
+                max_fetch_bytes=max_fetch_bytes,
             ))
 
     # ---- rebuild: the store's own units through the same kernel --------------

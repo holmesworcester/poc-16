@@ -44,10 +44,8 @@ class MeteredPeer(Peer):
 def measure_pull(node, workspace, url, token, *, rtt_ms=0):
     """Consume one remote forest through real HTTP and return exact costs."""
     peer = MeteredPeer(node, workspace, url, rtt_ms=rtt_ms)
-    peer.cache.update({
-        "sync_profile": "sync-v1/full",
-        "token": token,
-    })
+    peer._sync_profile = "sync-v1/full"
+    peer._token = token
     before = len(node.sql(workspace).fact_ids())
     started = time.perf_counter()
     result = asyncio.run(

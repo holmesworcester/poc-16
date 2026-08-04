@@ -14,7 +14,6 @@ from core.fact import Fact
 from core.http import HttpGate
 from core.kernel import drain
 from core.limits import MAX_REPOSITORY_OBJECT_BYTES
-from core.repository_applier import RepositoryApplier
 from core.repository_reader import RepositoryReader
 from core.store import FsStore
 from deploy.cloudflare_worker import runtime as cloudflare
@@ -25,6 +24,7 @@ from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
 from facts.auth.workspace import workspace
+from facts.content.message import message
 from full_peer.node import FullPeer, now_ms
 
 from .util import add_member, all_fids, closed_subset
@@ -96,7 +96,7 @@ def test_authority_display_facts_use_one_utf8_byte_bound():
 
     _, sibling = keypair()
     granted = device_invite(
-        root.fid, founder, founder, sibling, exact, 5)
+        root.fid, founder, sibling, exact, 5)
     granted_signature = _signed(founder_secret, founder, granted)
     device_base = (root, primary_signature, primary)
     assert drain(
@@ -111,10 +111,10 @@ def test_authority_display_facts_use_one_utf8_byte_bound():
     ).ok
     with pytest.raises(ValueError, match="display"):
         device_invite(
-            root.fid, founder, founder, sibling, oversized, 5)
+            root.fid, founder, sibling, oversized, 5)
 
 
-def test_repository_applier_rejects_a_signed_oversized_founder_name(
+def test_authority_repository_rejects_a_signed_oversized_founder_name(
         tmp_path):
     exact = "é" * 127 + "a"
     oversized = exact + "b"
@@ -123,30 +123,54 @@ def test_repository_applier_rejects_a_signed_oversized_founder_name(
     hostile = _rebody(root, name=oversized)
 
     rejected_store = FsStore(str(tmp_path / "rejected"))
-    rejected = asyncio.run(RepositoryApplier(
-        hostile.fid, rejected_store).receive_pile(
-            founder,
-            signed_pile_bytes(
-                (hostile,), workspace=hostile.fid,
-                secret=founder_secret),
-        ))
+    rejected = asyncio.run(AuthorityRepository(
+        hostile.fid, rejected_store).publish(signed_pile_bytes(
+            (hostile,), workspace=hostile.fid,
+            secret=founder_secret)))
     assert rejected.status == "rejected"
-    assert rejected_store.get("root") is None
+    assert rejected_store.get("authority") is None
 
     accepted_store = FsStore(str(tmp_path / "accepted"))
-    accepted = asyncio.run(RepositoryApplier(
-        root.fid, accepted_store).receive_pile(
-            founder,
-            signed_pile_bytes(
-                (root,), workspace=root.fid,
-                secret=founder_secret),
-        ))
+    repository = AuthorityRepository(root.fid, accepted_store)
+    accepted = asyncio.run(repository.publish(signed_pile_bytes(
+        (root,), workspace=root.fid,
+        secret=founder_secret)))
+    assert accepted.status == "applied"
+    pin = asyncio.run(repository.pin())
+    assert pin is not None
     reader = RepositoryReader(
         root.fid,
-        accepted.root,
+        pin.root_bytes,
         lambda oid: accepted_store.get("obj/" + oid),
     )
     assert reader.validated().fact(root.fid) == root
+
+
+def test_repeated_content_providers_do_not_recompile_authority(
+        tmp_path, monkeypatch):
+    node = FullPeer(str(tmp_path / "node"))
+    workspace_id = facts.auth.workspace.create(node, "alice", ts=1)
+    secret, writer = node.identity(workspace_id)
+    root = node.fact_of(workspace_id, workspace_id)
+    repository = node.authority(workspace_id)
+    publish = repository.publish
+    calls = []
+
+    async def counted(raw):
+        calls.append(raw)
+        return await publish(raw)
+
+    monkeypatch.setattr(repository, "publish", counted)
+    for ordinal in range(3):
+        item = message(
+            workspace_id, writer, "general", f"message {ordinal}",
+            10 + ordinal)
+        item_signature = signature(
+            secret, writer, item, 10 + ordinal)
+        node.publish_closed(
+            workspace_id, ((root, item_signature, item),))
+
+    assert calls == []
 
 
 def test_maximum_authority_labels_fit_cloudflare_mint_budgets(tmp_path):

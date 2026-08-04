@@ -15,7 +15,6 @@ from core.crypto import h, unseal
 from core.http_body import read_bounded
 from core.limits import (
     MAX_CONTROL_BYTES,
-    MAX_AUTHORITY_PILE_BYTES,
     MAX_DIRECT_OBJECT_BYTES,
     MAX_MINT_REQUEST_BYTES,
     MAX_OBJECT_BYTES,
@@ -58,6 +57,31 @@ class PushUnsupported(RuntimeError):
     """The authenticated peer profile does not accept pile delivery."""
 
 
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """A scoped provider request cannot delegate its capability by redirect."""
+
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
+_DIRECT_OPENER = urllib.request.build_opener(_RejectRedirects)
+
+
+def _origin(url):
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except (TypeError, ValueError) as error:
+        raise ValueError("scoped request origin") from error
+    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+        raise ValueError("scoped request origin")
+    return (
+        parsed.scheme,
+        parsed.hostname.lower(),
+        port if port is not None else (443 if parsed.scheme == "https" else 80),
+    )
+
+
 class Peer:
     """HTTP client for one (workspace, responder) pair.
 
@@ -67,7 +91,11 @@ class Peer:
 
     def __init__(self, node, ws, url):
         self.node, self.ws, self.url = node, ws, url
-        self.cache = node.sync_state(ws, url)
+        # A grant describes this one exchange with this one responder.  It is
+        # deliberately not node state: a later sync proves current authority
+        # again and receives a fresh profile.
+        self._token = None
+        self._sync_profile = None
         self._opened_head_page = None
         self._observed_heads = {}
         self._head_directory_complete = False
@@ -76,13 +104,13 @@ class Peer:
     def accepts_push(self):
         """Whether this peer accepts validate-first all-writer gossip."""
         return peer_capability.allows_push(
-            self.cache.get("sync_profile"))
+            self._sync_profile)
 
     @property
     def accepts_owner_publish(self):
         """Whether this peer accepts immutable owner-log publication."""
         return peer_capability.allows_object_put(
-            self.cache.get("sync_profile"))
+            self._sync_profile)
 
     def _http(
             self, method, path, data=None, etag=None, auth=True, retry=True,
@@ -99,18 +127,18 @@ class Peer:
             method=method,
         )
         if auth:
-            if "token" not in self.cache:
+            if self._token is None:
                 self.mint()
             if require_push and not self.accepts_push:
                 raise PushUnsupported("peer advertises pull-only sync")
             if require_object_put and not self.accepts_owner_publish:
                 raise PushUnsupported(
                     "peer does not accept immutable publication")
-            req.add_header("Authorization", "Bearer " + self.cache["token"])
+            req.add_header("Authorization", "Bearer " + self._token)
         if etag:
             req.add_header("If-None-Match", etag)
         try:
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with _DIRECT_OPENER.open(req, timeout=15) as r:
                 body = read_bounded(
                     r, response_limit, "peer response")
                 return r.status, body, dict(r.headers)
@@ -118,14 +146,33 @@ class Peer:
             if e.code == 304:
                 return 304, b"", {}
             if e.code == 401 and auth and retry:
-                self.cache.pop("token", None)
-                self.cache.pop("sync_profile", None)
+                self._token = None
+                self._sync_profile = None
                 return self._http(
                     method, path, data, etag, auth, retry=False,
                     require_push=require_push,
                     require_object_put=require_object_put,
                     response_limit=response_limit, query=query)
             raise
+
+    def _confine_direct_origin(self, scoped):
+        """Bind direct bytes to the authenticated peer's deployment class."""
+        target = _origin(scoped.url)
+        gate = _origin(self.url)
+        profile = self._sync_profile
+        if profile == peer_capability.FULL:
+            if target != gate:
+                raise ValueError("FullPeer scoped request changed origin")
+        elif profile in {peer_capability.OWNER, peer_capability.READ_ONLY}:
+            # Pull-only is a capability, not proof that this is a hosted
+            # deployment. A same-origin FullPeer route may remain on its local
+            # or Iroh-carried HTTP dial; an origin-changing S3/R2 capability
+            # must be protected by TLS.
+            if target != gate and target[0] != "https":
+                raise ValueError("hosted scoped request requires HTTPS")
+        else:
+            raise ValueError("unknown scoped request peer profile")
+        return scoped
 
     def mint(self):
         """The handshake: a small closed pile — request fact + its auth
@@ -149,21 +196,8 @@ class Peer:
         o = decode_json(resp, MAX_CONTROL_BYTES, "mint response")
         secret, _ = self.node.identity(self.ws)
         token = unseal(secret, base64.b64decode(o["grant"])).decode()
-        self.cache.update({
-            "token": token,
-            "sync_profile": peer_capability.negotiate(token, o),
-        })
-
-    def publish_authority(self, raw):
-        """Submit one signed authority closure before ordinary mint is possible."""
-        if not isinstance(raw, bytes) or len(raw) > MAX_AUTHORITY_PILE_BYTES:
-            raise ValueError("authority pile")
-        status, _, _ = self._http(
-            "POST", "/authority", raw, auth=False,
-            response_limit=MAX_CONTROL_BYTES)
-        if status not in {201, 204}:
-            raise ValueError("authority publication")
-        return status
+        self._token = token
+        self._sync_profile = peer_capability.negotiate(token, o)
 
     def advance_head(self, proof, proposed_head):
         """Submit one exact owner proof to the public mechanical CAS route."""
@@ -300,12 +334,13 @@ class Peer:
             response_limit=MAX_SCOPED_REQUEST_BYTES)
         scoped = confine_object_request(
             opened, decode_scoped_request(raw), now_ms())
+        self._confine_direct_origin(scoped)
         request = urllib.request.Request(
             scoped.url,
             method="GET",
             headers=dict(scoped.headers),
         )
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with _DIRECT_OPENER.open(request, timeout=60) as response:
             def chunks():
                 while True:
                     chunk = response.read(DIRECT_STREAM_CHUNK_BYTES)
@@ -348,12 +383,13 @@ class Peer:
             response_limit=MAX_SCOPED_REQUEST_BYTES)
         scoped = confine_scoped_request(
             opened, decode_scoped_request(raw), now_ms())
+        self._confine_direct_origin(scoped)
         request = urllib.request.Request(
             scoped.url,
             method="GET",
             headers=dict(scoped.headers),
         )
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with _DIRECT_OPENER.open(request, timeout=60) as response:
             def chunks():
                 while True:
                     chunk = response.read(DIRECT_STREAM_CHUNK_BYTES)
@@ -414,6 +450,7 @@ class Peer:
             response_limit=MAX_SCOPED_REQUEST_BYTES)
         scoped = confine_object_request(
             opened, decode_scoped_request(encoded), now_ms())
+        self._confine_direct_origin(scoped)
         parsed = urllib.parse.urlsplit(scoped.url)
         connection_type = http.client.HTTPSConnection \
             if parsed.scheme == "https" else http.client.HTTPConnection

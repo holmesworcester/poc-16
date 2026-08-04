@@ -8,6 +8,7 @@ import os
 import socket
 import threading
 import time
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -622,17 +623,15 @@ def test_lost_object_put_ack_reconciles_through_exact_direct_get(tmp_path):
 
         service._finish = lose_first_created
         client = Peer(peer, workspace, url)
-        client.cache.update({
-            "sync_profile": peer_capability.FULL,
-            "token": make_token(
-                SECRET,
-                peer.member_for(workspace),
-                workspace,
-                capability=peer_capability.FULL,
-                issued_at=clock(),
-                ttl_ms=60_000,
-            ),
-        })
+        client._sync_profile = peer_capability.FULL
+        client._token = make_token(
+            SECRET,
+            peer.member_for(workspace),
+            workspace,
+            capability=peer_capability.FULL,
+            issued_at=clock(),
+            ttl_ms=60_000,
+        )
         remote = RemoteStore(client)
         result = asyncio.run(ensure_pile_async(remote, oid, body))
 
@@ -678,6 +677,8 @@ def test_direct_object_put_never_follows_provider_redirect():
             expires,
         )
         peer = object.__new__(Peer)
+        peer.url = f"http://{host}:{port}"
+        peer._sync_profile = peer_capability.FULL
         peer._http = lambda *_args, **_kwargs: (
             200, encode_scoped_request(scoped), {})
 
@@ -688,6 +689,162 @@ def test_direct_object_put_never_follows_provider_redirect():
         server.shutdown()
         server.server_close()
         thread.join(5)
+
+
+def test_direct_object_get_never_follows_provider_redirect():
+    paths = []
+
+    class Redirect(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            paths.append(self.path)
+            self.send_response(307)
+            self.send_header("Content-Length", "0")
+            self.send_header("Location", "/redirected")
+            self.end_headers()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        oid = h(b"must not be redirected")
+        host, port = server.server_address[:2]
+        scoped = ScopedRequest(
+            "GET",
+            f"http://{host}:{port}/{object_key(oid)}?ticket=exact",
+            (),
+            int(time.time() * 1000) + 10_000,
+        )
+        peer = object.__new__(Peer)
+        peer.url = f"http://{host}:{port}"
+        peer._sync_profile = peer_capability.FULL
+        peer._http = lambda *_args, **_kwargs: (
+            200, encode_scoped_request(scoped), {})
+
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            peer.copy_obj(oid, response_limit=MAX_OBJECT_BYTES + 1,
+                          write=lambda _chunk: None)
+        assert rejected.value.code == 307
+        assert paths == [f"/{object_key(oid)}?ticket=exact"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
+
+
+def test_authenticated_control_request_never_follows_off_origin_redirect():
+    source_requests, sink_requests = [], []
+
+    class Sink(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            sink_requests.append((self.path, self.headers.get(
+                "Authorization")))
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    sink = ThreadingHTTPServer(("127.0.0.1", 0), Sink)
+    sink.daemon_threads = True
+    sink_thread = threading.Thread(target=sink.serve_forever, daemon=True)
+    sink_thread.start()
+    sink_host, sink_port = sink.server_address[:2]
+
+    class Redirect(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            source_requests.append((self.path, self.headers.get(
+                "Authorization")))
+            self.send_response(307)
+            self.send_header("Content-Length", "0")
+            self.send_header(
+                "Location", f"http://{sink_host}:{sink_port}/stolen")
+            self.end_headers()
+
+    source = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+    source.daemon_threads = True
+    source_thread = threading.Thread(
+        target=source.serve_forever, daemon=True)
+    source_thread.start()
+    try:
+        source_host, source_port = source.server_address[:2]
+        peer = object.__new__(Peer)
+        peer.ws = "0" * 64
+        peer.url = f"http://{source_host}:{source_port}"
+        peer._token = "must-stay-on-the-dial-origin"
+        peer._sync_profile = peer_capability.FULL
+
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            peer._http("GET", "/heads")
+
+        assert rejected.value.code == 307
+        assert source_requests == [(
+            f"/heads?ws={peer.ws}",
+            "Bearer must-stay-on-the-dial-origin",
+        )]
+        assert sink_requests == []
+    finally:
+        source.shutdown()
+        source.server_close()
+        source_thread.join(5)
+        sink.shutdown()
+        sink.server_close()
+        sink_thread.join(5)
+
+
+def test_full_peer_rejects_an_off_origin_direct_request_before_io():
+    body, oid = b"off-origin", h(b"off-origin")
+    scoped = ScopedRequest(
+        "PUT",
+        f"http://elsewhere.invalid/{object_key(oid)}?ticket=exact",
+        (
+            ("content-length", str(len(body))),
+            ("if-none-match", "*"),
+        ),
+        int(time.time() * 1000) + 10_000,
+    )
+    peer = object.__new__(Peer)
+    peer.url = "http://peer.invalid"
+    peer._sync_profile = peer_capability.FULL
+    peer._http = lambda *_args, **_kwargs: (
+        200, encode_scoped_request(scoped), {})
+
+    with pytest.raises(ValueError, match="changed origin"):
+        peer.put_obj(oid, body)
+
+
+def test_hosted_peer_rejects_plain_http_direct_requests_before_io():
+    body, oid = b"hosted", h(b"hosted")
+    scoped = ScopedRequest(
+        "PUT",
+        f"http://provider.invalid/{object_key(oid)}?ticket=exact",
+        (
+            ("content-length", str(len(body))),
+            ("if-none-match", "*"),
+        ),
+        int(time.time() * 1000) + 10_000,
+    )
+    peer = object.__new__(Peer)
+    peer.url = "https://gate.invalid"
+    peer._sync_profile = peer_capability.OWNER
+    peer._http = lambda *_args, **_kwargs: (
+        200, encode_scoped_request(scoped), {})
+
+    with pytest.raises(ValueError, match="requires HTTPS"):
+        peer.put_obj(oid, body)
 
 
 def test_independent_service_never_collects_another_upload_temp(tmp_path):

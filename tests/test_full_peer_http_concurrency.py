@@ -22,10 +22,8 @@ def test_concurrent_writer_finalization_serializes_one_sql_projection(tmp_path):
     with _serve(receiver) as (url, secret):
         headers = _bearer(secret, alice.member, workspace)
         client = Peer(alice, workspace, url)
-        client.cache.update({
-            "sync_profile": peer_capability.FULL,
-            "token": headers["Authorization"].removeprefix("Bearer "),
-        })
+        client._sync_profile = peer_capability.FULL
+        client._token = headers["Authorization"].removeprefix("Bearer ")
         for source in (alice, bob):
             for key in source.store(workspace).list("obj"):
                 oid = key.removeprefix("obj/")

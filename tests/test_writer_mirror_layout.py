@@ -566,13 +566,14 @@ class _ReadPeer:
 
 class _DialNode:
     def __init__(self, token):
-        self.cache = {
-            "token": token,
-            "sync_profile": peer_capability.FULL,
-        }
+        self.token = token
 
-    def sync_state(self, _workspace, _url):
-        return self.cache
+
+def _preminted_peer(node, workspace, url):
+    peer = Peer(node, workspace, url)
+    peer._token = node.token
+    peer._sync_profile = peer_capability.FULL
+    return peer
 
 
 @contextmanager
@@ -617,7 +618,7 @@ def test_real_http_remote_store_streams_pack_not_gate_response(tmp_path):
 
     backing.get_bounded = semantic_get
     with serving(_ReadPeer(root.fid, backing, binding)) as url:
-        peer = Peer(_DialNode(token), root.fid, url)
+        peer = _preminted_peer(_DialNode(token), root.fid, url)
         layout_requests, pack_requests, loose_batches = [], [], []
         original_layout = peer.layout
         original_copy, original_objs = peer.copy_pack, peer.objs
@@ -675,7 +676,7 @@ def test_real_http_loose_piles_use_the_same_direct_object_stream(tmp_path):
         ttl_ms=(1 << 52),
     )
     with serving(_ReadPeer(root.fid, backing, binding)) as url:
-        peer = Peer(_DialNode(token), root.fid, url)
+        peer = _preminted_peer(_DialNode(token), root.fid, url)
         limits = []
         original = peer.copy_obj
 
