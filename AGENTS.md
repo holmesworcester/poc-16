@@ -1,56 +1,14 @@
 # POC-16 engineer guide
 
-Read `README.md` for current operation and `DESIGN.md` for the accepted target
-protocol and trust boundaries. `poc-16-iq2` tracks the transition from the
-running workspace-wide content root to per-device writer logs and a shared
-head directory; `poc-16-iq2.9` is the one-way cutover gate. Do not deepen the
-predecessor's global-root assumptions or claim that target behavior is already
-deployed. Those files and this guide are the repository's only Markdown
-authorities. Track unfinished work in beads, never in a Markdown TODO ledger.
+`README.md` is the operating guide and `DESIGN.md` defines the protocol and
+trust boundaries. Those files and this guide are the repository's only
+Markdown authorities. Track unfinished work in beads, never in a Markdown TODO
+ledger.
 
-POC-16 has no backwards-compatibility surface. A cutover deletes predecessor
-wire, storage, route, and deployment formats instead of reading or migrating
-them. The only retained upgrade path is application fact-form replay into the
-disposable SQL projection described in `DESIGN.md`.
-
-The target `AuthorityGate` is actor-neutral: hosted and full peers run the same
-implementation. Every semantic evaluation starts from exactly one canonical
-closed pile. Pull recovers a complete signed pile from a loose pile object or a
-sealed-pack range and may retain its durable facts; push evaluates the same wire
-value only to check conditions in fresh in-memory or temporary SQLite, then
-discards the pile judgment and every derived row. A pushed pile never enters
-recipient fact space. Local persistent SQL, Python fact objects, provider
-identity, and Iroh identity may not shortcut this boundary. Provider storage
-bindings, process scheduling, packing, and optional content consumption are the
-only hosted/full-peer composition differences; pile bytes, evaluator, gate,
-temporary schema, family queries, and typed result must remain identical.
-
-Target writer trees reuse the canonical bounded persistent Merkle-map style.
-Each logical leaf names exactly one independently closed pile; range or diff
-pagination stops only between leaves. Separately replaceable, source-local
-fixed-window layout pages may map contiguous leaf ranges to immutable concat
-packs, but they are locators rather than log authority. Every pile is signed
-directly by its publishing writer device. The pile signature authenticates the
-portable pile; the device-signed writer head and Merkle inclusion path
-authenticate its place in that device's tree. A cold receiver must validate
-the pile signature, head, inclusion, and complete pile without an adjacent leaf
-or prior cache state.
-Large signed-pile and pack bodies must not widen `ObjectStore.get_bounded`,
-semantic-object limits, or buffered `HttpGate` responses. The common gate may
-mint one bounded exact HTTP request; S3/R2 transfer directly and FullPeer
-streams the same route.
-
-Cloud publication is owner-confined: a device may populate and advance only
-its own registered writer log, and hosted storage does not validate those
-content bytes. Full-peer replication is validate-first peer sync: a peer may
-serve all writers' piles it has consumed successfully, preserves every original
-pile signature, signed head, and writer identity, and never treats its prior
-judgment as a receiver's admission certificate. Do not add a combined P2P
-content log or allow one device to upload relayed content into another device's
-cloud writer log.
-P2P exchanges the per-device head directory and runs the common RBSR algorithm
-only for changed device roots. Add a combined peer inventory tree only after
-measurements show that this forest is inadequate.
+POC-16 has no backwards-compatibility surface. A protocol cut deletes old
+wire, route, storage, and deployment shapes instead of retaining readers or
+migrations. The only upgrade mechanism is application-version replay of the
+disposable full-peer SQL projection from accepted writer trees.
 
 Start a work session with:
 
@@ -60,202 +18,198 @@ bd ready
 git status --short
 ```
 
-## Current transition capabilities
+## Authority and data flow
 
-FullPeer authoring and sync already use per-device writer trees. Hosted direct
-upload, minting, and notification discovery still use the predecessor global
-content root and must disappear at `poc-16-iq2.9`: writers publish closed-pile
-leaves to their own trees, consumers pull them, and only discarded condition
-evaluations are pushed. Do not preserve hosted pile-to-Applier delivery as a
-second target publication algorithm.
-
-Authority flows from the database-free core into an optional stateful peer
-composition:
-
-- `WriterLog` signs closed piles and builds one device's tree; `OpaqueHeadGate`
-  performs the sole mechanical CAS of that device's slot.
-- `RepositoryMirror` verifies heads, inclusions, and complete pile closures.
-  `FactConsumer` is its optional validated-fact sink.
-- `PileSender` may use SQLite to close local intent. Its normal `send` path
-  publishes through the local device's `WriterLog`; it does not invoke
-  `RepositoryApplier`.
-- `RepositoryApplier`, `RepositoryReader`, and their global `root` remain only
-  in hosted predecessor and small authority-repository paths pending
-  `poc-16-iq2.9`.
-- `HttpGate` temporarily exposes both the writer-forest routes and those
-  predecessor hosted routes. The latter must be deleted, not generalized.
-
-`FullPeer` composes WriterLog, RepositoryMirror, FactConsumer, PileSender,
-local identities, scheduling, local control, attachment I/O, and disposable
-SQL. Hosted deployments have not completed that cutover. Never add a second
-writer-tree path, provider-specific compiler, SQL publication path, or
-authority membrane.
-
-Read implementation authority in this order:
-
-1. `core/fact.py` and `facts/` for fact bytes and family policy.
-2. `core/kernel.py` for closed-pile judgment.
-3. `core/repository_snapshot.py`, `core/repository_applier.py`, and
-   `core/repository_reader.py` for the database-free repository engine.
-4. `core/http.py` for peer routes and authorization.
-5. `full_peer/` for the stateful local composition; `sql_store.py` is its sole
-   SQL boundary and `upload_journal.py`, `upload_client.py`, and
-   `upload_client_http.py` own resumable outbound upload state and effects.
-6. `full_peer/daemon.py`, `full_peer/iroh_forwarders.py`,
-   `full_peer/iroh_process.py`, and `full_peer/iroh/` for process composition,
-   bounded outbound children, and the connection-only Iroh byte wrapper.
-7. `adapters/` and `deploy/` for provider adaptation and packaging.
-   `deploy/upload_session.py` and `deploy/upload_wire.py` are the shared
-   client/broker protocol values; no client journal or outbound runtime lives
-   under `deploy/`.
-8. `notifications/hints.py`, `notifications/discovery.py`,
-   `notifications/carrier.py`, `notifications/delivery.py`, and
-   `notifications/worker.py` for post-publication work. Notification state is
-   durable operational state outside core. It holds at most one pending diff
-   page per workspace before any disposable wake is emitted; only typed worker
-   completion advances it. It never grants fact authority or enters
-   `RepositoryApplier`.
-
-## The central theorem
-
-The wire and stored values are deliberately different:
+Ordinary content is a forest of independently advancing device logs. There is
+no workspace-global mutable content root.
 
 ```text
-wire:    one bounded, topologically ordered closed pile
-stored:  fid -> canonical fact-object oid
+local command
+  -> PileSender closes dependencies
+  -> WriterLog signs one independently closed pile leaf
+  -> immutable pile/tree/head objects
+  -> authority proof binds one exact proposed head
+  -> CAS heads/<workspace>/<device>
+
+peer pull
+  -> list/open changed writer slots
+  -> verify signed head and Merkle extension
+  -> fetch each complete signed pile
+  -> ClosedPileEvaluator
+  -> optional FactConsumer
+
+hosted owner publication
+  -> direct create-only immutable object PUTs
+  -> the same exact owner-head proof
+  -> CAS only the caller's writer slot
 ```
 
-The pile supplies the one-time validation closure at the ingress door. If any
-member fails, the whole pile fails and no valid prefix is published. After a
-successful root CAS, authenticated residence is the durable admission
-certificate: every durable fact is an equal resident and ephemeral facts are
-discarded. Do not store the selected dependency edges, proof DAGs, ranks,
-winners, eligibility labels,
-dormant candidates, or a second settlement state.
+The logical `AuthorityGate` is actor-neutral. Hosted and full peers use the
+same pile codec, removal-path verifier, family queries, and `OpaqueHeadGate`.
+It has two device-signed, discarded proof turns. First, a historical-member
+proof containing the owning member's signature over the requesting device may
+fetch only that member/device pair's path from the recipient's current removal
+tree. Second, a current-member proof carries that path and binds an exact mint,
+read, sync, or head action. Neither turn installs authority facts or asks the
+recipient to synchronize an authority repository. A head proof can authorize
+only the proposed head OID named in the request and never validates the
+advertised content tree.
 
-Validated storage is monotone:
+Cloud publication is owner-confined. A device may create immutable objects and
+advance only its own writer slot. Hosted storage need not inspect its content
+piles. Full-peer replication is validate-first peer sync: a full peer may
+relay any original writer tree it has consumed successfully, preserving the
+writer's pile signature, signed head, and identity. It may not rewrite a
+relayed pile into its own or another writer's cloud log.
+
+P2P exchanges the per-device directory and runs range-based set
+reconciliation only for changed writer roots. Do not add a combined P2P
+content log, a workspace content root, a second publication algorithm, or one
+sync session per pile without measurements that invalidate the forest.
+
+## Read the code in this order
+
+1. `core/fact.py` and `facts/`: canonical bytes and family-owned behavior and
+   policy.
+2. `core/kernel.py` and `core/close.py`: closed-pile judgment and the signed
+   pile boundary.
+3. `core/writer_tree.py`, `core/writer_head.py`, and
+   `core/writer_repository.py`: writer logs, owner publication, mirroring, and
+   optional consumption.
+4. `core/authority.py` and `core/suppression.py`: the two discarded proof
+   purposes and bounded verification against the recipient's pinned removal
+   tree.
+5. `core/http.py`: the one route and grant gate used by every runtime.
+6. `full_peer/pile_sender.py`, `full_peer/node.py`, and
+   `full_peer/sql_store.py`: stateful authorship, composition, and the sole SQL
+   boundary.
+7. `full_peer/daemon.py`, `full_peer/iroh_process.py`, and `full_peer/iroh/`:
+   process ownership and the connection-only Iroh byte wrapper.
+8. `adapters/` and `deploy/`: object-store adaptation and isolated provider
+   packaging.
+9. `notifications/`: post-publication scanning, durable cursor state,
+   disposable wakes, current-authority delivery, and provider effects.
+
+`FullPeer` is a composition root, not a policy owner. It combines every core
+path with identities, local scheduling, Bao I/O, and disposable SQL. It must
+not duplicate head validation, pile admission, grants, suppression, HTTP
+routes, or sync logic.
+
+## Closed piles and residence
+
+Every semantic input is one bounded, topologically ordered, device-signed
+closed pile. Heads, Merkle pages, pack indexes, SQL rows, and provider metadata
+can locate bytes but cannot introduce a fact.
 
 ```text
-if f validates against S, f remains valid in every validated superset S'
+wire:             complete signed closed pile
+accepted content: original signed pile in one writer-tree leaf
+local query state: fid -> canonical fact bytes plus generic current indexes
 ```
 
-If one provider is semantically significant, the fact must name that provider
-or its complete offer address in immutable bytes. Otherwise providers at the
-same complete address are interchangeable. Current suppression and authority
-maps may change visibility or authorization, never fact residence.
+If one member of a pulled pile fails, its entire candidate writer suffix
+fails and no prefix becomes resident. Once a receiver accepts and CASes a
+writer slot, that slot and its reachable immutable objects are the durable
+admission certificate. Projection replay must not consult present-day
+membership or retain a historical validation chain.
 
-## Authority flow
+Do not store selected dependency edges, proof DAGs, ranks, winners, dormant
+candidates, eligibility labels, or a second settlement state. Validated facts
+are monotone; current suppression and authority affect visibility and future
+operations, not historical residence.
 
-Read and change the receiving path in this order:
+Writer-tree leaves are independently closed. Range and diff pagination may
+stop only between leaves. Source-local layout pages and concat packs are
+replaceable locators, never log authority. A cold receiver verifies the pile
+signature, signed head, inclusion, content address, and full closure without
+an adjacent leaf or prior cache.
 
-```text
-closed pile
-  -> RepositoryApplier
-  -> kernel plus family policy
-  -> monotone validated-fact union
-  -> repository_snapshot's pure three-map compiler
-  -> immutable object establishment
-  -> the sole root CAS
-  -> applied, noop, rejected, or retryable result
-  -> RepositoryReader
-```
+Bao descriptors and slices are ordinary facts. Large pile and pack bodies use
+the streaming/direct-object path and must not widen buffered semantic-object
+or `HttpGate` response limits.
 
-`FactTree` binds `fact:<fid>` directly to the canonical fact object's oid and
-also contains mechanical postings. `FactOrder` and `SuppTree` are deterministic
-projections. A proof names its provider, so a hosted Reader authenticates that
-FactTree residence and its SuppTree scopes directly. SQLite mirrors canonical
-fact bytes plus generic index rows for local authorship and presentation only;
-it must be deletable and rebuildable from a pinned Reader.
+## Facts, suppression, and deletion
 
-Direct-upload clients write one exact closed pile to isolated ingress and then
-call broker `FINALIZE`; the broker invokes the recipient with that exact key.
-The sender retries retryable or lost results. There is no server-side ingress
-queue, LIST drain, detached-object completion pass, or internal pile copy. The
-Applier invokes the same transition for a hosted recipient and a full peer and
-leaves ingress immutable for a separate retention lifecycle.
+One module under `facts/auth/` or `facts/content/` owns each family's
+constructor, exact shape, Needs, refs/offers, durability, suppression policy,
+commands, and queries. `facts/__init__.py` is the checked
+registry. Core may dispatch through the registry but must not import concrete
+families or switch on their tags.
 
-## Fact families
+Needs use complete offer addresses. If provider identity matters, immutable
+fact bytes must select it explicitly. Suppression selectors are explicit:
+SELF, one named parent, an immutable-ref ancestor path, several selectors, or
+none. A family offering no suppression key cannot be directly suppressed.
 
-Use one module per family under `facts/auth/` or `facts/content/`. Families own
-construction, exact shape checks, named Needs, immutable refs/offers,
-suppression selectors/actions, authority scopes, ownership, commands, query
-assembly, and any inline authenticated payload format. `facts/__init__.py` is
-the checked registry. Keep core family-neutral; it may dispatch through
-`facts`, but it must not import concrete family modules or switch on their
-tags. Bao descriptors and slices are ordinary facts; each slice carries the
-payload and range proof needed for independent admission.
+`SuppTree` maps a known suppression ID to `CLEAR` or
+`ACTIVE(action_fid)`. Absence is not clear. This lets a database-free node
+answer exact suppression and principal-liveness questions with authenticated
+point reads.
 
-Needs use complete offer addresses. A fact may also name an exact provider in
-its envelope when identity matters. Do not infer durable ownership from a
-current winning provider. Suppression selectors are explicit: SELF, named
-parent or ancestor paths, several selectors, or none. PARENT pins one direct
-dependency; every ANCESTOR hop must be an immutable named ref. A family with
-none cannot be directly suppressed, although its declared current authority
-scopes may still make it unusable as a provider.
+Deletion and removal are ordinary facts. Their Needs prove the actor and their
+offers must match a selector declared by the target family. Admins may delete
+every directly deletable fact; an owner may delete facts owned by that member,
+including facts authored by any of the member's devices. Family handlers own
+these rules; core and `FullPeer` do not special-case them.
+
+## SQL and application-version replay
+
+`full_peer/sql_store.py` contains only canonical fact blobs, one combined
+generic index, and per-writer projection checkpoints. It is never receiving
+authority and may be deleted at any time. Startup replays accepted local
+writer slots through the same `FactConsumer` used for network pulls.
+
+`facts.APP_VERSION` is the application projection version. A mismatch deletes
+the disposable database and replays exact source events through the running
+family re-extraction and indexing code. A family may explicitly retain an old
+source tag in `SHAPES` and purely reconstruct its current form; all other old
+protocol values remain rejected. SQL serializes that current form under the
+immutable source fid and retains the exact source only as provenance for
+signatures and future closed-pile authorship. Do not add table migrations,
+version graphs, selected-edge history, or ambient-context migrations.
 
 ## Object-store and concurrency rules
 
-The running predecessor uses immutable content-addressed objects plus one
-linearizable opaque-token CAS register named `root`. The accepted target keeps
-immutable objects but replaces ordinary content publication with one stable
-CAS head per device and bounded strong LIST of the workspace head prefix; only
-the small authority/removal projection remains shared. In both designs, exact
-untrusted reads are bounded and provider ETags are opaque. LIST discovers
-candidate heads in the target but never grants membership, authorship,
-liveness, or fact validity. Every peer mirrors only missing content-addressed
-head/tree objects. The target `AuthorityGate` evaluates one pushed closed pile
-to prove requester and recipient membership, device join, and non-removal; it
-discards that state and does not validate the advertised content tree.
+The protocol relies on bounded exact reads, create-only immutable writes with
+collision verification, paginated LIST for candidate discovery, and
+linearizable conditional replacement of one exact small key. Provider version
+tokens are opaque compare capabilities, never content hashes.
 
-One exact create-only ingress key and its digest identify one delivery attempt.
-It is staging, not a server-side queue or repository authority. Provider
-retention may eventually collect it, but `RepositoryApplier` has no ingress
-DELETE capability and publication correctness never depends on collection.
-Lost requests and responses are recovered by sender retry; an already-applied
-pile returns an idempotent result from the authenticated repository.
+Stable mutable keys are:
 
-Stale workers may duplicate bounded immutable work or delay convergence. They
-must not overwrite different bytes at an object key, clobber a newer root,
-delete ingress, mint from unobserved state, or corrupt a Merkle tree.
+- `removal`, for the recipient's small authenticated removal-tree root;
+- `heads/<workspace>/<device>`, one independent slot per writer;
+- source-local layout slots; and
+- `cursor` only in the separate notification-state store.
+
+Ordinary content has no mutable workspace root. LIST grants no membership,
+authorship, liveness, or fact validity. Immutable objects must exist before a
+head advertises them. Stale workers may duplicate bounded creates or delay
+convergence; they may not overwrite another value, roll back a writer slot,
+delete canonical data, or mint against a caller-selected or stale removal root.
+
+Iroh carries opaque ordinary HTTP bytes only. Endpoint IDs, tickets, ALPN, and
+connection success grant no repository authority. Provider adapters translate
+storage calls, budgets, and deployment configuration only; they add no
+semantic branch.
 
 ## Change rules
 
-- FullPeer-authored piles enter its device's `WriterLog` through `PileSender`.
-- Pulled piles enter through `RepositoryMirror` and `FactConsumer`; every
-  receiver repeats signed-pile and closure validation.
-- Hosted predecessor uploads still enter `RepositoryApplier` until
-  `poc-16-iq2.9` replaces and deletes that path.
-- Sync compares per-device heads, runs RBSR only for changed writer trees, and
-  transfers their independently closed pile leaves.
-- Provider adapters translate storage, events, budgets, and deployment
-  configuration only.
-- Iroh carries opaque HTTP bytes only. Endpoint identity, tickets, ALPN,
-  and connection success never grant repository authority; local control
-  never traverses Iroh.
-- A receipt, cursor, notification, ETag, SQL row, or local lock carries no
-  authority beyond its exact documented binding.
-- Every behavior change needs a realistic test. Prefer actual daemon/socket,
-  provider-fake, restart, crash-point, concurrent, and hostile-input coverage.
+- Add realistic tests with every behavior change. Prefer actual sockets,
+  restart/replay, provider fakes, concurrency schedules, crash points, and
+  hostile inputs over placeholder assertions.
 - Keep structural authority ratchets in `tests/test_repository_layout.py`.
+- Constants own all protocol and resource ceilings; do not add magic sizes.
+- Preserve unrelated user changes. In a worktree, edit only that worktree and
+  commit completed work on its branch before handoff or review.
+- Close or supersede beads whose architecture no longer exists. Push the Dolt
+  ledger after reconciling it.
 
-When working in a worktree, edit only that worktree and commit completed work
-on its branch before handoff or review. Preserve unrelated changes.
-
-Run the authoritative repository preflight before handoff:
+Run the repository-owned gate before handoff:
 
 ```sh
 python3 tools/preflight.py
 ```
 
-The installed beads v1.1.0 `bd preflight --check` is hardcoded for the beads
-Go repository and cannot be configured here. The repository-owned command
-runs these underlying gates:
-
-```sh
-python3 -m compileall -q core full_peer facts notifications adapters deploy bench tests tools
-python3 -m pytest -q
-python3 -m pytest -q tests/test_repository_layout.py
-git diff --check
-bd lint
-bd dep cycles
-```
+It includes syntax checks, the complete test suite, layout ratchets, patch
+whitespace, and beads integrity checks.
