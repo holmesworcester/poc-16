@@ -1222,6 +1222,18 @@ explicitly retains a legacy source tag, the projection envelope also retains
 the exact source value needed by signatures and later closed piles. There are
 no table migrations, version graphs, or selected dependency histories.
 
+`RepositoryMirror.replay_local()` performs one bounded, paginated slot listing
+and compares each slot with its transactional per-writer `projected_heads`
+checkpoint. It fetches no pile for an unchanged writer and validates only the
+changed suffix. A 1,000-message local measurement of the running path
+(`python3 -m bench.bench_sql_replay`, 2026-08-04) took 0.000265 seconds and
+zero pile reads for a current restart, 0.005815 seconds/one pile/two facts for
+one changed head, and 0.884595 seconds/1,002 piles/2,003 facts after literal SQL
+deletion. The last case reconstructed byte-identical fact, generic-index, and
+head rows under `facts.APP_VERSION`. More incremental state would add a second
+checkpoint authority without reducing the ordinary changed-suffix work, so the
+current full slot scan plus per-writer checkpoint is retained.
+
 ### 13.1 Hosted and local turns are isomorphic
 
 | Turn | Hosted peer | Full peer | Shared core |

@@ -718,6 +718,11 @@ stored as one canonical current-form envelope keyed by its immutable source
 fid; that envelope also carries the exact source value needed to reproduce a
 signed closure. Queries and the generic index see only the current vocabulary.
 There are no table migrations, version graphs, or generic old-protocol codecs.
+Replay always pages the accepted writer slots, then uses `projected_heads` to
+open only changed suffixes. The repeatable measurement is
+`python3 -m bench.bench_sql_replay`: a current restart reads no piles, one new
+head replays one pile, and deleting SQL replays the complete accepted history.
+No additional checkpoint or migration layer is maintained.
 
 ## Passive writer-forest sync
 
