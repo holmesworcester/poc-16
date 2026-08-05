@@ -14,9 +14,11 @@ from peerlog.cloud import CLOUD_GET_CONCURRENCY
 def test_100_and_1000_writer_fanout_has_bounded_waves_and_constant_warm_delta():
     for writers in (100, 1000):
         report = measure_fanout(writers)
-        assert report.cold_gets == writers
-        assert report.cold_rounds == 1 + math.ceil(
-            writers / CLOUD_GET_CONCURRENCY)
+        waves = math.ceil(writers / CLOUD_GET_CONCURRENCY)
+        assert report.cold_gets == 2 * writers + 2
+        assert report.cold_directory_audit_gets == writers + 2
+        assert report.cold_directory_audit_rounds == 3 + waves
+        assert report.cold_rounds == 3 + 2 * waves
         assert report.noop_gets == report.noop_rounds == 1
         assert report.warm_gets == 1
         assert report.warm_rounds == 2
@@ -30,20 +32,23 @@ def test_source_local_range_fetch_opens_only_intersecting_ladder_segment():
     assert (report.requested_lo, report.requested_hi) == (64, 96)
     assert report.received_facts == 32
     assert report.object_gets == 1
-    assert report.rounds == 2
+    assert report.rounds - report.directory_audit_rounds == 1
 
 
 def test_100k_fact_cold_catchup_runs_exact_authenticated_path():
     report = measure_cold(writers=50, facts=100_000, body_bytes=80)
     assert report.facts == 100_000
     assert report.object_gets == 50
-    assert report.rounds == 2
+    assert report.rounds - report.directory_audit_rounds == 1
     assert report.received_bytes < 32 * 1024 * 1024
     assert report.pipelined_facts_per_s > 5_000
     assert report.pipelined_bytes_per_s > 1_000_000
-    # At the decision-record 90 ms RTT and 2.5 MB/s useful bandwidth, bounded
-    # request waves add less than 2% to the measured wire-byte floor.
-    assert report.rtt_margin < 0.02
+    # The mandatory cold stable-slot audit adds three bounded request waves at
+    # this 50-writer scale. At 90 ms RTT and 2.5 MB/s useful bandwidth the full
+    # verified catchup remains within 5% of its measured wire-byte floor.
+    assert report.directory_audit_gets == 52
+    assert report.directory_audit_bytes < report.received_bytes / 100
+    assert report.rtt_margin < 0.05
 
 
 def test_recent_window_cost_is_independent_of_cold_history_size():
@@ -57,7 +62,7 @@ def test_recent_window_cost_is_independent_of_cold_history_size():
         assert report.closure_segment_gets == report.closure_facts == 0
         assert report.annex_facts == report.closure_depth == 2
         assert report.object_gets == 10
-        assert report.rounds == 2
+        assert report.rounds - report.directory_audit_rounds == 1
         assert report.interactive_ready
         assert report.initial_bytes < 128 * 1024
         assert report.semantic_facts_per_s > 0

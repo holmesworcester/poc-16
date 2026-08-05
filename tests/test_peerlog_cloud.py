@@ -9,6 +9,9 @@ from nacl import signing
 import peerlog.cloud as cloud_module
 from adapters.s3 import S3Config, S3Store
 from peerlog.cloud import (
+    CLOUD_DIRECTORY_AUDIT_MAX_AGE_S,
+    CLOUD_DIRECTORY_IDLE_DEBOUNCE_S,
+    CLOUD_DIRECTORY_MAX_DELAY_S,
     CLOUD_DEMAND_MAX_INTERVALS,
     CLOUD_DEMAND_MAX_INTERVALS_PER_WRITER,
     CLOUD_DEMAND_MAX_WRITERS,
@@ -19,6 +22,8 @@ from peerlog.cloud import (
     CloudDemand,
     CloudMicroFork,
     CloudQueue,
+    DirectoryRepairContention,
+    DirectoryRepairResult,
     MaintenanceRequired,
     MemoryCloud,
     WriterDemand,
@@ -72,12 +77,12 @@ def dependency_chain_cloud(label="dependency closure"):
     for log in (a, b, c):
         holdings.add_owned(log)
     receipts = {
-        "c": cloud.publish(c, 0, 5, holdings=holdings, announce=False),
-        "b": cloud.publish(b, 0, 5, holdings=holdings, announce=False),
+        "c": cloud.publish(c, 0, 5, holdings=holdings),
+        "b": cloud.publish(b, 0, 5, holdings=holdings),
         "a_old": cloud.publish(
-            a, 0, 5, holdings=holdings, announce=False),
+            a, 0, 5, holdings=holdings),
         "a_recent": cloud.publish(
-            a, 5, 6, holdings=holdings, announce=False),
+            a, 5, 6, holdings=holdings),
     }
     cloud.repair_directory()
     return store, cloud, a, b, c, receipts
@@ -95,11 +100,11 @@ def same_writer_chain_cloud(label="same writer dependency closure"):
     log.append(Fact("msg", 104, (), b"unrelated four"))
     log.append(Fact("msg", 1_000, (Ref(log.writer, 2),), b"recent A"))
     receipts = {
-        "c": cloud.publish(log, 0, 1, announce=False),
-        "unrelated_one": cloud.publish(log, 1, 2, announce=False),
-        "b": cloud.publish(log, 2, 3, announce=False),
-        "unrelated_late": cloud.publish(log, 3, 5, announce=False),
-        "a": cloud.publish(log, 5, 6, announce=False),
+        "c": cloud.publish(log, 0, 1),
+        "unrelated_one": cloud.publish(log, 1, 2),
+        "b": cloud.publish(log, 2, 3),
+        "unrelated_late": cloud.publish(log, 3, 5),
+        "a": cloud.publish(log, 5, 6),
     }
     cloud.repair_directory()
     return store, cloud, log, receipts
@@ -131,7 +136,8 @@ def test_cloud_uses_exact_peer_runs_and_one_round_no_change():
 
     replica, cache = PeerState(), CloudCache()
     cold = cloud.sync(replica, cache)
-    assert cold.changed and cold.rounds == 2 and cold.facts == 8
+    assert cold.changed and cold.rounds - cold.directory_audit_rounds == 1 \
+        and cold.facts == 8
     assert set(replica.entries()) == entries(log)
 
     before = store.metrics.copy()
@@ -166,6 +172,149 @@ def test_publish_defaults_to_owner_only_and_poll_repairs_a_missing_directory():
     assert noop_cost.lists == noop_cost.cas == 0
 
 
+def test_owner_mutations_ack_before_any_directory_repair_can_fail(monkeypatch):
+    class CrashBeforeSlotCloud(MemoryCloud):
+        def __init__(self):
+            super().__init__()
+            self.crash = True
+
+        def cas(self, key, token, value):
+            if self.crash and "/slots/" in key:
+                self.crash = False
+                raise OSError("crash before writer-slot CAS")
+            return super().cas(key, token, value)
+
+    store = CrashBeforeSlotCloud()
+    cloud = CloudQueue(store, h("owner ack before repair"))
+    orphan = owned("orphan ack", 1)
+    with pytest.raises(OSError, match="before writer-slot"):
+        cloud.publish(orphan)
+
+    def forbidden():
+        raise AssertionError("owner mutation called directory repair")
+
+    monkeypatch.setattr(cloud, "repair_directory", forbidden)
+    readmitted = cloud.readmit_orphan(orphan.writer, 0, 1)
+    assert (readmitted.segment.lo, readmitted.segment.hi) == (0, 1)
+
+    ordinary = owned("ordinary ack", 2)
+    published = cloud.publish(ordinary, 0, 1)
+    assert (published.segment.lo, published.segment.hi) == (0, 1)
+    cloud.publish(ordinary, 1, 2)
+    folded = cloud.fold_idle(ordinary.writer)
+    assert folded.hi == 2
+
+
+def test_directory_maintenance_coalesces_bursts_and_honors_max_delay():
+    now = [0.0]
+    store = MemoryCloud()
+    cloud = CloudQueue(
+        store, h("coalesced directory maintenance"), clock=lambda: now[0])
+    log = WriterLog.owned()
+    for seq in range(10):
+        now[0] = seq * (CLOUD_DIRECTORY_IDLE_DEBOUNCE_S / 2)
+        log.append(Fact("msg", seq + 1, (), f"burst-{seq}".encode()))
+        cloud.publish(log, seq, seq + 1)
+        assert cloud.maintain_directory(idle=True) is None
+
+    before = store.metrics.copy()
+    now[0] += CLOUD_DIRECTORY_IDLE_DEBOUNCE_S
+    result = cloud.maintain_directory(idle=True)
+    delta = store.metrics.delta(before)
+    assert isinstance(result, DirectoryRepairResult)
+    assert result.changed and result.slots == 1
+    assert delta.lists == 1 and delta.cas == 1
+    assert cloud.maintain_directory(idle=True) is None
+
+    other = WriterLog.owned()
+    first = now[0]
+    for seq in range(10):
+        now[0] = first + seq * (CLOUD_DIRECTORY_IDLE_DEBOUNCE_S / 2)
+        other.append(Fact("msg", 100 + seq, (), f"busy-{seq}".encode()))
+        cloud.publish(other, seq, seq + 1)
+        assert cloud.maintain_directory(idle=False) is None
+    now[0] = first + CLOUD_DIRECTORY_MAX_DELAY_S
+    assert cloud.maintain_directory(idle=False).slots == 2
+
+
+def test_explicit_directory_repair_has_typed_contention_and_later_converges():
+    class ContendedDirectory(MemoryCloud):
+        def __init__(self):
+            super().__init__()
+            self.contended = True
+
+        def cas(self, key, token, value):
+            if self.contended and key.endswith("/directory"):
+                self.metrics.cas += 1
+                return False
+            return super().cas(key, token, value)
+
+    store = ContendedDirectory()
+    cloud = CloudQueue(store, h("typed directory repair"))
+    log = owned("durable while directory contends", 3)
+    receipt = cloud.publish(log)
+    assert receipt.segment.hi == 3
+    with pytest.raises(DirectoryRepairContention) as found:
+        cloud.repair_directory()
+    assert found.value.attempts == cloud_module.CLOUD_DIRECTORY_REPAIR_ATTEMPTS
+    assert cloud._slot_versioned(log.writer)[0].hi == 3
+
+    store.contended = False
+    repaired = cloud.repair_directory()
+    assert repaired.changed and repaired.slots == 1
+    assert cloud.visible_heads() == {log.writer: 3}
+
+
+def test_cold_and_max_age_audits_discover_writers_omitted_by_stale_hint():
+    class RegressOneAuditRead(MemoryCloud):
+        stale = None
+
+        def get(self, key, *, if_none_match=None, suffix=None):
+            if self.stale is not None and key.endswith("/directory"):
+                with self._lock:
+                    self._objects[key] = self.stale
+                    self._versions[key] = self._versions.get(key, 0) + 1
+                    self.stale = None
+            return super().get(
+                key, if_none_match=if_none_match, suffix=suffix)
+
+    now = [0.0]
+    store = RegressOneAuditRead()
+    workspace = h("reader directory audits")
+    writer = CloudQueue(store, workspace, clock=lambda: now[0])
+    first, omitted, later = (
+        owned("first visible", 2), owned("cold omitted", 3),
+        owned("warm omitted", 4),
+    )
+    writer.publish(first)
+    writer.repair_directory()
+    stale, _tag = store.get(writer.directory_key)
+    writer.publish(omitted)
+    assert set(writer.visible_heads()) == {first.writer}
+    store.stale = stale
+
+    reader = CloudQueue(store, workspace, clock=lambda: now[0])
+    state, cache = PeerState(), CloudCache()
+    cold = reader.sync(state, cache)
+    assert cold.facts == 5
+    assert cold.directory_audit_rounds > 6
+    assert set(state.logs) == {first.writer, omitted.writer}
+
+    writer.publish(later)
+    now[0] = CLOUD_DIRECTORY_AUDIT_MAX_AGE_S - 0.001
+    before = store.metrics.copy()
+    unchanged = reader.sync(state, cache)
+    delta = store.metrics.delta(before)
+    assert not unchanged.changed and later.writer not in state.logs
+    assert delta.gets == delta.conditional_gets == 1
+    assert delta.lists == delta.cas == 0
+
+    now[0] = CLOUD_DIRECTORY_AUDIT_MAX_AGE_S
+    warm = reader.sync(state, cache)
+    assert warm.changed and warm.facts == 4
+    assert set(state.logs) == {first.writer, omitted.writer, later.writer}
+
+
 def test_warm_delta_is_directory_plus_parallel_object_round():
     store = MemoryCloud()
     cloud = CloudQueue(store, h("warm"))
@@ -194,7 +343,8 @@ def test_timestamp_window_uses_directory_footer_and_body_waves():
 
     state = PeerState()
     report = cloud.sync(state, ts_window=(49_000, 51_000))
-    assert report.rounds == 3 and report.object_gets == 4
+    assert report.rounds - report.directory_audit_rounds == 2 \
+        and report.object_gets == 4
     assert report.facts == 1
     assert set(state.logs[log.writer]._facts) == {1}
 
@@ -214,8 +364,8 @@ def test_per_writer_tail_clamps_across_hot_medium_and_1000_long_tail_writers():
             continue
         split = max(0, count - 2)
         if split:
-            cloud.publish(log, 0, split, announce=False)
-        cloud.publish(log, split, count, announce=False)
+            cloud.publish(log, 0, split)
+        cloud.publish(log, split, count)
     cloud.repair_directory()
 
     demand = CloudDemand.tails((log.writer for log in logs), 2)
@@ -253,7 +403,7 @@ def test_per_writer_tail_clamps_across_hot_medium_and_1000_long_tail_writers():
     assert not noop.changed and noop.rounds == 1
     assert delta.gets == delta.conditional_gets == 1
     logs[0].append(Fact("msg", 9_000_000, (), b"one hot-writer delta"))
-    cloud.publish(logs[0], 2_000, 2_001, announce=False)
+    cloud.publish(logs[0], 2_000, 2_001)
     cloud.repair_directory()
     warm = cloud.sync(state, cache, demand=demand)
     assert warm.initial_segment_gets == warm.object_gets == warm.facts == 1
@@ -265,9 +415,9 @@ def test_exact_writer_intervals_normalize_and_subtract_coverage_islands():
     cloud = CloudQueue(store, h("exact demand coverage"))
     log = owned("interval writer", 12)
     receipts = [
-        cloud.publish(log, 0, 4, announce=False),
-        cloud.publish(log, 4, 8, announce=False),
-        cloud.publish(log, 8, 12, announce=False),
+        cloud.publish(log, 0, 4),
+        cloud.publish(log, 4, 8),
+        cloud.publish(log, 8, 12),
     ]
     cloud.repair_directory()
     state = PeerState()
@@ -287,7 +437,9 @@ def test_exact_writer_intervals_normalize_and_subtract_coverage_islands():
     assert report.initial_segment_gets == 2
     assert report.initial_bytes == receipts[1].segment.size \
         + receipts[2].segment.size
-    assert report.object_gets == delta.gets - 1 == 2
+    assert report.directory_audit_gets == 3
+    assert report.object_gets == delta.gets \
+        - report.directory_audit_gets == 2
     assert set(state.logs[log.writer]._facts) == set(range(12))
 
     cache = CloudCache()
@@ -359,7 +511,8 @@ def test_three_players_reach_cloud_and_peer_mesh_convergence():
     # A cold fourth client verifies the cloud's original-writer proofs.
     cold = PeerState()
     report = cloud.sync(cold)
-    assert report.rounds == 2 and report.facts == 54
+    assert report.rounds - report.directory_audit_rounds == 1 \
+        and report.facts == 54
     assert set(cold.entries()) == expected
 
     # The same three original writers converge over the one-driver P2P path.
@@ -405,7 +558,7 @@ def test_folded_segment_inherits_deterministic_cross_writer_annex():
         cloud.publish(citing, 0, 1)
     for seq in range(MICRO_TAIL):
         cloud.publish(
-            citing, seq, seq + 1, holdings=holdings, announce=False)
+            citing, seq, seq + 1, holdings=holdings)
     folded = cloud.fold_idle(citing.writer)
     assert len(folded.segments) == 1
     segment = folded.segments[0]
@@ -460,7 +613,6 @@ def test_applied_annex_publish_retries_without_rebuilding_local_holdings():
 
 def test_recent_window_carries_minimal_transitive_out_of_range_annex():
     store, cloud, a, b, c, receipts = dependency_chain_cloud()
-    directory, _tag = store.get(cloud.directory_key)
     expected_bodies = receipts["a_recent"].segment.size
     state = PeerState()
     before = store.metrics.copy()
@@ -472,11 +624,14 @@ def test_recent_window_carries_minimal_transitive_out_of_range_annex():
     assert report.interactive_ready and not report.pending
     assert report.initial_segment_gets == 1
     assert report.closure_segment_gets == 0
-    assert report.object_gets == delta.gets - 1 == 1
-    assert report.rounds == 2  # directory plus one closed recent micro
+    assert report.directory_audit_gets == 5
+    assert report.object_gets == delta.gets \
+        - report.directory_audit_gets == 1
+    assert report.rounds - report.directory_audit_rounds == 1
     assert report.initial_bytes == receipts["a_recent"].segment.size
     assert report.closure_bytes == 0
-    assert report.received_bytes == len(directory) + expected_bodies
+    assert report.received_bytes - report.directory_audit_bytes \
+        == expected_bodies
     assert report.initial_facts == 1
     assert report.closure_facts == 0
     assert report.facts == 1 and report.carries == 2
@@ -501,10 +656,10 @@ def test_dependency_closure_deduplicates_refs_cycles_and_local_targets():
     holdings = PeerState()
     for log in (a, b, c):
         holdings.add_owned(log)
-    cloud.publish(b, holdings=holdings, announce=False)
-    cloud.publish(c, holdings=holdings, announce=False)
-    cloud.publish(a, 0, 1, holdings=holdings, announce=False)
-    cloud.publish(a, 1, 2, holdings=holdings, announce=False)
+    cloud.publish(b, holdings=holdings)
+    cloud.publish(c, holdings=holdings)
+    cloud.publish(a, 0, 1, holdings=holdings)
+    cloud.publish(a, 1, 2, holdings=holdings)
     cloud.repair_directory()
     state = PeerState()
     state.add_owned(c)
@@ -611,8 +766,8 @@ def test_target_published_after_citer_closes_on_the_next_window_sync():
     log.append(Fact("msg", 1, (), b"old citing history"))
     log.append(Fact(
         "msg", 2, (Ref(log.writer, 2),), b"recent citing fact"))
-    cloud.publish(log, 0, 1, announce=False)
-    cloud.publish(log, 1, 2, announce=False)
+    cloud.publish(log, 0, 1)
+    cloud.publish(log, 1, 2)
     cloud.repair_directory()
     state, cache = PeerState(), CloudCache()
 
@@ -622,7 +777,7 @@ def test_target_published_after_citer_closes_on_the_next_window_sync():
     assert not first.interactive_ready
 
     log.append(Fact("msg", 3, (), b"late cloud target"))
-    cloud.publish(log, 2, 3, announce=False)
+    cloud.publish(log, 2, 3)
     cloud.repair_directory()
     second = cloud.sync(state, cache, demand=demand)
     assert second.interactive_ready and not second.pending
@@ -705,11 +860,13 @@ def test_micro_tail_folds_to_binary_ladder_and_footer_is_suffix_readable():
     log.append(Fact("msg", MICRO_TAIL + 1, (), b"requires idle fold"))
     with pytest.raises(MaintenanceRequired):
         cloud.publish(log, MICRO_TAIL, MICRO_TAIL + 1)
-    assert cloud.visible_heads()[log.writer] == MICRO_TAIL
+    assert cloud.visible_heads() == {}
     slot = cloud.fold_idle(log.writer)
     assert sum(segment.kind == "micro" for segment in slot.segments) == 0
     assert len(slot.segments) < MICRO_TAIL
     assert all(segment.size < MULTIPART_EDGE for segment in slot.segments)
+    cloud.repair_directory()
+    assert cloud.visible_heads()[log.writer] == MICRO_TAIL
     footers = [cloud.footer(segment) for segment in slot.segments]
     assert footers[0]["lo"] == 0 and footers[-1]["hi"] == MICRO_TAIL
 
@@ -721,10 +878,10 @@ def test_each_chat_publish_upload_is_suffix_bounded_not_log_sized():
     uploads = []
     for seq in range(128):
         if seq and seq % MICRO_TAIL == 0:
-            cloud.fold_idle(log.writer, announce=False)
+            cloud.fold_idle(log.writer)
         log.append(Fact("msg", seq + 1, (), b"x" * 90))
         before = store.metrics.copy()
-        cloud.publish(log, seq, seq + 1, announce=False)
+        cloud.publish(log, seq, seq + 1)
         uploads.append(store.metrics.delta(before).object_upload_bytes)
     assert max(uploads) < 8 * 1024
     assert uploads[-1] < uploads[0] + 512
@@ -850,7 +1007,7 @@ def test_same_workspace_writer_races_are_repaired_without_authority_loss():
 
     def publish(queue, log):
         barrier.wait()
-        queue.publish(log, announce=False)
+        queue.publish(log)
         barrier.wait()
         queue.repair_directory()
 
@@ -896,11 +1053,11 @@ def test_cold_body_gets_really_overlap_under_the_named_wave_bound():
     store = DelayedCloud()
     cloud = CloudQueue(store, h("parallel body reads"))
     for ordinal in range(70):
-        cloud.publish(owned(f"parallel-{ordinal}", 1), announce=False)
+        cloud.publish(owned(f"parallel-{ordinal}", 1))
     cloud.repair_directory()
     report = cloud.sync(PeerState())
     assert report.facts == report.object_gets == 70
-    assert report.rounds == 3  # directory + ceil(70 / 64) body waves
+    assert report.rounds - report.directory_audit_rounds == 2
     assert store.maximum_active >= 8
 
 
@@ -924,7 +1081,7 @@ def test_completed_body_ingests_while_another_writer_get_is_in_flight(
     store = PipelinedCloud()
     cloud = CloudQueue(store, h("pipelined body ingest"))
     for ordinal in range(2):
-        cloud.publish(owned(f"pipeline-{ordinal}", 8), announce=False)
+        cloud.publish(owned(f"pipeline-{ordinal}", 8))
     cloud.repair_directory()
     slots, _tag = cloud.poll()
     keys = sorted(
@@ -971,6 +1128,18 @@ def test_lost_slot_cas_response_retries_as_exact_idempotent_ack():
     replica = PeerState()
     assert cloud.sync(replica).facts == 4
     assert set(replica.entries()) == entries(log)
+
+
+def test_exact_publish_and_readmission_retry_survive_a_later_fold():
+    cloud = CloudQueue(MemoryCloud(), h("retry after physical fold"))
+    log = owned("retry folded writer", 2)
+    cloud.publish(log, 0, 1)
+    second = cloud.publish(log, 1, 2)
+    cloud.fold_idle(log.writer)
+
+    assert cloud.publish(log, 1, 2).segment == cloud.readmit_orphan(
+        log.writer, 1, 2).segment
+    assert cloud.readmit_orphan(log.writer, 1, 2).segment == second.segment
 
 
 def test_crash_orphan_exact_retry_finishes_the_original_slot_transition():
@@ -1060,14 +1229,14 @@ def test_same_base_identical_publishers_have_one_slot_winner_and_retry_ack():
 
     def first():
         try:
-            queues[0].publish(log, 0, 3, announce=False)
+            queues[0].publish(log, 0, 3)
         except Exception as error:  # pragma: no cover - asserted below
             failures.append(error)
 
     thread = threading.Thread(target=first)
     thread.start()
     assert store.entered.wait(3)
-    queues[1].publish(log, 0, 3, announce=False)
+    queues[1].publish(log, 0, 3)
     store.release.set()
     thread.join(3)
     assert len(failures) == 1
@@ -1108,7 +1277,7 @@ def test_same_writer_divergent_same_sequence_fails_at_immutable_address():
 
     def publish_first():
         try:
-            CloudQueue(store, workspace).publish(first, announce=False)
+            CloudQueue(store, workspace).publish(first)
         except Exception as error:  # pragma: no cover - asserted below
             failures.append(error)
 
@@ -1116,7 +1285,7 @@ def test_same_writer_divergent_same_sequence_fails_at_immutable_address():
     thread.start()
     assert store.entered.wait(3)
     with pytest.raises(CloudMicroFork) as found:
-        CloudQueue(store, workspace).publish(second, announce=False)
+        CloudQueue(store, workspace).publish(second)
     assert found.value.evidence.writer == first.writer
     assert found.value.evidence.incumbent_hash \
         != found.value.evidence.proposed_hash
@@ -1144,7 +1313,7 @@ def test_delayed_directory_snapshot_regresses_only_hint_until_fair_repair():
     store = DelayedFirstList()
     queue = CloudQueue(store, h("delayed directory"))
     first, second = owned("first listed", 2), owned("second listed", 2)
-    queue.publish(first, announce=False)
+    queue.publish(first)
     failures = []
 
     def stale_repair():
@@ -1156,7 +1325,7 @@ def test_delayed_directory_snapshot_regresses_only_hint_until_fair_repair():
     thread = threading.Thread(target=stale_repair)
     thread.start()
     assert store.entered.wait(3)
-    queue.publish(second, announce=False)
+    queue.publish(second)
     queue.repair_directory()
     assert set(queue.visible_heads()) == {first.writer, second.writer}
     store.release.set()

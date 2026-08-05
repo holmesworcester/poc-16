@@ -13,7 +13,8 @@ def test_decision_record_model_reproduces_round_and_bandwidth_bounds():
 
 def test_measured_three_writer_queue_costs_match_recipe_model():
     report = measure(writers=3, facts_per_writer=40, body_bytes=90)
-    assert report.cold_rounds == 2
+    assert report.cold_rounds - report.cold_directory_audit_rounds == 1
+    assert report.cold_directory_audit_gets == report.writers + 2
     assert report.noop_rounds == report.noop_gets == 1
     assert report.warm_rounds == 2
     assert report.warm_bytes < report.cold_bytes

@@ -461,7 +461,7 @@ def test_live_r2_queue_clobber_scenarios_3_4_5_7(live_r2_store):
 
     def stale_fold():
         try:
-            folding.fold_idle(log.writer, announce=False)
+            folding.fold_idle(log.writer)
         except Exception as error:  # noqa: BLE001 - asserted below
             fold_errors.append(error)
 
@@ -476,7 +476,7 @@ def test_live_r2_queue_clobber_scenarios_3_4_5_7(live_r2_store):
     assert len(fold_errors) == 1
     assert str(fold_errors[0]) == "stale cloud fold"
     audit = CloudQueue(provider(), workspace)
-    assert audit.fold_idle(log.writer, announce=False).hi == 2
+    assert audit.fold_idle(log.writer).hi == 2
     audit.repair_directory()
     folded_state = PeerState()
     assert audit.sync(folded_state).facts == 2
@@ -514,7 +514,7 @@ def test_live_r2_queue_clobber_scenarios_3_4_5_7(live_r2_store):
         large.append(Fact("msg", 10 + seq, (), b"m" * 2_000_000))
         CloudQueue(provider(), workspace).publish(large, seq, seq + 1)
     seed = CloudQueue(provider(), workspace)
-    initial = seed.fold_idle(large.writer, announce=False)
+    initial = seed.fold_idle(large.writer)
     assert initial.segments[-1].size >= MULTIPART_EDGE
     large.append(Fact("msg", 12, (), b"bounded tail" * 100))
     CloudQueue(provider(), workspace).publish(large, 2, 3)
@@ -525,8 +525,7 @@ def test_live_r2_queue_clobber_scenarios_3_4_5_7(live_r2_store):
 
     def concurrent_fold(queue):
         try:
-            fold_results.append(queue.fold_idle(
-                large.writer, announce=False))
+            fold_results.append(queue.fold_idle(large.writer))
         except Exception as error:  # noqa: BLE001 - asserted below
             concurrent_errors.append(error)
 
@@ -560,7 +559,7 @@ def test_live_r2_queue_clobber_scenarios_3_4_5_7(live_r2_store):
                     "msg", 100 + seq, (), f"churn-{seq}".encode("ascii")))
                 writer.publish(churn_log, seq, seq + 1)
                 if seq in {3, 7}:
-                    writer.fold_idle(churn_log.writer, announce=False)
+                    writer.fold_idle(churn_log.writer)
                 writer.repair_directory()
         except Exception as error:  # noqa: BLE001 - asserted below
             churn_errors.append(error)

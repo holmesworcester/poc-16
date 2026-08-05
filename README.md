@@ -775,11 +775,16 @@ was exhausted. The report separates initial and closure GETs, bytes, logical
 facts, closure depth, and segment overfetch. Missing advertised objects,
 corrupt proofs, forks, and omitted addressed targets fail closed.
 
-Cloud publication defaults to owner-confined work: one create-only micro and
-one writer-slot CAS, with no workspace-directory write. `fold_idle()`, the
-32-micro `MaintenanceRequired` boundary, an explicit maintenance call, or a
-reader that observes a missing directory repairs the deterministic LIST-derived
-hint. A closed conditional no-change poll remains one GET.
+Cloud publication is owner-confined work: one create-only micro and one writer-
+slot CAS, with no workspace-directory write. That CAS is the final mutation
+acknowledgement for publish, orphan readmission, and folding; none of those APIs
+accepts an announce option or can fail because later directory work contends.
+Local outbound maintenance coalesces a burst behind a 250 ms idle debounce and
+a 2 second maximum delay. Explicit repair has its own typed result and bounded
+contention failure. A cold sync audits the complete stable slot prefix before
+reporting completion, and a warm cache repeats that audit after 60 seconds;
+intervening closed conditional no-change polls remain one GET. Sync reports the
+audit GET, byte, and dependent-round cost separately.
 
 Every micro also carries a bounded deterministic transitive annex of its
 cross-writer refs, built from the owner's local `PeerState` holdings as exact

@@ -23,6 +23,7 @@ import hashlib
 import math
 import struct
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Protocol
@@ -41,6 +42,10 @@ MULTIPART_EDGE = 5 * 1024 * 1024
 EPOCH_CAP = 64 * 1024 * 1024
 FOOTER_READ = 64 * 1024
 CLOUD_GET_CONCURRENCY = 64
+CLOUD_DIRECTORY_REPAIR_ATTEMPTS = 8
+CLOUD_DIRECTORY_IDLE_DEBOUNCE_S = 0.250
+CLOUD_DIRECTORY_MAX_DELAY_S = 2.0
+CLOUD_DIRECTORY_AUDIT_MAX_AGE_S = 60.0
 CLOUD_CLOSURE_MAX_DEPTH = 32
 CLOUD_CLOSURE_MAX_REFS = 8 * 1024
 CLOUD_CLOSURE_MAX_SEGMENTS = 2 * 1024
@@ -96,6 +101,15 @@ class PartCopyUnavailable(RuntimeError):
 
 class MaintenanceRequired(RuntimeError):
     pass
+
+
+class DirectoryRepairContention(RuntimeError):
+    """The derived directory did not converge within its own retry budget."""
+
+    def __init__(self, attempts):
+        self.attempts = attempts
+        super().__init__(
+            f"cloud directory CAS contention after {attempts} attempts")
 
 
 @dataclass(frozen=True)
@@ -294,9 +308,18 @@ class PublicationReceipt:
     segment: Segment
 
 
+@dataclass(frozen=True)
+class DirectoryRepairResult:
+    directory_tag: str
+    slots: int
+    attempts: int
+    changed: bool
+
+
 @dataclass
 class CloudCache:
     directory_tag: str | None = None
+    directory_audited_at: float | None = None
     request_key: object | None = None
     pending: tuple[Ref, ...] = ()
     closure_exhausted: bool = False
@@ -426,6 +449,9 @@ class CloudSyncReport:
     closure_depth: int = 0
     closure_exhausted: bool = False
     interactive_ready: bool = True
+    directory_audit_gets: int = 0
+    directory_audit_bytes: int = 0
+    directory_audit_rounds: int = 0
 
 
 def _segment_document(segment):
@@ -697,13 +723,16 @@ def _decode_directory(raw, workspace):
 
 
 class CloudQueue:
-    def __init__(self, store, workspace):
+    def __init__(self, store, workspace, *, clock=time.monotonic):
         if not isinstance(workspace, bytes) \
-                or len(workspace) != 32:
+                or len(workspace) != 32 or not callable(clock):
             raise ValueError("cloud queue")
         self.store = store
         self.workspace = workspace
+        self._clock = clock
         self._lock = threading.RLock()
+        self._repair_first_pending_at = None
+        self._repair_last_pending_at = None
 
     @property
     def prefix(self):
@@ -736,17 +765,48 @@ class CloudQueue:
         return {writer: slot.hi
                 for writer, slot in _decode_directory(raw, self.workspace).items()}
 
-    def publish(self, log, lo=None, hi=None, *, carries=(),
-                holdings=None, announce=False):
+    def _schedule_directory_repair(self, now):
+        """Record local owner progress without doing fallible provider work."""
+        if self._repair_first_pending_at is None:
+            self._repair_first_pending_at = now
+        self._repair_last_pending_at = now
+
+    def maintain_directory(self, *, idle, now=None):
+        """Run one coalesced repair after idle debounce or the maximum delay.
+
+        The local outbound scheduler calls this with its current idle state.
+        A burst only records timestamps on its mutation path; provider LIST/CAS
+        work happens here and has an independent typed result or exception.
+        """
+        if type(idle) is not bool:
+            raise ValueError("cloud directory maintenance idle")
+        now = self._clock() if now is None else now
+        if not isinstance(now, (int, float)):
+            raise ValueError("cloud directory maintenance time")
+        with self._lock:
+            first = self._repair_first_pending_at
+            last = self._repair_last_pending_at
+            if first is None:
+                return None
+            due_to_idle = idle and now - last >= CLOUD_DIRECTORY_IDLE_DEBOUNCE_S
+            due_to_age = now - first >= CLOUD_DIRECTORY_MAX_DELAY_S
+            if not (due_to_idle or due_to_age):
+                return None
+            result = self.repair_directory()
+            self._repair_first_pending_at = None
+            self._repair_last_pending_at = None
+            return result
+
+    def publish(self, log, lo=None, hi=None, *, carries=(), holdings=None):
         """Create one immutable micro publication and CAS only its owner slot.
 
-        ``announce=False`` is the store-lag lever: a chat burst updates only
-        owner-confined state, then one idle ``repair_directory`` advertises all
-        writers without placing the derived digest on the publication path.
+        A successful owner-slot CAS is the final acknowledgement boundary.
+        Directory convergence is scheduled as independent idle maintenance.
         """
         if not isinstance(log, WriterLog) or log._secret is None:
             raise ValueError("cloud publish requires owner log")
         carries = tuple(carries)
+        mutation_time = self._clock()
         with self._lock:
             slot, token = self._slot_versioned(log.writer)
             expected = 0 if slot is None else slot.hi
@@ -755,7 +815,7 @@ class CloudQueue:
             # was lost, or after an identical same-base publisher won first.
             # The immutable micro bytes and signed head must both agree; a
             # divergent same-writer proposal still fails closed as a collision.
-            if slot is not None and slot.segments and slot.hi == hi \
+            if slot is not None and slot.hi == hi \
                     and slot.head == encode_head(log.head()):
                 retry_lo = slot.segments[-1].lo if lo is None else lo
                 retry_run = prove_run(log, retry_lo, hi)
@@ -767,19 +827,12 @@ class CloudQueue:
                     retry_descriptor = Segment(
                         retry_key, retry_lo, hi, len(incumbent), 1, "micro")
                     if len(stored) == 1 \
-                            and stored[0].main == retry_run \
-                            and retry_descriptor == slot.segments[-1]:
-                        if announce:
-                            self.repair_directory()
+                            and stored[0].main == retry_run:
+                        self._schedule_directory_repair(mutation_time)
                         return PublicationReceipt(retry_descriptor)
             if slot is not None and sum(
                     item.kind == "micro" for item in slot.segments) \
                     >= MICRO_TAIL:
-                # The owner-confined slot is durable even if the shared hint
-                # lagged throughout the burst. Hitting the maintenance bound
-                # always advertises that durable prefix before asking the
-                # caller to fold it.
-                self.repair_directory()
                 raise MaintenanceRequired("cloud micro tail is ready to fold")
             lo = expected if lo is None else lo
             if lo != expected or hi <= lo:
@@ -813,11 +866,10 @@ class CloudQueue:
             if not self.store.cas(self._slot_key(log.writer), token,
                                   encode_slot(new_slot)):
                 raise ValueError("stale cloud writer slot")
-            if announce:
-                self.repair_directory()
+            self._schedule_directory_repair(mutation_time)
             return PublicationReceipt(descriptor)
 
-    def readmit_orphan(self, writer, lo, hi, *, announce=False):
+    def readmit_orphan(self, writer, lo, hi):
         """Validate and install one micro created before a crashed slot CAS.
 
         This chooses the already signed orphan branch. A divergent restarted
@@ -828,6 +880,7 @@ class CloudQueue:
                 type(item) is not int for item in (lo, hi)) \
                 or lo < 0 or hi <= lo:
             raise ValueError("cloud orphan range")
+        mutation_time = self._clock()
         with self._lock:
             slot, token = self._slot_versioned(writer)
             expected = 0 if slot is None else slot.hi
@@ -843,9 +896,9 @@ class CloudQueue:
             if run.writer != writer or run.lo != lo or run.hi != hi:
                 raise ValueError("cloud orphan binding")
             descriptor = Segment(key, lo, hi, len(raw), 1, "micro")
-            if slot is not None and slot.segments \
-                    and slot.segments[-1] == descriptor \
+            if slot is not None and slot.hi == hi \
                     and slot.head == encode_head(run.head):
+                self._schedule_directory_repair(mutation_time)
                 return PublicationReceipt(descriptor)
             if expected != lo:
                 raise ValueError("stale cloud orphan")
@@ -856,8 +909,7 @@ class CloudQueue:
             if not self.store.cas(
                     self._slot_key(writer), token, encode_slot(replacement)):
                 raise ValueError("stale cloud orphan")
-            if announce:
-                self.repair_directory()
+            self._schedule_directory_repair(mutation_time)
             return PublicationReceipt(descriptor)
 
     def _close_publication(self, publication, holdings):
@@ -964,7 +1016,11 @@ class CloudQueue:
                     raise ValueError("Rule-2 reference lacks adjacent carry")
 
     def repair_directory(self):
-        """Deterministically rebuild the sole non-writer-owned object."""
+        """Deterministically rebuild the sole non-writer-owned object.
+
+        Repair is never part of an owner mutation acknowledgement. Its result
+        and bounded contention failure are explicit maintenance outcomes.
+        """
         slot_keys = self.store.list(self.prefix + "slots/")
         slots = {}
         found_slots = self._parallel(slot_keys, self.store.read_versioned)
@@ -977,13 +1033,16 @@ class CloudQueue:
                 raise ValueError("cloud directory workspace")
             slots[slot.writer] = found.value
         desired = _directory_bytes(self.workspace, slots)
-        for _attempt in range(8):
+        directory_tag = hashlib.sha256(desired).hexdigest()
+        for attempt in range(1, CLOUD_DIRECTORY_REPAIR_ATTEMPTS + 1):
             current = self.store.read_versioned(self.directory_key)
             if current.value == desired:
-                return hashlib.sha256(desired).hexdigest()
+                return DirectoryRepairResult(
+                    directory_tag, len(slots), attempt, False)
             if self.store.cas(self.directory_key, current.token, desired):
-                return hashlib.sha256(desired).hexdigest()
-        raise ValueError("cloud directory CAS contention")
+                return DirectoryRepairResult(
+                    directory_tag, len(slots), attempt, True)
+        raise DirectoryRepairContention(CLOUD_DIRECTORY_REPAIR_ATTEMPTS)
 
     def footer(self, segment):
         raw, _tag = self.store.get(segment.key, suffix=FOOTER_READ)
@@ -1033,8 +1092,9 @@ class CloudQueue:
         return Segment(key, publications[0].main.lo,
                        publications[-1].main.hi, len(raw), weight, kind)
 
-    def fold_idle(self, writer, *, announce=True):
+    def fold_idle(self, writer):
         """Fold the micro tail, carry the binary ladder, then append mono."""
+        mutation_time = self._clock()
         with self._lock:
             slot, token = self._slot_versioned(writer)
             if slot is None:
@@ -1092,8 +1152,7 @@ class CloudQueue:
             if not self.store.cas(self._slot_key(writer), token,
                                   encode_slot(replacement)):
                 raise ValueError("stale cloud fold")
-            if announce:
-                self.repair_directory()
+            self._schedule_directory_repair(mutation_time)
             return replacement
 
     def _append_mono(self, old, additions):
@@ -1183,6 +1242,7 @@ class CloudQueue:
         cache = cache or CloudCache()
         if cache.state is not state:
             cache.directory_tag = None
+            cache.directory_audited_at = None
             cache.request_key = None
             cache.pending = ()
             cache.closure_exhausted = False
@@ -1193,14 +1253,50 @@ class CloudQueue:
         before = self.store.metrics.copy()
         conditional_tag = cache.directory_tag \
             if same_request and cache.interactive_ready else None
-        slots, tag = self.poll(conditional_tag)
+        now = self._clock()
+        audit = cache.directory_audited_at is None \
+            or now - cache.directory_audited_at \
+            >= CLOUD_DIRECTORY_AUDIT_MAX_AGE_S
+        audit_result = None
+        audit_gets = 0
+        audit_bytes = 0
+        audit_rounds = 0
+        if audit:
+            audit_before = self.store.metrics.copy()
+            for _audit_attempt in range(CLOUD_DIRECTORY_REPAIR_ATTEMPTS):
+                audit_result = self.repair_directory()
+                slots, tag = self.poll()
+                audit_rounds += 2 \
+                    + math.ceil(
+                        audit_result.slots / CLOUD_GET_CONCURRENCY) \
+                    + audit_result.attempts + int(audit_result.changed)
+                if slots is not None:
+                    observed = _directory_bytes(self.workspace, {
+                        writer: encode_slot(slot)
+                        for writer, slot in slots.items()
+                    })
+                    if hashlib.sha256(observed).hexdigest() \
+                            == audit_result.directory_tag:
+                        break
+            else:
+                raise DirectoryRepairContention(
+                    CLOUD_DIRECTORY_REPAIR_ATTEMPTS)
+            audit_delta = self.store.metrics.delta(audit_before)
+            audit_gets = audit_delta.gets
+            audit_bytes = audit_delta.downloaded_bytes
+            cache.directory_audited_at = now
+        else:
+            slots, tag = self.poll(conditional_tag)
         if slots is None:
-            return CloudSyncReport(False, 1, 0,
+            return CloudSyncReport(False, 1 if not audit else audit_rounds, 0,
                                    self.store.metrics.downloaded_bytes
                                    - before.downloaded_bytes,
                                    0, 0, cache.pending, tag,
                                    closure_exhausted=cache.closure_exhausted,
-                                   interactive_ready=cache.interactive_ready)
+                                   interactive_ready=cache.interactive_ready,
+                                   directory_audit_gets=audit_gets,
+                                   directory_audit_bytes=audit_bytes,
+                                   directory_audit_rounds=audit_rounds)
         cache.directory_tag = tag
         if not same_request:
             cache.pending = ()
@@ -1397,7 +1493,8 @@ class CloudQueue:
         delta = self.store.metrics.delta(before)
         # Directory, bounded footer waves, then bounded immutable-body waves.
         footer_gets = len(all_segments) if ts_window is not None else 0
-        rounds = 1 + math.ceil(footer_gets / CLOUD_GET_CONCURRENCY) \
+        rounds = audit_rounds + (0 if audit else 1) \
+            + math.ceil(footer_gets / CLOUD_GET_CONCURRENCY) \
             + math.ceil(len(selected) / CLOUD_GET_CONCURRENCY) \
             + closure_rounds
         initial_facts = len(initial_addresses)
@@ -1420,7 +1517,10 @@ class CloudQueue:
                                closure_depth=closure_depth,
                                closure_exhausted=closure_exhausted,
                                interactive_ready=(
-                                   not pending and not closure_exhausted))
+                                   not pending and not closure_exhausted),
+                               directory_audit_gets=audit_gets,
+                               directory_audit_bytes=audit_bytes,
+                               directory_audit_rounds=audit_rounds)
         cache.pending = report.pending
         cache.closure_exhausted = report.closure_exhausted
         cache.interactive_ready = report.interactive_ready
@@ -1462,11 +1562,14 @@ __all__ = (
     "CLOUD_ANNEX_MAX_RUNS",
     "CLOUD_CLOSURE_MAX_BYTES", "CLOUD_CLOSURE_MAX_DEPTH",
     "CLOUD_CLOSURE_MAX_REFS", "CLOUD_CLOSURE_MAX_SEGMENTS",
+    "CLOUD_DIRECTORY_AUDIT_MAX_AGE_S", "CLOUD_DIRECTORY_IDLE_DEBOUNCE_S",
+    "CLOUD_DIRECTORY_MAX_DELAY_S", "CLOUD_DIRECTORY_REPAIR_ATTEMPTS",
     "CLOUD_DEMAND_MAX_INTERVALS", "CLOUD_DEMAND_MAX_INTERVALS_PER_WRITER",
     "CLOUD_DEMAND_MAX_WRITERS", "CLOUD_GET_CONCURRENCY", "CloudCache",
     "CLOUD_PUBLICATION_MAX_BYTES",
     "CloudClosureLimits", "CloudDemand", "CloudMicroFork",
     "CloudMetrics", "CloudObjectStore", "CloudQueue", "CloudSyncReport",
+    "DirectoryRepairContention", "DirectoryRepairResult",
     "EPOCH_CAP", "FOOTER_READ",
     "MICRO_TAIL", "MULTIPART_EDGE", "MaintenanceRequired", "MemoryCloud",
     "MicroForkEvidence",

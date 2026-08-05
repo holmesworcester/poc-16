@@ -1,6 +1,8 @@
+import pytest
+
 from peerlog.cloud import CloudMetrics
 
-from bench.cloud_contention import provider_request_report
+from bench.cloud_contention import _cleanup_live_r2, provider_request_report
 
 
 class Provider:
@@ -35,3 +37,36 @@ def test_contention_report_counts_and_prices_logical_adapter_operations():
     assert report["logical_class_a"] == 16
     assert report["logical_class_b"] == 11
     assert report["projected_logical_r2_usd"] == 0.00007596
+
+
+def test_live_cleanup_is_hard_scoped_to_one_generated_contention_prefix():
+    prefix = "poc16-contention/run-" + "a" * 32
+
+    class MutationClient:
+        def __init__(self, store):
+            self.store = store
+
+        def delete_object(self, **request):
+            physical = request["Key"]
+            assert physical.startswith(prefix + "/")
+            self.store.keys.remove(physical[len(prefix) + 1:])
+
+    class Store:
+        def __init__(self):
+            self.keys = ["cloud/a", "cloud/b"]
+            self._mutation_client = MutationClient(self)
+
+        def list(self, _prefix):
+            return tuple(self.keys)
+
+        @staticmethod
+        def _read_args(key):
+            return {"Bucket": "isolated", "Key": prefix + "/" + key}
+
+    provider = Provider()
+    provider.store = Store()
+    assert _cleanup_live_r2((provider,), prefix) == {
+        "deleted": 2, "remaining": 0}
+
+    with pytest.raises(ValueError, match="outside"):
+        _cleanup_live_r2((provider,), "tinyp2p")

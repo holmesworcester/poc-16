@@ -32,6 +32,9 @@ class CloudCostReport:
     measured_upload_amplification: float
     model_upload_ceiling: float
     million_fact_floor_margin: float
+    cold_directory_audit_rounds: int
+    cold_directory_audit_gets: int
+    cold_directory_audit_bytes: int
 
 
 def measure(writers=3, facts_per_writer=64, body_bytes=90):
@@ -47,7 +50,7 @@ def measure(writers=3, facts_per_writer=64, body_bytes=90):
         logs.append(log)
         for seq in range(facts_per_writer):
             if seq and seq % MICRO_TAIL == 0:
-                cloud.fold_idle(log.writer, announce=False)
+                cloud.fold_idle(log.writer)
             fact = Fact(
                 "msg", writer_number * 1_000_000 + seq + 1, (),
                 bytes([writer_number % 251]) * body_bytes)
@@ -55,8 +58,8 @@ def measure(writers=3, facts_per_writer=64, body_bytes=90):
             log.append(fact)
             authenticated_run_bytes += len(encode_run(prove_run(
                 log, seq, seq + 1)))
-            cloud.publish(log, seq, seq + 1, announce=False)
-        cloud.fold_idle(log.writer, announce=False)
+            cloud.publish(log, seq, seq + 1)
+        cloud.fold_idle(log.writer)
     cloud.repair_directory()
     publication = store.metrics.delta(start)
 
@@ -93,6 +96,9 @@ def measure(writers=3, facts_per_writer=64, body_bytes=90):
         append_projection(max(1, authenticated_run_bytes // writers))
         .worst_amplification,
         cold_model.margin,
+        cold.directory_audit_rounds,
+        cold.directory_audit_gets,
+        cold.directory_audit_bytes,
     )
 
 

@@ -412,6 +412,28 @@ def test_untrusted_boundaries_stay_bounded_and_stream_large_piles():
         }
 
 
+def test_cloud_owner_mutators_cannot_redefine_commit_with_directory_repair():
+    queue = owner(Path("peerlog/cloud.py"), "CloudQueue")
+    mutators = {
+        item.name: item for item in queue.body
+        if isinstance(item, ast.FunctionDef)
+        and item.name in {"publish", "readmit_orphan", "fold_idle"}
+    }
+    assert set(mutators) == {"publish", "readmit_orphan", "fold_idle"}
+    for mutation in mutators.values():
+        parameters = {
+            argument.arg for argument in (
+                *mutation.args.posonlyargs, *mutation.args.args,
+                *mutation.args.kwonlyargs)
+        }
+        assert "announce" not in parameters
+        assert not any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "repair_directory"
+            for call in ast.walk(mutation))
+
+
 def test_provider_lists_validate_native_pages_before_consuming_them():
     s3 = (ROOT / "adapters/s3/store.py").read_text()
     r2 = (ROOT / "adapters/r2/listing.py").read_text()

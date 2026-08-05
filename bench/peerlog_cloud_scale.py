@@ -51,6 +51,9 @@ class ColdScale:
     bandwidth_floor_s: float
     projected_network_s: float
     rtt_margin: float
+    directory_audit_gets: int
+    directory_audit_bytes: int
+    directory_audit_rounds: int
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,8 @@ class FanoutScale:
     warm_rounds: int
     warm_facts: int
     directory_bytes: int
+    cold_directory_audit_gets: int
+    cold_directory_audit_rounds: int
 
 
 @dataclass(frozen=True)
@@ -74,6 +79,7 @@ class RangeScale:
     received_facts: int
     object_gets: int
     rounds: int
+    directory_audit_rounds: int
 
 
 @dataclass(frozen=True)
@@ -97,6 +103,9 @@ class InteractiveScale:
     recent_facts_per_s: float
     semantic_facts_per_s: float
     projected_network_s: float
+    directory_audit_gets: int
+    directory_audit_bytes: int
+    directory_audit_rounds: int
 
 
 @dataclass(frozen=True)
@@ -123,6 +132,9 @@ class SkewedInteractiveScale:
     time_to_interactive_s: float
     semantic_facts_per_s: float
     projected_network_s: float
+    directory_audit_gets: int
+    directory_audit_bytes: int
+    directory_audit_rounds: int
 
 
 @dataclass(frozen=True)
@@ -178,7 +190,7 @@ def measure_cold(*, writers=50, facts=100_000, body_bytes=80):
     logs = []
     for ordinal in range(writers):
         log = _log(ordinal, per_writer, body_bytes)
-        queue.publish(log, announce=False)
+        queue.publish(log)
     queue.repair_directory()
     build_s = time.perf_counter() - started
     directory = store.get(queue.directory_key)[0]
@@ -197,6 +209,8 @@ def measure_cold(*, writers=50, facts=100_000, body_bytes=80):
         facts / sync_s, report.received_bytes / sync_s,
         floor, projected,
         0.0 if not floor else projected / floor - 1.0,
+        report.directory_audit_gets, report.directory_audit_bytes,
+        report.directory_audit_rounds,
     )
 
 
@@ -209,7 +223,7 @@ def measure_fanout(writers):
     for ordinal in range(writers):
         log = _log(ordinal, 1, 24)
         logs.append(log)
-        queue.publish(log, announce=False)
+        queue.publish(log)
     queue.repair_directory()
     directory = store.get(queue.directory_key)[0]
 
@@ -223,15 +237,16 @@ def measure_fanout(writers):
 
     changed = logs[0]
     changed.append(Fact("msg", 9_000_000, (), b"one warm update"))
-    queue.publish(changed, 1, 2, announce=False)
+    queue.publish(changed, 1, 2)
     queue.repair_directory()
     before = store.metrics.copy()
     warm = queue.sync(state, cache)
     warm_cost = store.metrics.delta(before)
     return FanoutScale(
-        writers, cold_cost.gets - 1, cold.rounds,
+        writers, cold_cost.gets, cold.rounds,
         noop_cost.gets, noop.rounds,
         warm_cost.gets - 1, warm.rounds, warm.facts, len(directory),
+        cold.directory_audit_gets, cold.directory_audit_rounds,
     )
 
 
@@ -242,17 +257,18 @@ def measure_range():
         b"peerlog-scale-range-writer").digest()))
     for seq in range(3 * MICRO_TAIL):
         if seq and seq % MICRO_TAIL == 0:
-            queue.fold_idle(log.writer, announce=False)
+            queue.fold_idle(log.writer)
         log.append(Fact("msg", seq + 1, (), b"range" * 8))
-        queue.publish(log, seq, seq + 1, announce=False)
-    queue.fold_idle(log.writer, announce=False)
+        queue.publish(log, seq, seq + 1)
+    queue.fold_idle(log.writer)
     queue.repair_directory()
     lo, hi = 2 * MICRO_TAIL, 3 * MICRO_TAIL
     report = queue.sync(PeerState(), demand=CloudDemand.exact({
         log.writer: ((lo, hi),),
     }))
     return RangeScale(
-        len(log), lo, hi, report.facts, report.object_gets, report.rounds)
+        len(log), lo, hi, report.facts, report.object_gets, report.rounds,
+        report.directory_audit_rounds)
 
 
 def measure_interactive(*, history_facts, recent_facts=1_000,
@@ -292,10 +308,10 @@ def measure_interactive(*, history_facts, recent_facts=1_000,
     holdings = _holdings(logs)
     for log in logs:
         queue.publish(
-            log, 0, recent_lo, holdings=holdings, announce=False)
+            log, 0, recent_lo, holdings=holdings)
         queue.publish(
             log, recent_lo, per_writer,
-            holdings=holdings, announce=False)
+            holdings=holdings)
     queue.repair_directory()
 
     state = PeerState()
@@ -322,6 +338,8 @@ def measure_interactive(*, history_facts, recent_facts=1_000,
         report.segment_overfetch_facts, report.closure_depth,
         report.interactive_ready, elapsed, recent_facts / elapsed,
         (recent_facts + report.carries) / elapsed, projected,
+        report.directory_audit_gets, report.directory_audit_bytes,
+        report.directory_audit_rounds,
     )
 
 
@@ -371,16 +389,16 @@ def measure_skewed_interactive(*, history_facts, requested_tail=2,
         while cursor < split:
             stop = min(split, cursor + SKEW_PUBLICATION_FACTS)
             queue.publish(
-                log, cursor, stop, holdings=holdings, announce=False)
+                log, cursor, stop, holdings=holdings)
             cursor = stop
             micros += 1
             if micros == SKEW_FOLD_PUBLICATIONS:
-                queue.fold_idle(log.writer, announce=False)
+                queue.fold_idle(log.writer)
                 micros = 0
         if micros:
-            queue.fold_idle(log.writer, announce=False)
+            queue.fold_idle(log.writer)
         queue.publish(
-            log, split, count, holdings=holdings, announce=False)
+            log, split, count, holdings=holdings)
     queue.repair_directory()
 
     demand = CloudDemand.tails(
@@ -406,6 +424,8 @@ def measure_skewed_interactive(*, history_facts, requested_tail=2,
         report.segment_overfetch_facts,
         report.closure_depth, report.interactive_ready, elapsed,
         (selected + report.carries) / elapsed, projected,
+        report.directory_audit_gets, report.directory_audit_bytes,
+        report.directory_audit_rounds,
     )
 
 
@@ -429,8 +449,8 @@ def measure_annex(*, facts, ref_stride=8, body_bytes=160):
     for lo in range(0, facts, width):
         queue.publish(
             citing, lo, lo + width,
-            holdings=holdings, announce=False)
-    slot = queue.fold_idle(citing.writer, announce=False)
+            holdings=holdings)
+    slot = queue.fold_idle(citing.writer)
     if len(slot.segments) != 1:
         raise AssertionError("annex scale segment")
     segment = slot.segments[0]

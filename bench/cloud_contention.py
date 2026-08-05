@@ -7,9 +7,9 @@ attacks both with genuinely concurrent clients — separate ``CloudQueue``
 instances over separate provider clients, the real multi-device topology —
 and reports durability, convergence, retry, and provider-throttle counts.
 
-Durability and announcement are scored separately on purpose: a publication
-whose directory update fails is unannounced, not lost, and the design says an
-idle ``repair_directory`` must be able to finish the job.
+Durability and announcement are scored separately on purpose. Owner mutation
+never writes the shared directory, so all publish calls must acknowledge their
+durable slots before one fair, independently scored repair advertises them.
 
     python3 -m bench.cloud_contention --writers 8 --rounds 3
     POC16_LIVE_R2=1 ... python3 -m bench.cloud_contention --live-r2 --writers 6
@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -36,6 +37,8 @@ REQUEST_METRICS = (
     "gets", "puts", "cas", "lists", "multipart_creates", "part_copies",
     "multipart_completes",
 )
+LIVE_PREFIX_RE = re.compile(r"^poc16-contention/run-[0-9a-f]{32}$")
+LIVE_CLEANUP_MAX_KEYS = 10_000
 
 
 @dataclass
@@ -98,7 +101,7 @@ def provider_request_report(providers):
     }
 
 
-def probe_directory_contention(factory, workspace, writers, rounds, announce):
+def probe_directory_contention(factory, workspace, writers, rounds):
     """W distinct writers publish concurrently into one workspace."""
     logs = [WriterLog.owned() for _ in range(writers)]
     queues = [CloudQueue(_make_provider(factory), workspace) for _ in logs]
@@ -113,7 +116,7 @@ def probe_directory_contention(factory, workspace, writers, rounds, announce):
             log.append(Fact("msg", 1000 + round_index,
                             (), f"w{index}r{round_index}".encode()))
             try:
-                cloud.publish(log, announce=announce)
+                cloud.publish(log)
                 with lock:
                     outcome.published += 1
             except Exception as error:  # noqa: BLE001 - probe classifies
@@ -128,8 +131,7 @@ def probe_directory_contention(factory, workspace, writers, rounds, announce):
     # Durability is scored from owner-confined slots, announcement from the
     # derived directory: the design permits the second to lag the first.
     audit = CloudQueue(_make_provider(factory), workspace)
-    if not announce:
-        audit.repair_directory()
+    audit.repair_directory()
     announced = audit.visible_heads()
     durable = {}
     for log in logs:
@@ -165,7 +167,7 @@ def probe_same_writer_race(factory, workspace, clients):
         rival.append(Fact("msg", 2000 + index, (), f"race{index}".encode()))
         barrier.wait()
         try:
-            queues[index].publish(rival, announce=False)
+            queues[index].publish(rival)
             with lock:
                 outcome.published += 1
         except Exception as error:  # noqa: BLE001
@@ -185,7 +187,7 @@ def probe_key_write_rate(factory, workspace, attempts):
     cloud = CloudQueue(_make_provider(factory), workspace)
     log = WriterLog.owned()
     log.append(Fact("msg", 1, (), b"rate"))
-    cloud.publish(log, announce=False)
+    cloud.publish(log)
     outcome = Outcome()
     started = time.perf_counter()
     for _ in range(attempts):
@@ -219,6 +221,28 @@ def _live_r2_factory():
     return factory, prefix
 
 
+def _cleanup_live_r2(providers, prefix):
+    """Delete only this probe's generated namespace through the R2 client."""
+    if not LIVE_PREFIX_RE.fullmatch(prefix):
+        raise ValueError("refusing cleanup outside contention prefix")
+    provider = next(iter(providers), None)
+    if provider is None or not hasattr(provider, "store"):
+        raise ValueError("missing live R2 cleanup provider")
+    store = provider.store
+    keys = store.list("")
+    if len(keys) > LIVE_CLEANUP_MAX_KEYS:
+        raise RuntimeError("refusing unbounded contention cleanup")
+    for key in keys:
+        request = store._read_args(key)
+        if not request["Key"].startswith(prefix + "/"):
+            raise ValueError("refusing out-of-prefix contention cleanup")
+        store._mutation_client.delete_object(**request)
+    remaining = store.list("")
+    if remaining:
+        raise RuntimeError("live R2 contention cleanup incomplete")
+    return {"deleted": len(keys), "remaining": 0}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--writers", type=int, default=8)
@@ -248,26 +272,25 @@ def main():
     report = {"target": "live-r2" if args.live_r2 else "memory",
               "prefix": prefix}
 
-    for announce in (True, False):
-        workspace = secrets.token_bytes(32)
-        outcome, durable, announced = probe_directory_contention(
-            factory, workspace, args.writers, args.rounds, announce)
-        expected = args.writers * args.rounds
-        report[f"directory_announce_{announce}"] = {
-            "attempted": expected,
-            "published_ok": outcome.published,
-            "stale_slot": outcome.stale_slot,
-            "directory_exhausted": outcome.directory_exhausted,
-            "micro_fork": outcome.micro_fork,
-            "throttled": outcome.throttled,
-            "other": outcome.other,
-            "seconds": round(outcome.seconds, 3),
-            "facts_durable": sum(durable.values()),
-            "facts_announced": sum(announced.values()),
-            "writers_announced": len(announced),
-            "durability_complete": sum(durable.values()) == expected,
-            "announcement_complete": sum(announced.values()) == expected,
-        }
+    workspace = secrets.token_bytes(32)
+    outcome, durable, announced = probe_directory_contention(
+        factory, workspace, args.writers, args.rounds)
+    expected = args.writers * args.rounds
+    report["directory_owner_only"] = {
+        "attempted": expected,
+        "published_ok": outcome.published,
+        "stale_slot": outcome.stale_slot,
+        "directory_exhausted": outcome.directory_exhausted,
+        "micro_fork": outcome.micro_fork,
+        "throttled": outcome.throttled,
+        "other": outcome.other,
+        "seconds": round(outcome.seconds, 3),
+        "facts_durable": sum(durable.values()),
+        "facts_announced": sum(announced.values()),
+        "writers_announced": len(announced),
+        "durability_complete": sum(durable.values()) == expected,
+        "announcement_complete": sum(announced.values()) == expected,
+    }
 
     outcome, final_hi, base = probe_same_writer_race(
         factory, secrets.token_bytes(32), args.clients)
@@ -297,6 +320,8 @@ def main():
             outcome.published / outcome.seconds, 2) if outcome.seconds else None,
     }
     report["provider_logical_operations"] = provider_request_report(providers)
+    if args.live_r2:
+        report["cleanup"] = _cleanup_live_r2(providers, prefix)
 
     print(json.dumps(report, indent=2))
 

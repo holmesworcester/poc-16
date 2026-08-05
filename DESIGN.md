@@ -1019,6 +1019,16 @@ in a `CloudDemand` independently requests either:
 - its newest `N` facts, resolved as `[max(0, writer_hi - N), writer_hi)`; or
 - normalized exact half-open sequence intervals.
 
+Owner-slot CAS is the final acknowledgement boundary for publication,
+readmission, and physical folding. Those mutators never attempt shared-
+directory repair after commit. Writer-side maintenance coalesces directory
+repair after an idle debounce with a bounded maximum delay, and repair returns
+its own typed result or bounded contention failure. A cold reader audits the
+complete stable slot prefix before initial completion. A continuously warm
+reader repeats that full audit at a named maximum age; ordinary intervening
+no-change polls remain one conditional GET. Audit requests, bytes, and rounds
+are explicit performance output rather than hidden data-plane cost.
+
 There is no workspace-wide scalar sequence window. The client subtracts its
 held coverage intervals per writer and opens only segments intersecting the
 remaining demand. A segment is the physical read unit: suffix range GETs read
