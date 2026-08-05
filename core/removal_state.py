@@ -271,11 +271,12 @@ class RecipientRemovalState:
         device = getattr(identity, "device", None)
         owner = getattr(identity, "owner", None)
         scopes = getattr(identity, "scopes", None)
+        guards = getattr(identity, "guards", ())
         if not valid_fid(device) or not valid_fid(owner):
             return await self._result("rejected")
         try:
             updates = checked_updates(
-                ((sid, suppression_slot()) for sid in scopes),
+                ((sid, suppression_slot()) for sid in (*scopes, *guards)),
                 MAX_REMOVAL_PATH_SCOPES,
             )
         except (TypeError, ValueError):

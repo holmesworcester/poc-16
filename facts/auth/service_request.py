@@ -151,14 +151,16 @@ def _claim(
     scopes = tuple(sorted(
         set(identity.scopes)
         | facts.fact_scopes(shaped)
-        | {
-            _binding_scope(binding, cell, administrator),
-            facts.principal_sid("member", administrator),
-        }
+        | {_binding_scope(binding, cell, administrator)}
     ))
-    if len(scopes) > MAX_REMOVAL_PATH_SCOPES:
+    administrator_scope = facts.principal_sid("member", administrator)
+    guards = tuple(sorted(
+        set(identity.guards)
+        | ({administrator_scope} if administrator_scope not in scopes else set())
+    ))
+    if len(scopes) + len(guards) > MAX_REMOVAL_PATH_SCOPES:
         raise PayloadTooLarge("service identity has too many removal scopes")
-    return identity._replace(scopes=scopes)
+    return identity._replace(scopes=scopes, guards=guards)
 
 
 def lookup(fact, writer, trusted_now, *, purpose=None, proposed_head=None):

@@ -335,13 +335,14 @@ def test_approving_administrator_removal_revokes_warm_binding(tmp_path):
     assert run(target.state.apply_control(
         control, world["founder"])).status == "applied"
 
-    with pytest.raises(LookupActive):
-        run(authorize_service(
-            target, operations,
-            target_proof(world, admission=False, ts=41),
-            operations_proof(world, admission=False, ts=42),
-            100,
-        ))
+    # A third-party authority guard denies without returning that member's
+    # removal path. Only removal of the requesting subject may disclose one.
+    assert run(authorize_service(
+        target, operations,
+        target_proof(world, admission=False, ts=41),
+        operations_proof(world, admission=False, ts=42),
+        100,
+    )) is None
 
 
 def test_target_leave_revokes_and_fresh_binding_rejoins(tmp_path):

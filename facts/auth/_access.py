@@ -15,6 +15,7 @@ class IdentityClaim(NamedTuple):
     owner: str
     providers: tuple
     scopes: tuple[str, ...]
+    guards: tuple[str, ...]
 
 
 def subject_sid(device, owner):
@@ -35,6 +36,7 @@ def lookup_claim(device, owner):
             facts.principal_sid("device", device),
             facts.principal_sid("member", owner),
         })),
+        (),
     )
 
 
@@ -78,4 +80,4 @@ def claim(valid, stream, writer, *, extra_roles=()):
     }))
     if len(scopes) > MAX_REMOVAL_PATH_SCOPES:
         raise PayloadTooLarge("identity has too many removal scopes")
-    return IdentityClaim(device, owner, tuple(providers), scopes)
+    return IdentityClaim(device, owner, tuple(providers), scopes, ())

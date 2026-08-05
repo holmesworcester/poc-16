@@ -52,11 +52,12 @@ class LookupJudgment:
     pin: object = None
 
     def __post_init__(self):
-        if self.status not in {"unknown", "clear", "active"} \
+        if self.status not in {"unknown", "clear", "active", "denied"} \
                 or self.status == "unknown" and (
                     self.tip is not None or self.path is not None) \
                 or self.status != "unknown" and not valid_fid(self.tip) \
                 or self.status == "clear" and self.path is not None \
+                or self.status == "denied" and self.path is not None \
                 or self.status == "active" and not isinstance(
                     self.path, bytes):
             raise ValueError("lookup judgment")
@@ -93,7 +94,13 @@ class AccessGate:
         pin = await self._pin()
         if pin is None:
             return LookupJudgment("unknown", None, None)
-        key = pin.root_oid, identity.device, identity.owner, identity.scopes
+        key = (
+            pin.root_oid,
+            identity.device,
+            identity.owner,
+            identity.scopes,
+            identity.guards,
+        )
         cached = self._lookup_cache.get(key)
         if cached is not None:
             status, path = cached
@@ -101,10 +108,19 @@ class AccessGate:
                 return LookupJudgment("unknown", None, None)
             return LookupJudgment(status, pin.root_oid, path, pin)
 
-        states = await pin.lookup_many(identity.scopes)
+        coordinates = (*identity.scopes, *identity.guards)
+        states = await pin.lookup_many(coordinates)
+        subject_states = states[:len(identity.scopes)]
+        guard_states = states[len(identity.scopes):]
         active = any(
             value is not None and value.get("state") == "active"
-            for value in states)
+            for value in subject_states)
+        denied = any(
+            value is not None and value.get("state") == "active"
+            for value in guard_states)
+        if not active and denied:
+            self._lookup_cache[key] = ("denied", None)
+            return LookupJudgment("denied", pin.root_oid, None, pin)
         if not active and any(value is None for value in states):
             self._lookup_cache[key] = ("unknown", None)
             return LookupJudgment("unknown", None, None)
@@ -123,6 +139,8 @@ class AccessGate:
     @staticmethod
     def _finish_lookup(judgment, basis, *, admitted=False):
         if judgment.status == "unknown":
+            return None
+        if judgment.status == "denied":
             return None
         if judgment.status == "active":
             raise LookupActive(judgment.tip, judgment.path)
@@ -165,6 +183,8 @@ class AccessGate:
             admitted = True
         judgment = self._finish_lookup(
             judgment, basis, admitted=admitted)
+        if judgment is None:
+            return None
         return identity.device, verb, judgment.tip
 
     async def authorize_head(self, proof, proposed_head, trusted_now):

@@ -874,6 +874,12 @@ before replacement and is idempotent once provider inventory matches desired
 DAG authority. Iroh identity and provider-local ACL databases are never inputs
 to either judgment.
 
+The binding's approving administrator is a continuing denial-only guard. Its
+member removal withdraws the grant, but its private removal row is never placed
+in the service requester's rejection path. Exact warm lookup state instead
+binds the binding fid, capability cell, and approver into one composite cell;
+metadata admitted for separate bindings cannot be recombined.
+
 ### 7.6 Removal and deletion semantics
 
 The important content rules remain:
