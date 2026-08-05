@@ -28,6 +28,7 @@ from .object_store import (
     EXISTS,
     Applied,
     OutcomeUnknown,
+    RetryableStoreError,
     STALE,
     UNCHANGED,
     Versioned,
@@ -56,6 +57,7 @@ class FsStore:
     def __init__(self, root):
         self.root = root
         self._durable_directories = set()
+        self._uncertain_keys = set()
         self._makedirs(root)
         self._cas_lock = os.path.join(root, ".cas.lock")
 
@@ -105,6 +107,20 @@ class FsStore:
     def _after_durable_write(self, _operation, _key):
         """Response-loss seam after the namespace mutation is durable."""
 
+    def _namespace_barrier(self, directory, key, operation):
+        try:
+            self._fsync_directory(directory)
+        except OSError as error:
+            self._uncertain_keys.add(key)
+            raise OutcomeUnknown(
+                f"filesystem {operation} outcome unknown") from error
+        self._uncertain_keys.discard(key)
+
+    def _reconcile_read(self, key):
+        if key in self._uncertain_keys:
+            self._namespace_barrier(
+                os.path.dirname(self._p(key)), key, "read reconciliation")
+
     @staticmethod
     def _path_value(path, maximum):
         try:
@@ -121,6 +137,7 @@ class FsStore:
         return os.path.join(self.root, validate_key(key))
 
     def get(self, key):
+        self._reconcile_read(key)
         try:
             with open(self._p(key), "rb") as f:
                 return f.read()
@@ -132,6 +149,7 @@ class FsStore:
         if type(max_bytes) is not int \
                 or not 0 < max_bytes <= MAX_STORE_READ_BYTES:
             raise ValueError("filesystem read byte limit")
+        self._reconcile_read(key)
         try:
             with open(self._p(key), "rb") as f:
                 value = f.read(max_bytes + 1)
@@ -195,13 +213,24 @@ class FsStore:
         return authoritative_key(key)
 
     def _temp(self, directory, b):
-        fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
+        try:
+            fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
+        except OSError as error:
+            raise RetryableStoreError(
+                "filesystem temporary create did not commit") from error
         try:
             with os.fdopen(fd, "wb") as f:
                 self._write_temp(f, b)
                 f.flush()
                 self._fsync_file(f.fileno())
             return tmp
+        except OSError as error:
+            try:
+                os.remove(tmp)
+            except FileNotFoundError:
+                pass
+            raise RetryableStoreError(
+                "filesystem temporary write did not commit") from error
         except BaseException:
             try:
                 os.remove(tmp)
@@ -218,15 +247,22 @@ class FsStore:
         try:
             try:
                 os.replace(tmp, p)
-            except Exception as error:
+            except OSError as error:
                 if self._path_value(p, len(b)) == b:
+                    try:
+                        self._namespace_barrier(directory, key, "replacement")
+                    except OutcomeUnknown as unknown:
+                        raise unknown from error
                     raise OutcomeUnknown(
                         "filesystem replacement outcome unknown") from error
-                raise
+                raise RetryableStoreError(
+                    "filesystem replacement did not commit") from error
             try:
-                self._fsync_directory(directory)
+                self._namespace_barrier(directory, key, "replacement")
                 self._after_durable_write("replace", key)
-            except Exception as error:
+            except OutcomeUnknown:
+                raise
+            except OSError as error:
                 raise OutcomeUnknown(
                     "filesystem replacement outcome unknown") from error
         except BaseException:
@@ -252,16 +288,24 @@ class FsStore:
             try:
                 os.link(tmp, p)
             except FileExistsError:
+                self._namespace_barrier(directory, key, "create")
                 return EXISTS
-            except Exception as error:
+            except OSError as error:
                 if self._path_value(p, len(b)) == b:
+                    try:
+                        self._namespace_barrier(directory, key, "create")
+                    except OutcomeUnknown as unknown:
+                        raise unknown from error
                     raise OutcomeUnknown(
                         "filesystem create outcome unknown") from error
-                raise
+                raise RetryableStoreError(
+                    "filesystem create did not commit") from error
             try:
-                self._fsync_directory(directory)
+                self._namespace_barrier(directory, key, "create")
                 self._after_durable_write("create", key)
-            except Exception as error:
+            except OutcomeUnknown:
+                raise
+            except OSError as error:
                 raise OutcomeUnknown(
                     "filesystem create outcome unknown") from error
             return CREATED
