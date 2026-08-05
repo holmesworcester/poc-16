@@ -5,7 +5,7 @@ import random
 import facts
 
 from .util import signed_pile_facts
-from core.crypto import keypair
+from core.crypto import load_sk
 from core.fact import Fact, encode
 from core.fact_index import index_rows
 from core.kernel import MemoryContext, accepts, resolve_edges
@@ -14,7 +14,7 @@ from core.limits import (
     MAX_REGISTERED_FACT_ROWS,
     MAX_REGISTERED_SUPPRESSION_ROUTES,
 )
-from full_peer.node import FullPeer, now_ms
+from full_peer.node import FullPeer
 from full_peer.sql_store import SqlStore
 
 from .util import add_member, all_fids, closed_subset, send_bytes
@@ -83,18 +83,34 @@ def test_offer_resolution_matrix_matches_for_exact_and_open_sources(tmp_path):
 
 
 def test_every_family_accepts_against_the_same_complete_context(tmp_path):
-    node = FullPeer(str(tmp_path / "peer"))
+    node = FullPeer(
+        str(tmp_path / "peer"), initial_secret=load_sk("10" * 32))
+    ticks = iter(range(1_000, 2_000))
+    node.now_ms = lambda: next(ticks)
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     facts.auth.device.bind(node, workspace, "phone")
 
-    member = add_member(node, workspace, "bob")[1]
+    invite_secret = load_sk("20" * 32)
+    member_secret = load_sk("30" * 32)
+    member = add_member(
+        node,
+        workspace,
+        "bob",
+        ts=node.now_ms(),
+        invite_identity=(invite_secret,
+                         invite_secret.verify_key.encode().hex()),
+        member_identity=(member_secret,
+                         member_secret.verify_key.encode().hex()),
+    )[1]
     facts.auth.admin.grant(node, workspace, member)
-    sibling_secret, sibling = keypair()
+    sibling_secret = load_sk("40" * 32)
+    sibling = sibling_secret.verify_key.encode().hex()
     node.keychain.add_identity(sibling_secret)
     facts.auth.device_invite.grant(
         node, workspace, node.pk, sibling, "laptop")
-    timestamp = now_ms()
-    _, push_node = keypair()
+    timestamp = node.now_ms()
+    push_secret = load_sk("50" * 32)
+    push_node = push_secret.verify_key.encode().hex()
     facts.auth.push_endpoint.register(
         node,
         workspace,
@@ -107,32 +123,34 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
         ts=timestamp,
     )
     facts.content.notification_preference.set_global(
-        node, workspace, "all", ts=timestamp + 1)
+        node, workspace, "all", ts=node.now_ms())
 
     message = facts.content.message.post(
-        node, workspace, "general", "context contract", ts=timestamp + 2)
+        node, workspace, "general", "context contract", ts=node.now_ms())
     send_bytes(
         node, workspace, "context.bin", b"context",
-        ts=timestamp + 3)
+        ts=node.now_ms())
     facts.content.delete.remove(
-        node, workspace, message, ts=timestamp + 4)
+        node, workspace, message, ts=node.now_ms())
     facts.auth.device_removal.remove(node, workspace, sibling)
     facts.auth.removal.evict(node, workspace, member)
+    request_ts = node.now_ms()
     ephemeral = facts.auth.request.payload(
-        node, workspace, "sync", timestamp + 10_000, timestamp + 6,
+        node, workspace, "sync", request_ts + 10_000, request_ts,
         basis="", admission=True)
+    head_ts = node.now_ms()
     head = facts.auth.head_request.head_request(
         workspace,
         node.pk,
         node.pk,
         None,
         "2" * 64,
-        timestamp + 10_000,
+        head_ts + 10_000,
         "",
-        timestamp + 7,
+        head_ts,
     )
     head_signature = facts.auth.signature.signature(
-        node.sk, node.pk, head, timestamp + 7)
+        node.sk, node.pk, head, head_ts)
 
     durable = signed_pile_facts(
         closed_subset(node, workspace, all_fids(node, workspace)),

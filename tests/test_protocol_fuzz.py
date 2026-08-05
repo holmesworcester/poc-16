@@ -80,6 +80,8 @@ def _mutants(raw, seed, maximum=64):
 
 
 def _assert_total_canonical_codec(label, raw, decode, encode, seed):
+    value = decode(raw)
+    assert encode(value) == raw, f"{label} rejected its canonical sample"
     for ordinal, mutant in enumerate(_mutants(raw, seed)):
         try:
             value = decode(mutant)
