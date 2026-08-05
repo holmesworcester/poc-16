@@ -284,6 +284,8 @@ def _verify_bundle(directory):
         "core/removal_tree.py",
         "core/writer_repository.py",
         "facts/auth/request.py",
+        "facts/auth/service_binding.py",
+        "facts/auth/service_request.py",
         "adapters/r2/listing.py",
         "adapters/r2/worker.py",
         "adapters/r2/reader.py",

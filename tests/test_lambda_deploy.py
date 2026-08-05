@@ -777,6 +777,8 @@ def test_lambda_stage_is_an_explicit_importable_allowlist(tmp_path):
         path.name for path in (staged / "core").glob("*.py")
     } == set(HOSTED_GATE_CORE_MODULES)
     assert (staged / "facts" / "auth" / "request.py").is_file()
+    assert (staged / "facts" / "auth" / "service_binding.py").is_file()
+    assert (staged / "facts" / "auth" / "service_request.py").is_file()
     assert (staged / "adapters" / "s3" / "store.py").is_file()
     assert (staged / "deploy" / "aws_lambda" / "app.py").is_file()
     assert (staged / "deploy" / "aws_lambda" / "config.py").is_file()

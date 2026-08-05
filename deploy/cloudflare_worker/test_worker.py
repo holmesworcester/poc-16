@@ -1219,6 +1219,9 @@ def test_stage_is_minimal_current_and_patches_pynacl(tmp_path, monkeypatch):
     } == set(HOSTED_GATE_CORE_MODULES)
     assert (staged / "facts" / "auth" / "request.py").read_bytes() == (
         manage.REPOSITORY / "facts" / "auth" / "request.py").read_bytes()
+    for name in ("service_binding.py", "service_request.py"):
+        assert (staged / "facts" / "auth" / name).read_bytes() == (
+            manage.REPOSITORY / "facts" / "auth" / name).read_bytes()
     assert (staged / "adapters" / "r2" / "worker.py").read_bytes() == (
         manage.REPOSITORY / "adapters" / "r2" / "worker.py").read_bytes()
     assert (staged / "adapters" / "r2" / "reader.py").read_bytes() == (
