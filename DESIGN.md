@@ -1259,6 +1259,13 @@ would create a second authority model: the tree intentionally contains only
 non-carriable removal judgments, while the positive admission chain travels in
 each closure.
 
+Historical junk from a since-removed writer is bounded rather than trusted:
+directory reads are paged by `PAGE_BATCH`, one unknown writer head is scanned
+per discovery invocation, the ordinary head/tree/pile/fact ceilings apply, and
+an invalid `(device, head)` is retained in the rejected map until that device
+advertises a different head. Removal therefore cannot turn one stale writer
+into an unbounded scan loop.
+
 The slot's recorded removal root remains pinned with the scan so a retry judges
 the same historical head. It does not decide present delivery eligibility.
 Current membership/removal state is reread separately immediately before
