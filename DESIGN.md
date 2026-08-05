@@ -1077,6 +1077,13 @@ The portable store contract becomes:
   notification, queue delivery, or provider-global transactions.
 
 The filesystem adapter is a stronger local implementation of this contract.
+It fsyncs complete temp-file bytes before atomic link/replace, fsyncs every
+new directory entry and the final containing directory, and acknowledges only
+after that durability boundary. A failure after link/replace but before the
+acknowledgement is `OutcomeUnknown`; exact reread reconciles the whole old or
+new value. These filesystem persistence steps implement the portable typed
+outcomes but do not add rename, inode, mtime, or filesystem tokens to the
+protocol.
 S3 uses conditional HTTP requests; the Cloudflare runtime uses native R2
 conditionals. Provider adapters must preserve the same typed outcomes:
 applied, noop, stale/retryable, permanent rejection, and unknown-result

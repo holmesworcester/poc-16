@@ -27,6 +27,7 @@ from .object_store import (
     CREATED,
     EXISTS,
     Applied,
+    OutcomeUnknown,
     STALE,
     UNCHANGED,
     Versioned,
@@ -54,8 +55,64 @@ from .shape import valid_fid
 class FsStore:
     def __init__(self, root):
         self.root = root
-        os.makedirs(root, exist_ok=True)
+        self._durable_directories = set()
+        self._makedirs(root)
         self._cas_lock = os.path.join(root, ".cas.lock")
+
+    @staticmethod
+    def _fsync_file(fd):
+        os.fsync(fd)
+
+    @staticmethod
+    def _fsync_directory(directory):
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        fd = os.open(directory, flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _makedirs(self, directory):
+        """Create every missing component and persist its parent entry."""
+        missing = []
+        current = os.path.abspath(directory)
+        if current in self._durable_directories:
+            return
+        while not os.path.exists(current):
+            missing.append(current)
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+        for path in reversed(missing):
+            try:
+                os.mkdir(path)
+            except FileExistsError:
+                pass
+            self._fsync_directory(os.path.dirname(path))
+        if not missing:
+            # A fresh process cannot inherit the previous process's knowledge
+            # that this visible directory entry crossed a parent fsync.
+            self._fsync_directory(os.path.dirname(current))
+        self._durable_directories.add(os.path.abspath(directory))
+
+    @staticmethod
+    def _write_temp(stream, value):
+        written = stream.write(value)
+        if written != len(value):
+            raise OSError("short filesystem write")
+
+    def _after_durable_write(self, _operation, _key):
+        """Response-loss seam after the namespace mutation is durable."""
+
+    @staticmethod
+    def _path_value(path, maximum):
+        try:
+            with open(path, "rb") as stream:
+                value = stream.read(maximum + 1)
+        except FileNotFoundError:
+            return None
+        return value if len(value) <= maximum else None
 
     def namespace_id(self):
         return "filesystem", os.path.realpath(os.path.abspath(self.root))
@@ -137,12 +194,13 @@ class FsStore:
     def _authoritative(key):
         return authoritative_key(key)
 
-    @staticmethod
-    def _temp(directory, b):
+    def _temp(self, directory, b):
         fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
         try:
             with os.fdopen(fd, "wb") as f:
-                f.write(b)
+                self._write_temp(f, b)
+                f.flush()
+                self._fsync_file(f.fileno())
             return tmp
         except BaseException:
             try:
@@ -155,10 +213,22 @@ class FsStore:
         """Atomic replacement used by CAS and fault injection."""
         p = self._p(key)
         directory = os.path.dirname(p)
-        os.makedirs(directory, exist_ok=True)
+        self._makedirs(directory)
         tmp = self._temp(directory, b)
         try:
-            os.replace(tmp, p)
+            try:
+                os.replace(tmp, p)
+            except Exception as error:
+                if self._path_value(p, len(b)) == b:
+                    raise OutcomeUnknown(
+                        "filesystem replacement outcome unknown") from error
+                raise
+            try:
+                self._fsync_directory(directory)
+                self._after_durable_write("replace", key)
+            except Exception as error:
+                raise OutcomeUnknown(
+                    "filesystem replacement outcome unknown") from error
         except BaseException:
             try:
                 os.remove(tmp)
@@ -176,13 +246,24 @@ class FsStore:
         key = validate_create(key, b)
         p = self._p(key)
         directory = os.path.dirname(p)
-        os.makedirs(directory, exist_ok=True)
+        self._makedirs(directory)
         tmp = self._temp(directory, b)
         try:
             try:
                 os.link(tmp, p)
             except FileExistsError:
                 return EXISTS
+            except Exception as error:
+                if self._path_value(p, len(b)) == b:
+                    raise OutcomeUnknown(
+                        "filesystem create outcome unknown") from error
+                raise
+            try:
+                self._fsync_directory(directory)
+                self._after_durable_write("create", key)
+            except Exception as error:
+                raise OutcomeUnknown(
+                    "filesystem create outcome unknown") from error
             return CREATED
         finally:
             try:

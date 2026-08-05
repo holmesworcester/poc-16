@@ -841,8 +841,13 @@ slots may be replaced independently. The separate notification-state store
 uses `cursor`. There is no mutable key named `root` and no shared content CAS.
 
 The filesystem adapter is a stronger local implementation of the same
-contract. S3 uses conditional requests through `adapters/s3`; the Cloudflare
-runtime uses the native R2 binding through `adapters/r2/worker.py`.
+contract. It fsyncs complete temp bytes before atomic link/replace, persists
+new directory entries and the containing directory, and returns success only
+after that boundary. A failure after the namespace mutation is
+`OutcomeUnknown`; callers reconcile by exact reread and observe only the whole
+old or new value. S3 uses conditional requests through `adapters/s3`; the
+Cloudflare runtime uses the native R2 binding through
+`adapters/r2/worker.py`.
 
 ## AWS deployment
 
