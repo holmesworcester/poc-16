@@ -77,27 +77,31 @@ class FsStore:
 
     def _makedirs(self, directory):
         """Create every missing component and persist its parent entry."""
-        missing = []
-        current = os.path.abspath(directory)
-        if current in self._durable_directories:
-            return
-        while not os.path.exists(current):
-            missing.append(current)
-            parent = os.path.dirname(current)
-            if parent == current:
-                break
-            current = parent
-        for path in reversed(missing):
-            try:
-                os.mkdir(path)
-            except FileExistsError:
-                pass
-            self._fsync_directory(os.path.dirname(path))
-        if not missing:
-            # A fresh process cannot inherit the previous process's knowledge
-            # that this visible directory entry crossed a parent fsync.
-            self._fsync_directory(os.path.dirname(current))
-        self._durable_directories.add(os.path.abspath(directory))
+        try:
+            missing = []
+            current = os.path.abspath(directory)
+            if current in self._durable_directories:
+                return
+            while not os.path.exists(current):
+                missing.append(current)
+                parent = os.path.dirname(current)
+                if parent == current:
+                    break
+                current = parent
+            for path in reversed(missing):
+                try:
+                    os.mkdir(path)
+                except FileExistsError:
+                    pass
+                self._fsync_directory(os.path.dirname(path))
+            if not missing:
+                # A fresh process cannot inherit the previous process's
+                # knowledge that this visible entry crossed a parent fsync.
+                self._fsync_directory(os.path.dirname(current))
+            self._durable_directories.add(os.path.abspath(directory))
+        except OSError as error:
+            raise RetryableStoreError(
+                "filesystem directory setup did not commit") from error
 
     @staticmethod
     def _write_temp(stream, value):
@@ -180,8 +184,10 @@ class FsStore:
                 or not 0 < max_bytes <= MAX_DIRECT_OBJECT_BYTES \
                 or not callable(write):
             raise ValueError("filesystem pile copy")
+        key = "obj/" + oid
+        self._reconcile_read(key)
         try:
-            source = open(self._p("obj/" + oid), "rb")
+            source = open(self._p(key), "rb")
         except FileNotFoundError:
             return None
         total = 0
@@ -222,7 +228,16 @@ class FsStore:
             and opened.token == token else opened
 
     def has(self, key):
+        self._reconcile_read(key)
         return os.path.exists(self._p(key))
+
+    @staticmethod
+    def _ambiguous_readback(operation, namespace_error, readback_error):
+        unknown = OutcomeUnknown(
+            f"filesystem {operation} outcome unknown")
+        unknown.add_note(
+            f"readback also failed: {readback_error!r}")
+        raise unknown from namespace_error
 
     @staticmethod
     def _authoritative(key):
@@ -258,7 +273,12 @@ class FsStore:
             try:
                 os.replace(tmp, p)
             except OSError as error:
-                if self._path_value(p, len(b)) == b:
+                try:
+                    applied = self._path_value(p, len(b)) == b
+                except OSError as readback_error:
+                    self._ambiguous_readback(
+                        "replacement", error, readback_error)
+                if applied:
                     try:
                         self._namespace_barrier(directory, key, "replacement")
                     except OutcomeUnknown as unknown:
@@ -298,7 +318,12 @@ class FsStore:
                 self._namespace_barrier(directory, key, "create")
                 return EXISTS
             except OSError as error:
-                if self._path_value(p, len(b)) == b:
+                try:
+                    applied = self._path_value(p, len(b)) == b
+                except OSError as readback_error:
+                    self._ambiguous_readback(
+                        "create", error, readback_error)
+                if applied:
                     try:
                         self._namespace_barrier(directory, key, "create")
                     except OutcomeUnknown as unknown:
@@ -322,8 +347,17 @@ class FsStore:
     def cas(self, key, token, b):
         if not mutable_key(key):
             raise ValueError("key is not a CAS register")
-        with open(self._cas_lock, "a+b") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            lock = open(self._cas_lock, "a+b")
+        except OSError as error:
+            raise RetryableStoreError(
+                "filesystem CAS lock did not commit") from error
+        with lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            except OSError as error:
+                raise RetryableStoreError(
+                    "filesystem CAS lock did not commit") from error
             current = self.read_versioned(key)
             current_token = current.token \
                 if isinstance(current, Versioned) else ABSENT

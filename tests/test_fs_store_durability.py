@@ -1,5 +1,6 @@
 """Crash-point durability for the stronger local ObjectStore assumption."""
 import os
+import builtins
 
 import pytest
 
@@ -331,3 +332,121 @@ def test_temp_cleanup_failure_never_masks_typed_precommit_failure(
 
     with pytest.raises(RetryableStoreError, match="create did not commit"):
         store.put_if_absent(key, value)
+
+
+@pytest.mark.parametrize("reader", ("has", "copy"))
+@pytest.mark.parametrize("fresh", (False, True))
+def test_streaming_and_existence_reads_complete_directory_barrier(
+        tmp_path, monkeypatch, reader, fresh):
+    store = FsStore(str(tmp_path))
+    value = b"pile visible only after the namespace barrier"
+    key = _immutable(value)
+    store._makedirs(os.path.dirname(store._p(key)))
+    fsync = store._fsync_directory
+    calls = 0
+
+    def fail_once(directory):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise InjectedCrash("lost create barrier")
+        fsync(directory)
+
+    monkeypatch.setattr(store, "_fsync_directory", fail_once)
+    with pytest.raises(OutcomeUnknown):
+        store.put_if_absent(key, value)
+
+    observed = _restart(tmp_path) if fresh else store
+    barriers = []
+    observed_fsync = observed._fsync_directory
+
+    def record(directory):
+        barriers.append(directory)
+        observed_fsync(directory)
+
+    monkeypatch.setattr(observed, "_fsync_directory", record)
+    if reader == "has":
+        assert observed.has(key)
+    else:
+        chunks = []
+        assert observed.copy_pile_object(
+            key[4:], len(value), chunks.append) == len(value)
+        assert b"".join(chunks) == value
+    assert barriers == [os.path.dirname(observed._p(key))]
+
+
+@pytest.mark.parametrize("operation", ("create", "replacement"))
+def test_failed_namespace_mutation_and_readback_is_typed_unknown(
+        tmp_path, monkeypatch, operation):
+    store = FsStore(str(tmp_path))
+    primary = InjectedCrash("namespace response lost")
+    secondary = InjectedCrash("readback unavailable")
+    if operation == "create":
+        value = b"ambiguous create with failed readback"
+        key = _immutable(value)
+        monkeypatch.setattr(
+            "core.store.os.link",
+            lambda *_args: (_ for _ in ()).throw(primary))
+        invoke = lambda: store.put_if_absent(key, value)
+    else:
+        value = b"ambiguous replacement with failed readback"
+        monkeypatch.setattr(
+            "core.store.os.replace",
+            lambda *_args: (_ for _ in ()).throw(primary))
+        invoke = lambda: store.cas("removal", ABSENT, value)
+    monkeypatch.setattr(
+        store, "_path_value",
+        lambda *_args: (_ for _ in ()).throw(secondary))
+
+    with pytest.raises(OutcomeUnknown) as raised:
+        invoke()
+    assert raised.value.__cause__ is primary
+    assert any("readback also failed" in note
+               for note in raised.value.__notes__)
+
+
+@pytest.mark.parametrize("phase", ("mkdir", "parent-fsync"))
+def test_directory_setup_failures_are_typed_precommit(
+        tmp_path, monkeypatch, phase):
+    store = FsStore(str(tmp_path))
+    value = b"directory setup failure"
+    key = _immutable(value)
+    if phase == "mkdir":
+        monkeypatch.setattr(
+            "core.store.os.mkdir",
+            lambda *_args: (_ for _ in ()).throw(
+                InjectedCrash("mkdir")))
+    else:
+        monkeypatch.setattr(
+            store, "_fsync_directory",
+            lambda *_args: (_ for _ in ()).throw(
+                InjectedCrash("parent fsync")))
+
+    with pytest.raises(
+            RetryableStoreError, match="directory setup did not commit"):
+        store.put_if_absent(key, value)
+
+
+@pytest.mark.parametrize("phase", ("open", "flock"))
+def test_cas_lock_failures_are_typed_precommit(
+        tmp_path, monkeypatch, phase):
+    store = FsStore(str(tmp_path))
+    if phase == "open":
+        original_open = builtins.open
+
+        def fail_lock(path, *args, **kwargs):
+            if path == store._cas_lock:
+                raise InjectedCrash("lock open")
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", fail_lock)
+    else:
+        monkeypatch.setattr(
+            "core.store.fcntl.flock",
+            lambda *_args: (_ for _ in ()).throw(
+                InjectedCrash("lock acquire")))
+
+    with pytest.raises(
+            RetryableStoreError, match="CAS lock did not commit"):
+        store.cas("removal", ABSENT, b"never committed")
+    assert not os.path.exists(store._p("removal"))
