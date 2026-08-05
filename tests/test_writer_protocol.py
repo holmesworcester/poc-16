@@ -177,11 +177,15 @@ def test_pile_scanner_bounds_nesting_and_json_values_before_decode(
     assert not decoded
 
 
-def test_pile_scanner_streaming_memory_is_bounded_for_deep_input():
-    depth = MAX_PILE_JSON_VALUES - 4
-    hostile = b'{"facts":[' + b'[' * depth + b'0' \
-        + b']' * depth + b']}'
-
+@pytest.mark.parametrize("hostile", (
+    b'{"facts":['
+    + b'[' * (MAX_PILE_JSON_VALUES - 4)
+    + b'0'
+    + b']' * (MAX_PILE_JSON_VALUES - 4)
+    + b']}',
+    b'{"' + b'x' * (3 * 1024 * 1024) + b'":0}',
+))
+def test_pile_scanner_streaming_memory_is_bounded_for_hostile_input(hostile):
     tracemalloc.start()
     try:
         check_pile_bounds(hostile)
@@ -190,8 +194,9 @@ def test_pile_scanner_streaming_memory_is_bounded_for_deep_input():
         tracemalloc.stop()
 
     # The scanner retains only its bounded delimiter stack, never a decoded
-    # object graph. This ceiling is deliberately far above the ~110 KiB
-    # observed stack so ordinary allocator variation cannot make it flaky.
+    # object graph or an attacker-sized root-key slice. This ceiling is
+    # deliberately far above the ~110 KiB observed stack so ordinary
+    # allocator variation cannot make it flaky.
     assert peak < 2 * 1024 * 1024
 
 

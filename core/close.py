@@ -109,11 +109,12 @@ def _string_end(raw, at):
 
 
 def _facts_key(raw, start, end):
-    token = raw[start:end]
-    if token == b'"facts"':
+    length = end - start
+    if length == 7 and raw[start:end] == b'"facts"':
         return True
-    if len(token) > 64:
+    if length > 64:
         return False
+    token = raw[start:end]
     try:
         return decode_json(token, 64, "pile key") == "facts"
     except ValueError:
