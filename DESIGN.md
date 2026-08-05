@@ -1029,6 +1029,16 @@ reader repeats that full audit at a named maximum age; ordinary intervening
 no-change polls remain one conditional GET. Audit requests, bytes, and rounds
 are explicit performance output rather than hidden data-plane cost.
 
+Mono-log physical append may use provider-side multipart copy only as an
+optimization: copy the exact old semantic-record prefix, upload the new bounded
+tail and replacement footer, and make the destination visible only at complete.
+Live R2 verifies that `UploadPartCopy` honors the inclusive five-MiB range,
+ordered provider part identifiers, invisibility/abort, and source immutability.
+R2 currently reports CRC64NVME rather than SHA-256 through checksum-mode HEAD,
+does not inherit source user metadata into the multipart destination, and emits
+a multipart-shaped ETag. None of those provider values is content authority;
+the completed artifact must still decode to the exact canonical queue bytes.
+
 There is no workspace-wide scalar sequence window. The client subtracts its
 held coverage intervals per writer and opens only segments intersecting the
 remaining demand. A segment is the physical read unit: suffix range GETs read

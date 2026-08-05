@@ -914,14 +914,27 @@ def test_s3_compatible_adapter_runs_cloud_recipe_and_exact_part_copy():
     assert cloud.sync(replica).facts == 6
     assert set(replica.entries()) == entries(log)
 
-    provider.create("multipart/source", b"x" * MULTIPART_EDGE)
+    source = b"x" * MULTIPART_EDGE + b"guarded source suffix"
+    provider.create("multipart/source", source)
     upload = provider.begin_multipart("multipart/destination")
     provider.copy_part(upload, "multipart/source", MULTIPART_EDGE)
     provider.upload_part(upload, b"tail")
+    assert [item["PartNumber"]
+            for item in provider._uploads[upload].parts] == [1, 2]
     assert provider.get("multipart/destination")[0] is None
     provider.complete_multipart(upload)
     assert provider.get("multipart/destination")[0] \
         == b"x" * MULTIPART_EDGE + b"tail"
+    assert provider.get("multipart/source")[0] == source
+
+    aborted = provider.begin_multipart("multipart/aborted")
+    provider.copy_part(aborted, "multipart/source", MULTIPART_EDGE)
+    assert provider.get("multipart/aborted")[0] is None
+    provider.abort_multipart(aborted)
+    assert provider.get("multipart/aborted")[0] is None
+    assert any(item[1] == "part-copy" and item[3] == MULTIPART_EDGE
+               for item in bucket.history)
+    assert any(item[1] == "multipart-abort" for item in bucket.history)
 
 
 def test_part_copy_failure_automatically_starts_complete_epoch():

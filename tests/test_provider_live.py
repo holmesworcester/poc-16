@@ -18,6 +18,7 @@ These tests reject endpoint overrides.  Emulator runs can exercise SDK wiring
 elsewhere but are not provider evidence.
 """
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -164,6 +165,8 @@ def _cleanup_generated_store(store, *, delete_versions=False):
         if not physical.startswith(prefix + "/"):
             raise ValueError("refusing out-of-prefix cleanup")
         store._mutation_client.delete_object(**request)
+    if store.list(""):
+        raise RuntimeError("live-provider cleanup left reachable objects")
     if delete_versions:
         request = {
             "Bucket": store.config.bucket,
@@ -354,7 +357,7 @@ def test_live_r2_direct_api_conformance(live_r2_store):
 @pytest.mark.live
 @pytest.mark.live_r2
 def test_live_r2_peerlog_rounds_and_five_mib_part_copy(live_r2_store):
-    """Phase-2 evidence; skipped unless direct R2 credentials are explicit."""
+    """Prove exact UploadPartCopy and production mono append on real R2."""
     provider = S3Cloud(live_r2_store())
     workspace = secrets.token_bytes(32)
     cloud = CloudQueue(provider, workspace)
@@ -363,7 +366,8 @@ def test_live_r2_peerlog_rounds_and_five_mib_part_copy(live_r2_store):
     cloud.publish(log)
     cloud.repair_directory()
     state, cache = PeerState(), CloudCache()
-    assert cloud.sync(state, cache).rounds == 2
+    cold = cloud.sync(state, cache)
+    assert cold.rounds - cold.directory_audit_rounds == 1
     assert cloud.sync(state, cache).rounds == 1
 
     # Respect R2's documented same-key write pacing for the derived directory.
@@ -374,13 +378,116 @@ def test_live_r2_peerlog_rounds_and_five_mib_part_copy(live_r2_store):
     assert cloud.sync(state, cache).rounds == 2
 
     edge = b"r" * MULTIPART_EDGE
-    provider.create("part-copy/source", edge)
+    source = edge + b"guarded source suffix"
+    source_digest = hashlib.sha256(source).hexdigest()
+    source_args = provider.store._put_args("part-copy/source", source)
+    source_args["Metadata"] = {"poc16-source-sha256": source_digest}
+    provider.store._mutation_client.put_object(**source_args)
+
+    def head(key, *, checksums=False):
+        request = provider.store._read_args(key)
+        if checksums:
+            request["ChecksumMode"] = "ENABLED"
+        return provider.store._read_client.head_object(**request)
+
+    def checksum_evidence(key):
+        try:
+            response = head(key, checksums=True)
+        except Exception as error:  # noqa: BLE001 - provider evidence shape
+            provider_response = getattr(error, "response", {})
+            return {
+                "supported": False,
+                "status": provider_response.get(
+                    "ResponseMetadata", {}).get("HTTPStatusCode"),
+                "code": provider_response.get("Error", {}).get("Code"),
+            }
+        return {
+            "supported": True,
+            "fields": sorted(
+                key for key in response if key.startswith("Checksum")),
+            "sha256_returned": "ChecksumSHA256" in response,
+        }
+
+    source_head = head("part-copy/source")
+    assert source_head["ContentLength"] == len(source)
+    assert source_head["Metadata"] == {
+        "poc16-source-sha256": source_digest}
     upload = provider.begin_multipart("part-copy/destination")
     provider.copy_part(upload, "part-copy/source", MULTIPART_EDGE)
+    copied_parts = tuple(provider._uploads[upload].parts)
+    assert [item["PartNumber"] for item in copied_parts] == [1]
+    assert all(isinstance(item["ETag"], str) and item["ETag"]
+               for item in copied_parts)
     provider.upload_part(upload, b"tail")
+    declared_parts = tuple(provider._uploads[upload].parts)
+    assert [item["PartNumber"] for item in declared_parts] == [1, 2]
     assert provider.get("part-copy/destination")[0] is None
     provider.complete_multipart(upload)
     assert provider.get("part-copy/destination")[0] == edge + b"tail"
+    assert provider.get("part-copy/source")[0] == source
+    destination_head = head("part-copy/destination")
+    assert destination_head["ContentLength"] == MULTIPART_EDGE + len(b"tail")
+    assert destination_head.get("Metadata", {}) == {}
+
+    aborted = provider.begin_multipart("part-copy/aborted")
+    provider.copy_part(aborted, "part-copy/source", MULTIPART_EDGE)
+    assert provider.get("part-copy/aborted")[0] is None
+    provider.abort_multipart(aborted)
+    assert provider.get("part-copy/aborted")[0] is None
+
+    # Exercise the exact runtime call site: fold a provider-edge mono, append
+    # a bounded tail by UploadPartCopy, then decode and ingest the result.
+    mono_workspace = secrets.token_bytes(32)
+    mono = CloudQueue(provider, mono_workspace)
+    large = WriterLog.owned()
+    for seq in range(2):
+        large.append(Fact("msg", 100 + seq, (), b"m" * 2_000_000))
+        mono.publish(large, seq, seq + 1)
+    initial = mono.fold_idle(large.writer)
+    assert initial.segments[-1].size >= MULTIPART_EDGE
+    large.append(Fact("msg", 102, (), b"bounded mono tail" * 100))
+    mono.publish(large, 2, 3)
+    before_copy = provider.metrics.copy()
+    folded = mono.fold_idle(large.writer)
+    copy_cost = provider.metrics.delta(before_copy)
+    assert folded.hi == 3
+    assert copy_cost.part_copies == copy_cost.multipart_completes == 1
+    assert copy_cost.copied_bytes >= MULTIPART_EDGE
+    mono.repair_directory()
+    replica = PeerState()
+    synced = mono.sync(replica)
+    assert synced.facts == 3
+    assert replica.logs[large.writer].coverage() == ((0, 3),)
+
+    source_checksum = checksum_evidence("part-copy/source")
+    destination_checksum = checksum_evidence("part-copy/destination")
+    for evidence in (source_checksum, destination_checksum):
+        assert evidence["supported"]
+        assert "ChecksumCRC64NVME" in evidence["fields"]
+        assert not evidence["sha256_returned"]
+    multipart_etag = "-" in str(
+        destination_head.get("ETag", "")).strip('"')
+    assert multipart_etag
+
+    cost = provider_request_report((provider,))
+    assert cost["projected_logical_r2_usd"] < 0.05
+    report = {
+        "copied_range_bytes": MULTIPART_EDGE,
+        "part_numbers": [item["PartNumber"] for item in declared_parts],
+        "destination_invisible_before_complete": True,
+        "abort_left_destination": False,
+        "source_unchanged": True,
+        "source_metadata_keys": sorted(source_head["Metadata"]),
+        "destination_metadata_keys": sorted(
+            destination_head.get("Metadata", {})),
+        "source_checksum": source_checksum,
+        "destination_checksum": destination_checksum,
+        "destination_etag_is_multipart_shaped": multipart_etag,
+        "mono_copy_bytes": copy_cost.copied_bytes,
+        "mono_facts": synced.facts,
+        "provider_logical_operations": cost,
+    }
+    print(json.dumps(report, indent=2), flush=True)
 
 
 class _PausedSlotCasCloud(S3Cloud):

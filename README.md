@@ -786,6 +786,17 @@ reporting completion, and a warm cache repeats that audit after 60 seconds;
 intervening closed conditional no-change polls remain one GET. Sync reports the
 audit GET, byte, and dependent-round cost separately.
 
+Above the provider's 5 MiB multipart edge, mono-log append copies the exact old
+record prefix with `UploadPartCopy`, uploads only the bounded new tail/footer,
+and completes with the returned ordered part identifiers. Live R2 evidence
+confirms exact inclusive ranges, pre-completion invisibility, abort cleanup,
+source immutability, and byte-identical runtime decode. Current R2 HEAD with
+checksum mode returns CRC64NVME but no SHA-256 for either the source or the
+multipart result; source user metadata is not inherited, and the multipart
+ETag is not a content hash. Protocol correctness therefore continues to come
+from canonical bytes and signed/hash-checked queue artifacts, never ETag or an
+assumed copied checksum.
+
 Every micro also carries a bounded deterministic transitive annex of its
 cross-writer refs, built from the owner's local `PeerState` holdings as exact
 authenticated runs. Folds preserve those carries, so ordinary cold ranges need
