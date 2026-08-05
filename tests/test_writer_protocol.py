@@ -218,6 +218,7 @@ if sys.argv[1] == "deep":
     hostile = b'{"facts":[' + b'[' * depth + b'0' + b']' * depth + b']}'
 else:
     hostile = b'{"' + b'x' * (3 * 1024 * 1024) + b'":0}'
+tracemalloc.stop()
 tracemalloc.start()
 check_pile_bounds(hostile)
 print(tracemalloc.get_traced_memory()[1])
