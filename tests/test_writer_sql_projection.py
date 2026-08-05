@@ -65,7 +65,7 @@ def test_sql_checkpoint_restart_and_wipe_replay_the_accepted_tree(tmp_path):
         await log.establish(update)
         request = head_request(
             root.fid, public, public, None,
-            update.head_oid, 1_000, b"mechanical removal path", 3)
+            update.head_oid, 1_000, h(b"mechanical removal path"), 3)
         request_signature = signature_fact(
             secret, public, request, 3)
         proof = encode_signed_pile(make_signed_pile(

@@ -7,7 +7,6 @@ from . import (
     head_request,
     push_endpoint,
     removal,
-    removal_path_request,
     request,
     signature,
     user,
@@ -27,6 +26,5 @@ MODULES = (
     head_request,
     push_endpoint,
     removal,
-    removal_path_request,
     request,
 )

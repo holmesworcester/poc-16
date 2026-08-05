@@ -110,7 +110,7 @@ NOTIFICATION_CORE_MODULES = (
     "removal_path.py",
     "shape.py",
     "suppression.py",
-    "suppression_tree.py",
+    "removal_tree.py",
     "writer_head.py",
     "writer_repository.py",
     "writer_tree.py",

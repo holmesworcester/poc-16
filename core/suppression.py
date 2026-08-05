@@ -33,7 +33,7 @@ def suppression_slot(action_fid=None):
 
 
 def checked_suppression_slot(value):
-    """Validate one authenticated SuppressionTree value."""
+    """Validate one authenticated RemovalTree value."""
     if value == {"state": "clear"}:
         return value
     if isinstance(value, dict) \

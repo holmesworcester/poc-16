@@ -12,7 +12,11 @@ import json
 import re
 
 from . import peer_capability
-from .access import ControlHeadRetry
+from .access import (
+    ControlHeadRetry,
+    LookupActive,
+    LookupRefresh,
+)
 from .crypto import h, seal_to
 from .grants import check_token, make_token
 from .limits import (
@@ -48,7 +52,6 @@ from .pack_access import (
     decode_pack_open,
     encode_scoped_request,
 )
-from .removal_path import ProofRefreshRequired, RemovalDenied
 from .shape import valid_fid
 from .writer_head import (
     MAX_HEAD_SLOT_BYTES,
@@ -213,7 +216,6 @@ class HttpGate:
             head_permit_commit=None,
             permit_secret=None,
             mint_authorize=None,
-            path_authorize=None,
             removal_bootstrap=None,
             object_open=None,
             pack_open=None,
@@ -240,7 +242,6 @@ class HttpGate:
         callbacks = (
             ("head permit issuer", head_permit_issue),
             ("head permit committer", head_permit_commit),
-            ("path authorizer", path_authorize),
             ("removal bootstrap", removal_bootstrap),
         )
         if any(value is not None and not callable(value)
@@ -255,7 +256,6 @@ class HttpGate:
                      or len(permit_secret) < 32):
             raise ValueError("control-head permit secret")
         self.permit_secret = permit_secret
-        self.path_authorize = path_authorize
         self.removal_bootstrap = removal_bootstrap
         if object_open is not None and not callable(object_open):
             raise ValueError("object OPEN issuer")
@@ -368,17 +368,24 @@ class HttpGate:
                     )
                     if inspect.isawaitable(grant):
                         grant = await grant
-            except ProofRefreshRequired:
-                return self._json(409, {"error": "proof_refresh_required"})
-            except RemovalDenied:
-                return Response(403)
+            except LookupRefresh as error:
+                return self._json(409, {
+                    "error": "proof_refresh_required",
+                    "tip": error.tip,
+                })
+            except LookupActive as error:
+                return self._json(403, {
+                    "error": "removed",
+                    "path": base64.b64encode(error.path).decode("ascii"),
+                    "tip": error.tip,
+                })
             except (PayloadTooLarge, StoreError):
                 return Response(503)
             except Exception:
                 return Response(403)
             if grant is None:
                 return Response(403)
-            public, verb = grant
+            public, verb, tip = grant
             token = make_token(
                 self.secret, public, self.workspace, verb,
                 capability=self.sync_profile,
@@ -388,34 +395,9 @@ class HttpGate:
                     self.seal(public, token.encode())).decode(),
             }
             response["cap"] = self.sync_profile
+            response["tip"] = tip
             return self._json(200, response)
         return Response(503)
-
-    async def _removal_path(self, body, trusted_now):
-        """Evaluate historical membership and return only caller points."""
-        if self.path_authorize is None:
-            return Response(405)
-        if not isinstance(body, bytes) or len(body) > self.max_request_bytes:
-            return Response(413)
-        try:
-            pile = self._decode_mint(body, self.workspace)
-            if inspect.iscoroutinefunction(self.path_authorize):
-                result = await self.path_authorize(pile, trusted_now)
-            else:
-                result = await _to_thread(
-                    self.path_authorize, pile, trusted_now)
-                if inspect.isawaitable(result):
-                    result = await result
-        except (PayloadTooLarge, StoreError):
-            return Response(503)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return Response(403)
-        if not isinstance(result, bytes) or len(result) > MAX_MINT_REQUEST_BYTES:
-            return Response(403 if result is None else 503)
-        return Response(200, result, {
-            "Cache-Control": "no-store",
-            "Content-Type": "application/json",
-        })
 
     async def _bootstrap_removal(self, body):
         """Evaluate one original direct-member control closure, then discard."""
@@ -474,10 +456,15 @@ class HttpGate:
                 )
                 if inspect.isawaitable(permit):
                     permit = await permit
-        except ProofRefreshRequired:
-            return self._json(409, {"error": "proof_refresh_required"})
-        except RemovalDenied:
-            return Response(403)
+        except LookupRefresh as error:
+            return self._json(409, {
+                "error": "proof_refresh_required", "tip": error.tip})
+        except LookupActive as error:
+            return self._json(403, {
+                "error": "removed",
+                "path": base64.b64encode(error.path).decode("ascii"),
+                "tip": error.tip,
+            })
         except PayloadTooLarge:
             return Response(413)
         except StoreError:
@@ -554,10 +541,15 @@ class HttpGate:
                     self.head_advance, body, proposed_head, trusted_now)
                 if inspect.isawaitable(result):
                     result = await result
-        except ProofRefreshRequired:
-            return self._json(409, {"error": "proof_refresh_required"})
-        except RemovalDenied:
-            return Response(403)
+        except LookupRefresh as error:
+            return self._json(409, {
+                "error": "proof_refresh_required", "tip": error.tip})
+        except LookupActive as error:
+            return self._json(403, {
+                "error": "removed",
+                "path": base64.b64encode(error.path).decode("ascii"),
+                "tip": error.tip,
+            })
         except (PayloadTooLarge, StoreError):
             return Response(503)
         except ValueError:
@@ -860,8 +852,6 @@ class HttpGate:
         path = "/" + path.strip("/")
         if method == "POST" and path == "/mint":
             return MAX_MINT_REQUEST_BYTES
-        if method == "POST" and path == "/removal/path":
-            return MAX_MINT_REQUEST_BYTES
         if method == "POST" and path == "/removal/bootstrap":
             return MAX_CONTROL_PILE_BYTES
         if method == "POST" and path.startswith("/head/"):
@@ -888,7 +878,7 @@ class HttpGate:
         path = "/" + path.strip("/")
         return method == "POST" and (
             path in {
-                "/mint", "/removal/bootstrap", "/removal/path",
+                "/mint", "/removal/bootstrap",
             }
             or path.startswith("/head/")
         )
@@ -918,8 +908,6 @@ class HttpGate:
         trusted_now = self.now()
         if path == "/mint" and method == "POST":
             return await self._mint(body, trusted_now)
-        if path == "/removal/path" and method == "POST":
-            return await self._removal_path(body, trusted_now)
         if path == "/removal/bootstrap" and method == "POST":
             return await self._bootstrap_removal(body)
         if path.startswith("/head/") and method == "POST":

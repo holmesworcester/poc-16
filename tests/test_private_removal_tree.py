@@ -1,4 +1,4 @@
-"""Executable privacy, integrity, bound, and CAS contracts for SuppTree."""
+"""Executable privacy, integrity, bound, and CAS contracts for RemovalTree."""
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -30,7 +30,7 @@ from core.pack_access import (
 )
 from core.store import FsStore
 from core.suppression import suppression_slot
-from core import suppression_tree as tree
+from core import removal_tree as tree
 from facts import principal_sid
 
 from .shared_bucket import ScriptedBucket
@@ -193,7 +193,7 @@ def test_tiny_batch_exact_bound_prunes_nodes_and_one_over_stops_early():
         for index in range(MAX_REMOVAL_UPDATES)
     )
     bucket = ScriptedBucket()
-    state = tree.SuppressionTree(workspace, bucket.handle("writer"))
+    state = tree.RemovalTree(workspace, bucket.handle("writer"))
     assert run(state.apply((initial,))).status == "applied"
     before = len(bucket.history)
 
@@ -318,7 +318,7 @@ def test_exact_256_step_proof_verifies_and_one_over_is_rejected():
 def test_private_nodes_and_root_are_not_object_or_grant_addressable(tmp_path):
     workspace, source = rows()
     store = FsStore(tmp_path / "store")
-    state = tree.SuppressionTree(workspace, store)
+    state = tree.RemovalTree(workspace, store)
     assert run(state.apply(
         source, maximum=MAX_HEAD_REMOVAL_UPDATES)).status == "applied"
     pin = run(state.pin())
@@ -374,8 +374,8 @@ def test_concurrent_root_cas_converges_without_clobbering_private_nodes():
     alice_sid = principal_sid("member", alice)
     bob_sid = principal_sid("member", bob)
     bucket = ScriptedBucket()
-    first = tree.SuppressionTree(workspace, bucket.handle("alice"))
-    second = tree.SuppressionTree(workspace, bucket.handle("bob"))
+    first = tree.RemovalTree(workspace, bucket.handle("alice"))
+    second = tree.RemovalTree(workspace, bucket.handle("bob"))
     paused = bucket.pause(
         "alice", "cas", REMOVAL_ROOT_KEY, when="before")
 
@@ -415,7 +415,7 @@ def test_apply_at_stale_validation_pin_performs_no_mutation():
     sid = principal_sid("member", member)
     other_sid = principal_sid("member", h(b"unrelated member"))
     bucket = ScriptedBucket()
-    state = tree.SuppressionTree(workspace, bucket.handle("recipient"))
+    state = tree.RemovalTree(workspace, bucket.handle("recipient"))
     assert run(state.apply(((sid, suppression_slot()),))).status == "applied"
     stale = run(state.pin())
 
@@ -454,9 +454,9 @@ def test_private_node_create_recovers_after_unknown_applied_outcome():
         bucket, "writer", "put_if_absent",
         tree.private_node_key(node_oid), "after")
 
-    state = tree.SuppressionTree(workspace, bucket.handle("writer"))
+    state = tree.RemovalTree(workspace, bucket.handle("writer"))
     assert run(state.apply((row,))).status == "applied"
-    restarted = tree.SuppressionTree(
+    restarted = tree.RemovalTree(
         workspace, bucket.handle("restarted"))
     pin = run(restarted.pin())
     assert pin.verify(sid, run(pin.proof(sid))) == suppression_slot()
@@ -471,12 +471,12 @@ def test_root_cas_unknown_outcome_is_restart_safe(unknown_when):
     bucket = ScriptedBucket()
     lose_response(
         bucket, "writer", "cas", REMOVAL_ROOT_KEY, unknown_when)
-    state = tree.SuppressionTree(workspace, bucket.handle("writer"))
+    state = tree.RemovalTree(workspace, bucket.handle("writer"))
 
     first = run(state.apply((row,)))
     assert first.status == (
         "retryable" if unknown_when == "before" else "applied")
-    restarted = tree.SuppressionTree(
+    restarted = tree.RemovalTree(
         workspace, bucket.handle("restarted"))
     if first.status == "retryable":
         assert run(restarted.pin()) is None
@@ -493,8 +493,8 @@ def test_concurrent_actions_retry_to_the_same_minimum_fid(first_is_min):
     low, high = sorted((h(b"race action a"), h(b"race action b")))
     first_action, second_action = (low, high) if first_is_min else (high, low)
     bucket = ScriptedBucket()
-    first = tree.SuppressionTree(workspace, bucket.handle("first"))
-    second = tree.SuppressionTree(workspace, bucket.handle("second"))
+    first = tree.RemovalTree(workspace, bucket.handle("first"))
+    second = tree.RemovalTree(workspace, bucket.handle("second"))
     paused = bucket.pause(
         "first", "cas", REMOVAL_ROOT_KEY, when="before")
 
@@ -522,7 +522,7 @@ def test_existing_wrong_private_bytes_fail_before_root_publication():
     built = tree._build(workspace, (source[0],))
     oid, _raw = built.nodes[0]
     bucket = ScriptedBucket({tree.private_node_key(oid): b"wrong"})
-    state = tree.SuppressionTree(workspace, bucket.handle("writer"))
+    state = tree.RemovalTree(workspace, bucket.handle("writer"))
 
     with pytest.raises(ValueError, match="node conflict"):
         run(state.apply((source[0],)))

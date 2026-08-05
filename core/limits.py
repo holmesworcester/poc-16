@@ -48,13 +48,16 @@ MAX_PAGE_BATCH_BYTES = 4 * MIB
 MAX_MERKLE_PAGE_BYTES = 48 * 1024
 MAX_MERKLE_PAGE_DEPTH = 512
 
-# Private suppression/removal proof geometry. Logical keys are SHA-256
+# Private removal proof geometry. Logical keys are SHA-256
 # digests, so a compressed binary Patricia path has at most one branch for
 # each digest bit. Proofs carry only one target value and opaque sibling
 # commitments; they never carry a dense leaf or neighboring logical keys.
 MAX_REMOVAL_PROOF_STEPS = 256
 MAX_REMOVAL_NODE_BYTES = 1024
-MAX_REMOVAL_ROOT_BYTES = 1024
+# The private judgment pin is fetched whole so a cold gate never walks one
+# provider object per Patricia branch. Hashed rows fit the same bounded 1 MiB
+# control-response envelope; immutable nodes remain for path commitments.
+MAX_REMOVAL_ROOT_BYTES = MAX_ROOT_BYTES
 MAX_REMOVAL_PROOF_BYTES = 32 * 1024
 
 MAX_INVITE_BYTES = MAX_PAGE_BATCH_BYTES

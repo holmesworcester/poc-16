@@ -1036,7 +1036,7 @@ class RepositoryMirror:
         self.observe_controls = observe_controls
 
     def _control_plan(self, batch, device, pile_values):
-        """Evaluate all accepted control sinks into one bounded local turn."""
+        """Evaluate peer control sinks as independently bounded local turns."""
         if batch is None or not batch.control_piles:
             return None
         if self.control_state is None:
@@ -1052,7 +1052,10 @@ class RepositoryMirror:
         raws = tuple(by_oid[oid] for oid in sorted(by_oid))
         if set(by_oid) != control:
             raise ValueError("recipient control pile set")
-        return self.control_state.plan_control(raws, device)
+        return tuple(
+            self.control_state.plan_control((raw,), device)
+            for raw in raws
+        )
 
     async def _repair_local_slot(self, key, opened):
         """Replay a lagging projection from one already-final writer slot."""
@@ -1246,23 +1249,30 @@ class RepositoryMirror:
         for pile_oid, raw in pile_values:
             await ensure_pile_async(self.store, pile_oid, raw)
 
-        plan = self._control_plan(batch, device, pile_values)
+        plans = self._control_plan(batch, device, pile_values)
         changed = True
-        if plan is not None:
+        if plans is not None:
             base_head = None if accepted is None else head_oid(accepted)
             permit_oid = _mirror_permit_oid(
-                workspace, device, base_head, slot.head, plan.updates)
+                workspace,
+                device,
+                base_head,
+                slot.head,
+                tuple(plan.updates for plan in plans),
+            )
             gate = OpaqueHeadGate(self.store, lambda *_args: None)
             applied = None
-            for _attempt in range(MAX_CONTROL_APPLY_ATTEMPTS):
-                applied = await _maybe_await(
-                    self.control_state.apply_plan(plan))
-                if getattr(applied, "status", None) != "retryable":
-                    break
-            if applied is None or applied.status == "retryable" \
-                    or applied.status not in {"applied", "noop"} \
-                    or not valid_fid(applied.root_oid):
-                raise ValueError("concurrent recipient control application")
+            for plan in plans:
+                for _attempt in range(MAX_CONTROL_APPLY_ATTEMPTS):
+                    applied = await _maybe_await(
+                        self.control_state.apply_plan(plan))
+                    if getattr(applied, "status", None) != "retryable":
+                        break
+                if applied is None or applied.status == "retryable" \
+                        or applied.status not in {"applied", "noop"} \
+                        or not valid_fid(applied.root_oid):
+                    raise ValueError(
+                        "concurrent recipient control application")
             outcome = await gate.advance_control(HeadGrant(
                 workspace,
                 device,

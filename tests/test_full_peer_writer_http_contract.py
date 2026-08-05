@@ -22,6 +22,7 @@ import pytest
 from bench.writer_p2p_cost import measure_two_party_sync
 from core import peer_capability
 from core.access import AccessGate, ControlHeadRetry
+from core.close import decode_signed_pile
 from core.crypto import h, keypair
 from core.fact import canon
 from core.grants import make_token
@@ -238,10 +239,8 @@ class _HostedEndpoint:
     def layout(self, _key, *, response_limit):
         return None
 
-    def removal_path(self):
-        proof = self.node.removal_path_proof(self.ws)
-        return _run(self.access.removal_path(
-            proof, int(time.time() * 1000)))
+    def judgment_tip(self):
+        return _run(self.access.state.pin()).root_oid
 
     async def advance_head(self, proof, proposed):
         self.events.append((
@@ -893,15 +892,14 @@ def test_each_sync_turn_mints_fresh_and_never_publishes_authority(
         sync_module.sync(bob, workspace, url)
 
     assert requests.count(("POST", "/mint")) == 2
-    assert requests.count(("POST", "/removal/path")) == 2
+    assert requests.count(("POST", "/removal/path")) == 0
     assert not [request for request in requests if request[1] == "/authority"]
 
 
-def test_missing_remote_state_attempts_one_original_bootstrap_without_cache(
+def test_missing_remote_state_retries_once_with_positive_admission_chain(
         tmp_path):
     workspace, _alice, bob, _carol = _forest_fixture(tmp_path)
     calls = []
-    expected_bootstrap = bob.removal_bootstrap_pile(workspace)
 
     def reject(method, path, data=None, *_args, **_kwargs):
         calls.append((method, path, data))
@@ -915,10 +913,16 @@ def test_missing_remote_state_attempts_one_original_bootstrap_without_cache(
 
     assert denied.value.code == 403
     assert [(method, path) for method, path, _body in calls] == [
-        ("POST", "/removal/path"),
-        ("POST", "/removal/bootstrap"),
+        ("POST", "/mint"),
+        ("POST", "/mint"),
     ]
-    assert calls[1][2] == expected_bootstrap
+    first = decode_signed_pile(base64.b64decode(
+        json.loads(calls[0][2])["pile"], validate=True))
+    second = decode_signed_pile(base64.b64decode(
+        json.loads(calls[1][2])["pile"], validate=True))
+    assert [fact.t for fact in first.facts] == ["req"]
+    assert [fact.t for fact in second.facts][-2:] == ["signature", "req"]
+    assert len(second.facts) > len(first.facts)
     assert peer._token is peer._sync_profile is None
     assert not hasattr(peer, "authority_recover")
     assert not hasattr(peer, "publish_authority")

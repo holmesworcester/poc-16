@@ -1,5 +1,6 @@
 """Cloudflare request and binding translation around the shared HttpGate."""
 import base64
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import re
 from time import time_ns
@@ -56,6 +57,8 @@ _BUDGETS = {
 _BAD_PERCENT = re.compile(r"%(?![0-9a-fA-F]{2})")
 
 _CRYPTO_READY = False
+_ACCESS_GATES = OrderedDict()
+_ACCESS_GATE_CACHE_MAX = 256
 
 
 def _crypto_self_test():
@@ -214,7 +217,13 @@ def gateway(settings, clock=None):
     clock = now_ms if clock is None else clock
     issuer = settings.issue_packs(clock)
     store = R2BindingStore(settings.bucket, settings.prefix)
-    gate = AccessGate(settings.workspace, store)
+    gate_key = store.namespace_id(), settings.workspace
+    gate = _ACCESS_GATES.pop(gate_key, None)
+    if gate is None:
+        gate = AccessGate(settings.workspace, store)
+    _ACCESS_GATES[gate_key] = gate
+    while len(_ACCESS_GATES) > _ACCESS_GATE_CACHE_MAX:
+        _ACCESS_GATES.popitem(last=False)
     heads = OpaqueHeadGate(store, gate.authorize_head)
 
     async def commit_permit(permit, proposed, secret):
@@ -231,7 +240,6 @@ def gateway(settings, clock=None):
         head_permit_commit=commit_permit,
         permit_secret=settings.permit_secret,
         mint_authorize=gate.authorize_access,
-        path_authorize=gate.removal_path,
         removal_bootstrap=gate.state.bootstrap,
         object_open=issuer.open_object,
         pack_open=issuer.open_pack,

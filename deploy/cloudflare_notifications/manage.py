@@ -140,7 +140,7 @@ WRITER_CONSUMER_CORE_MODULES = (
     "merkle_map.py",
     "removal_path.py",
     "suppression.py",
-    "suppression_tree.py",
+    "removal_tree.py",
     "writer_head.py",
     "writer_repository.py",
     "writer_tree.py",

@@ -21,7 +21,6 @@ from core.writer_repository import (
     open_accepted_pile,
 )
 from facts.auth.head_request import payload as head_proof_payload
-from facts.auth.removal_path_request import payload as path_proof_payload
 
 from . import bao_native, sql_store
 from .keychain import (
@@ -133,7 +132,7 @@ class FullPeer:
             return self._mirrors[workspace]
 
     def access_gate(self, workspace):
-        """Return the database-free two-phase gate for one recipient."""
+        """Return the shared database-free lookup gate for one recipient."""
         with self.lock:
             if workspace not in self._access_gates:
                 self._access_gates[workspace] = AccessGate(
@@ -474,23 +473,9 @@ class FullPeer:
                 secret, self.store(workspace))
         return self._writers[key]
 
-    def removal_path_proof(
-            self, workspace, *, owner=None, closures=()):
-        """Build the historical-member phase signed by this exact device."""
-        timestamp = now_ms()
-        closed = path_proof_payload(
-            self,
-            workspace,
-            timestamp + ACCESS_PROOF_TTL_MS,
-            timestamp,
-            owner=owner,
-            closures=closures,
-        )
-        return self.sender(workspace).pack(closed)
-
     def head_proof(
             self, workspace, owner, base_head, proposed_head, *,
-            removal_path, closures=()):
+            basis, closures=()):
         """Build one disposable proof for this device's exact head update."""
         timestamp = now_ms()
         closed = head_proof_payload(
@@ -500,7 +485,7 @@ class FullPeer:
             base_head,
             proposed_head,
             timestamp + ACCESS_PROOF_TTL_MS,
-            removal_path,
+            basis,
             timestamp,
             closures=closures,
         )
@@ -556,18 +541,15 @@ class FullPeer:
                 raw for oid, raw in zip(update.pile_oids, raw_piles)
                 if oid in control)
 
-            path_proof = self.removal_path_proof(
-                workspace, owner=owner, closures=closures)
-            removal_path = _run_core(access.removal_path(
-                path_proof, now_ms()))
-            if removal_path is None:
-                raise ValueError("historical membership proof rejected")
+            pin = _run_core(access.state.pin())
+            if pin is None:
+                raise ValueError("writer lookup state is absent")
             proof = self.head_proof(
                 workspace,
                 owner,
                 update.base_head,
                 update.head_oid,
-                removal_path=removal_path,
+                basis=pin.root_oid,
                 closures=closures,
             )
             head_gate = self.head_gate(workspace)

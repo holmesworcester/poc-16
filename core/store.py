@@ -28,6 +28,7 @@ from .object_store import (
     EXISTS,
     Applied,
     STALE,
+    UNCHANGED,
     Versioned,
     VersionToken,
     ListPage,
@@ -120,6 +121,14 @@ class FsStore:
         value = self.get_bounded(key, limit)
         return ABSENT if value is None else Versioned(
             value, VersionToken(h(value)))
+
+    def read_versioned_if_changed(self, key, token):
+        """Local equivalent of an If-None-Match versioned read."""
+        if not isinstance(token, VersionToken):
+            raise TypeError("filesystem conditional read token")
+        opened = self.read_versioned(key)
+        return UNCHANGED if isinstance(opened, Versioned) \
+            and opened.token == token else opened
 
     def has(self, key):
         return os.path.exists(self._p(key))

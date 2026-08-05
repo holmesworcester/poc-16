@@ -68,8 +68,8 @@ ClosedPileEvaluator
     canonical closed-pile bytes -> bounded kernel/family judgment
 
 AccessGate
-    historical-member proof -> caller-confined current removal path
-    current-member proof + path -> exact bounded action
+    signed request -> UNKNOWN, CLEAR, or ACTIVE lookup at recipient pin
+    ACTIVE -> caller-confined rejection path + current tip
 
 RepositoryMirror
     listed head pointers -> missing content-addressed writer-tree objects
@@ -78,7 +78,7 @@ FactConsumer
     pulled pile judgment -> local validated union
 
 HttpGate
-    peer HTTP request -> removal path, authorized object, head, or mirror operation
+    peer HTTP request -> rejection, authorized object, head, or mirror operation
 ```
 
 `LogWriter` normally lives in a stateful full peer and may use SQLite for local
@@ -93,16 +93,15 @@ kernel, and family dispatch for every pushed or pulled pile. No actor may accept
 loose facts, caller-projected rows, or a claimed validation result.
 
 `AccessGate` runs unchanged in a hosted peer, a full peer, or an in-process
-local call. It has two device-signed closed-pile requests. A weak historical-
-membership request proves which member once joined, proves that member signed
-the requesting device's ownership link, and returns only that member/device
-pair's path from the recipient's current removal tree. A strong request is
-again signed by that device, includes the path, and proves present membership
-and non-removal before minting a grant or performing one exact writer-confined
-action. Both judgments and all supplied facts are discarded. The gate never
-asks the caller to synchronize authority state, never admits proof facts to
-content state, and never validates the advertised main writer log. A head
-write opens only its small signed head/control declaration to select the
+local call. An UNKNOWN subject may present its positive admission chain once;
+the gate evaluates and discards those facts after creating the exact CLEAR
+subject row. Every later action carries only its outer device signature and
+last-seen basis. The recipient's own lookup decides UNKNOWN, CLEAR, or ACTIVE;
+an ACTIVE rejection includes only rows belonging to that subject and the
+recipient's current tip. The gate never asks the caller to synchronize
+authority state, never admits proof facts to content state, and never validates
+the advertised main writer log. A head write opens only its small signed
+head/control declaration to select the
 ordinary or fenced permit route.
 
 `RepositoryMirror` is database-free and runs on consuming peers. It lists a
@@ -169,7 +168,7 @@ passed. Heads, Merkle pages, pack indexes, and authenticated removal paths are
 bounded retrieval or index evidence; they cannot introduce fact state except
 through a successful closed-pile judgment.
 
-The same evaluator has exactly two uses:
+The evaluator has two semantic uses:
 
 ```text
 pull signed closed pile
@@ -178,16 +177,17 @@ pull signed closed pile
 
 push signed closed pile
     -> the same canonical decode + writer signature + bounded kernel/family judgment
-    -> verify historical membership or current removal-path evidence
-    -> check the exact request-family conditions
+    -> evaluate an UNKNOWN admission chain or an exact control sink
+    -> join only the family-selected recipient judgment rows
     -> discard the judgment and supplied facts
 ```
 
-Pull is replication. Push is not. A pushed pile never enters a recipient log,
-removal tree, or validated fact space and can never become a second publication
-route. It may return only the requester's self-confined removal path or
-authorize the exact operation bound by its request fact, such as a writer-
-confined head CAS, grant, or mirror turn.
+Pull is replication. Push is not. A pushed pile never enters a recipient log or
+validated fact space and can never become a second publication route. Admission
+and control pushes retain only their bounded canonical removal-tree rows. A
+steady request verifies its outer signature, performs the subject lookup, and
+may authorize only the exact operation bound by its request fact, such as a
+writer-confined head CAS, grant, or mirror turn.
 
 This distinction is about retention, not validation. Hosted peers, full peers,
 plain HTTP, HTTP over Iroh, and local in-process calls all feed identical
@@ -769,133 +769,66 @@ SQL row, caller-selected root, or retained proof judgment.
 Permit issuance is the only closed-pile evaluation in this turn. Commit trusts
 only the authenticated permit fields and performs no fact-family dispatch.
 
-### 7.1 Historical membership reveals only the caller's path
+### 7.1 Admission creates the exact subject row once
 
-A client that does not have current removal evidence first pushes the weaker
-historical-membership request to `POST /removal/path`. Its device signature
-authenticates the live request. Its closed dependencies must also contain:
+An UNKNOWN subject may present one device-signed mint request closed over its
+positive workspace admission and device-ownership chain. `AccessGate`
+evaluates that carriable chain once and joins CLEAR rows for the exact member,
+device, and device/owner subject tuple into the recipient's removal tree.
+Relabeling a known device as another owner is therefore UNKNOWN, even if both
+individual principal rows exist. `POST /removal/bootstrap` remains the narrow
+public exception for introducing the original direct-member closure before any
+subject can mint.
 
-1. the member's valid historical workspace admission;
-2. a device-ownership or device-join fact signed by that same member, naming
-   the requesting device; and
-3. the signed request fact binding the workspace, member, device, and removal-
-   path purpose.
+After admission, requests contain only the action fact and the outer device
+signature. A mint binds the workspace and purpose; a head request additionally
+binds the base and proposed head OIDs. The gate never validates ordinary
+content while authorizing access. Full peers still validate every transferred
+head, range proof, pile, and dependency before admitting data.
 
-The ordinary family query asks only whether that member was ever admitted and
-whether that member signed ownership of this requesting device. Current
-removal, leave, or self-removal does not erase those historical facts. If the
-query succeeds, the recipient returns the bounded authenticated path for
-exactly that member and device from the recipient's current removal tree,
-together with the identity of the root that binds it. The recipient never
-discloses the root bytes, so the caller cannot independently re-verify the
-path; only the recipient judges it, at the next request, against the root it
-then pins. Withholding root bytes also keeps the tree's population private.
+### 7.2 One lookup authorizes access or one exact write
 
-This response is not a content grant, head-write grant, bearer token, authority
-snapshot, or workspace-wide removal dump. It cannot reveal another member's
-path. A removed member can therefore learn that it was removed without
-retaining workspace access.
+The gate pins its recipient-owned removal tree and looks up the exact subject.
+UNKNOWN fails closed with no body. CLEAR proceeds. ACTIVE fails with the
+current tip and an authenticated path containing exactly the rows present for
+that subject (at minimum the ACTIVE row). A nonempty basis that names an older
+CLEAR tip receives `proof_refresh_required` and the current tip; the client
+re-signs its action at that basis and retries. The client never presents a
+removal path as a credential, and there is no `POST /removal/path` route.
 
-That confinement is enforced by storage shape, not endpoint etiquette.
-Removal-root and page bytes live under a private removal namespace that generic
-`/obj`, `/pack`, direct-object grants, and writer-store LIST cannot address.
-Recording recipient-local removal-root and permit hashes in a final writer slot
-makes the transition auditable; it does not make either root fetchable. Only
-the historical-membership handler may read the private tree, and it performs
-authenticated point reads for the exact member/device scopes selected by the
-valid request.
+For hosted publication, a successful ordinary head request can conditionally
+replace only the requesting device's deterministic slot. Before exposing a
+head with new control piles, the writer obtains an exact permit at
+`POST /head/<oid>/permit` and commits it at `POST /head/<oid>/commit`. There is
+no bearer-only removal update, accepted-leaf scan, replay cursor, reservation,
+or second control envelope.
 
-The returned witness contains those requested values and non-disclosing
-sibling commitments only. Logical removal keys are hashed before placement,
-and a proof leaf commits to one requested value (or uses an equivalent
-zero-knowledge-of-neighbors shape); it must not serialize an ordinary dense
-Merkle leaf containing adjacent members. Thus possession of an ordinary member
-grant, a recorded root OID, or a sibling path never permits enumeration of the
-removal tree.
+### 7.3 Fetchable-whole state keeps requests bounded
 
-### 7.2 Current membership mints access or one exact write
+The private root value contains the complete sorted hashed row set under the
+same bounded root envelope. A gate caches the decoded tree by root entity tag,
+so steady authorization performs one request signature verification, one
+in-memory lookup, and at most one conditional root read. Immutable Patricia
+nodes remain private path commitments used to build ACTIVE rejection stories;
+authorization must never walk one provider object per branch.
 
-The client then pushes the stronger request — to `POST /mint` for a grant, or
-to the head and permit routes for one exact write. This second closed pile is also
-signed by the requesting member device. It contains the request fact, the
-historical membership and member-signed device-ownership chain, and the exact
-removal-path evidence returned by the recipient.
+Removal roots and nodes are not generic objects: `/obj`, packs, direct-open,
+and LIST cannot address them. A writer slot may record a root hash for audit,
+but that hash is not a read capability. Rejection witnesses contain only the
+requesting subject's values and opaque siblings, never dense leaves or adjacent
+subjects.
 
-`AccessGate` pins the recipient's current removal root, invokes the same
-evaluator, verifies that the path belongs to the named member and device at
-that exact root, and runs the request family's ordinary bounded query over only
-that request-local judgment. The query must establish:
+### 7.4 Pins make races and commits explicit
 
-1. the requester member was admitted and is not removed or left;
-2. the requesting device is owned by that member and is not removed or self-
-   removed;
-3. when provider-community authority is enabled, the recipient device named by
-   its configured root public key is itself joined and not removed; and
-4. the signed request binds the exact purpose and every action-specific value.
-
-For a read or two-way full-peer sync, a successful mint authorizes only the
-requested workspace/tree operations. For hosted publication it authorizes
-only the requesting device's own writer objects and stable slot. For a full
-peer it may authorize transfer of any writer tree the sender has already
-validated, but the receiver still verifies every signed head, Merkle path, and
-closed pile before admitting facts. For a slot update, the request additionally
-binds the base head and proposed head OID; `OpaqueHeadGate` may conditionally
-replace only that device's deterministic slot.
-
-Before a writer exposes a head containing new control piles, it obtains the
-exact head/control permit at `POST /head/<oid>/permit` and commits it at
-`POST /head/<oid>/commit`. Ordinary heads
-without control retain the one-request current-proof slot CAS. There is no
-bearer-only removal update, accepted-leaf scan, replay cursor, or second
-control envelope. `POST /removal/bootstrap` remains the public, narrow
-exception for introducing one original direct-member CLEAR closure before any
-grant can be minted.
-
-The gate never semantically validates the main writer tree, ordinary content
-pile, or fact as part of minting. For a head write it verifies the small signed
-head and its control-subsequence extension solely to choose the ordinary or
-permit path. The hosted owner target trusts a writer to maintain its own opaque
-log; every consuming peer independently rejects malformed content or a false
-control declaration before use. After the exact answer or action, the proof
-judgment and all supplied facts and path evidence are discarded.
-
-### 7.3 Cached paths fail closed and refresh on demand
-
-Clients may retain the last successful canonical proof and removal path. They
-may reuse those exact bytes while the recipient still pins the named removal
-root. If the tree has advanced, mint returns a typed
-`proof_refresh_required` result without granting access or performing the
-write. The client repeats only the historical-membership request, receives its
-new self-confined path, rebuilds the stronger device-signed request, and
-retries. A refreshed path that proves removal produces a permanent denial.
-
-There is no proactive authority push, authority-only reclosure, pre-mint
-repository synchronization, remote-root marker, forced-resend recovery state,
-or persistent peer authority cache. A fresh mint per sync turn is sufficient;
-losing connection-local bearer state can cause only another proof exchange.
-
-### 7.4 Pins make races explicit
-
-One strong proof is answered entirely against one immutable removal-root pin.
-A concurrent removal-tree update may make that answer immediately stale in
-wall-clock terms, but cannot tear it across roots. A later request pins the
-newer root. An ordinary final writer slot records the root that authorized its
-accepted head. A control permit also binds its issue-time root, while its final
-slot records the resulting root after the authenticated aggregate effects and
-the permit hash that fenced that exact transition. These hashes are private
-recipient-local metadata, not fetch capabilities, and are never used to
-reconstruct a historical authority repository; consumers validate signed
-heads, closed piles, and fact relationships normally.
-
-Removal governs later access and publication after observation; it does not
-rewrite already validated history. An ordinary head CAS uses its pinned view.
-A control-bearing head verifies its issue-time root, applies its ACI removal
-rows, and then attempts one final slot CAS. A losing same-base permit can
-therefore leave fail-safe removal effects, but never a grant; a crash can leave
-removal ahead while a visible head is never ahead of its effects. An exact retry
-is recoverable because the permit rows can be proved already subsumed by the
-live removal tree. There is no workspace-global transaction spanning the
-removal tree and all writer slots.
+One lookup is answered against one immutable pin. A concurrent update may make
+that answer stale afterward, but cannot tear it across roots. An ordinary final
+writer slot records the pin that authorized its head. A control permit binds
+its issue-time live root and bounded canonical missing-row plan; commit applies
+those ACI rows first, pins the result, and then attempts one base-guarded slot
+CAS. A losing permit may leave fail-safe removal effects, but never a grant. A
+crash may leave removal ahead while a visible head is never ahead of its
+effects, and an exact retry succeeds when its rows are already subsumed. There
+is no workspace-global transaction or pending-head journal.
 
 ### 7.5 One protocol identity per node
 
@@ -907,10 +840,9 @@ identity, API-token membership system, or persisted cloud account table must
 not appear beside the fact proof universe.
 
 Provider-community membership and service withdrawal can later be expressed
-as another ordinary workspace and another closed-pile condition. It must
-compose through the same evaluator and self-confined removal-path check; it is
-not implemented by trusting an Iroh identity or by adding a special provider
-ACL to core.
+as another ordinary workspace and another lookup-gate condition. It is not
+implemented by trusting an Iroh identity or by adding a special provider ACL
+to core.
 
 ### 7.6 Removal and deletion semantics
 
@@ -989,13 +921,11 @@ The hosted store deliberately parses nothing, so its rows arrive as the
 bounded canonical plan inside the permit turn above. Both apply control
 effects before exposing the transition they authorize.
 
-Status: the hosted half of this section — strong requests, the private tree,
-permits, pins — is the running implementation, and the running standalone
-weak route (`POST /removal/path`) is subsumed by rejection payloads when
-`poc-16-6j4.37` lands. The peer-side gate instance and the derived tip index
-land with the same bead. Echoing tips relaxes this section's root-withholding
-to pairwise disclosure once that lands; the population-privacy floor becomes
-hashed subject ids plus own-story-in-own-rejection.
+Status: this section is the running implementation. Hosted workers and full
+peers construct the same `AccessGate`; only their store adapters differ. Tips
+are disclosed pairwise in refresh and ACTIVE responses, while the
+population-privacy floor remains hashed subject ids plus
+own-story-in-own-rejection.
 
 ## 8. Suppression and deterministic union
 
@@ -1014,7 +944,7 @@ indexes into SQLite for queries. A consuming database-free peer can keep the
 same `FactConsumer` union in memory and validate streamed pile deltas without
 creating a hidden database. A hosted owner target neither mirrors nor builds a
 combined content projection; its gate needs only its pinned removal tree,
-local trust anchors, and each discarded proof pile.
+local trust anchors, and each ephemeral signed request pile.
 
 ## 9. Sync and range behavior
 
@@ -1197,8 +1127,8 @@ The concurrency proof and deterministic tests must cover:
 - head creation and update at every pagination boundary;
 - short pages, opaque cursors, stale tokens, throttling, and lost responses;
 - removal-tree advancement racing publication and read grants;
-- terminal self-removal crashing before reservation, after pending reservation,
-  after its aggregate removal CAS, and after final slot publication;
+- terminal self-removal crashing before permit issue, after permit issue, after
+  its aggregate removal CAS, and after final slot publication;
 - crashes at every external effect;
 - full-scan repair after every permitted delayed observation.
 
@@ -1359,9 +1289,9 @@ existing `fid`. Unknown predecessor protocol values remain rejected.
 11. Immutable objects exist before a writer advertises a head that names them.
 12. A provider version token is opaque and never a content hash.
 13. LIST output is candidate discovery, never authority.
-14. `AccessGate` evaluates one device-signed request-local closed pile
-   against one recipient-pinned removal root and binds current member/device
-   authority to the exact operation; it does not validate writer content.
+14. `AccessGate` checks one outer device signature and one exact subject lookup
+   against a recipient-pinned removal root. Only UNKNOWN admission additionally
+   evaluates its positive chain; the gate never validates writer content.
 15. A control-bearing head is preauthorized while current and binds its exact
     base, proposed head, issue-time root, and canonical aggregate removal plan.
     Commit applies those ACI rows before one final slot CAS; replay may leave
@@ -1392,8 +1322,8 @@ existing `fid`. Unknown predecessor protocol values remain rejected.
 26. One device root secret plus invite-derived facts is the complete protocol
     identity bootstrap for a node.
 27. No workspace-global mutable content root exists.
-28. Removal-root/page bytes are non-enumerable private verifier state; a caller
-    can obtain only its authenticated member/device point witness through the
-    historical-membership gate.
+28. Removal-root/node bytes are non-enumerable private verifier state; only an
+    ACTIVE caller receives its authenticated available subject rows, inside
+    that caller's rejection.
 29. There is no `POST /authority`, `AuthorityRepository`, authority-root sync,
     or mirror/replay authority-publication hook in the running protocol.

@@ -19,7 +19,6 @@ from tests.shared_bucket import ScriptedBucket
 from tests.test_control_head_permit import (
     exact_head_proof,
     founder_world,
-    historical_proof,
     self_removal_pile,
     signed,
 )
@@ -102,8 +101,7 @@ def test_ordinary_grant_pins_before_concurrent_removal_and_mutates_one_slot():
     item_signature = signature(secret, founder, item, item.ts)
     ordinary = run(writer.prepare(((root, item_signature, item),)))
     run(writer.establish(ordinary))
-    path = run(access.removal_path(
-        historical_proof(secret, founder, root, (root,)), 10))
+    path = run(access.state.pin()).root_oid
     proof = exact_head_proof(
         secret,
         founder,

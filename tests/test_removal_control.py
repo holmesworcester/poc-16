@@ -6,6 +6,7 @@ import facts
 from core.crypto import h, keypair
 from core.kernel import drain
 from core.suppression import scoped_id, suppression_slot
+from facts.auth._access import subject_sid
 from facts.auth.removal import removal
 from facts.auth.request import request
 from facts.auth.signature import signature
@@ -43,6 +44,7 @@ def test_founder_and_joined_member_closures_project_only_the_semantic_sink():
         founder_judgment, (root,))) == {
             scoped_id("device", founder): suppression_slot(),
             scoped_id("member", founder): suppression_slot(),
+            subject_sid(founder, founder): suppression_slot(),
         }
 
     joined_judgment = judged(membership, root.fid)
@@ -54,6 +56,7 @@ def test_founder_and_joined_member_closures_project_only_the_semantic_sink():
         joined_judgment, membership)) == {
             scoped_id("device", member): suppression_slot(),
             scoped_id("member", member): suppression_slot(),
+            subject_sid(member, member): suppression_slot(),
         }
 
 
@@ -73,7 +76,7 @@ def test_content_ephemeral_and_content_target_signature_reject_whole_control_pil
     ordinary = message(root.fid, founder, "general", "hello", 5)
     ordinary_sig = signature(founder_secret, founder, ordinary, 5)
     ephemeral = request(
-        root.fid, founder, founder, "sync", 100, b"path", 6)
+        root.fid, founder, founder, "sync", 100, "", 6)
     ephemeral_sig = signature(founder_secret, founder, ephemeral, 6)
 
     for stream in (

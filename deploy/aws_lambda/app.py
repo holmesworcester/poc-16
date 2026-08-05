@@ -207,7 +207,6 @@ def _gateway():
             head_permit_commit=commit_permit,
             permit_secret=permit_secret,
             mint_authorize=gate.authorize_access,
-            path_authorize=gate.removal_path,
             removal_bootstrap=gate.state.bootstrap,
             object_open=issuer.open_object,
             pack_open=issuer.open_pack,

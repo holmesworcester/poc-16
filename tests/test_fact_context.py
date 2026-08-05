@@ -118,9 +118,7 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
     facts.auth.removal.evict(node, workspace, member)
     ephemeral = facts.auth.request.payload(
         node, workspace, "sync", timestamp + 10_000, timestamp + 6,
-        removal_path=b"[]")
-    historical = facts.auth.removal_path_request.payload(
-        node, workspace, timestamp + 10_000, timestamp + 6)
+        basis="", admission=True)
     head = facts.auth.head_request.head_request(
         workspace,
         node.pk,
@@ -128,7 +126,7 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
         None,
         "2" * 64,
         timestamp + 10_000,
-        b"[]",
+        "",
         timestamp + 7,
     )
     head_signature = facts.auth.signature.signature(
@@ -141,7 +139,6 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
     corpus, seen = list(durable), {fact.fid for fact in durable}
     corpus.extend(fact for fact in ephemeral if fact.fid not in seen)
     seen.update(fact.fid for fact in corpus)
-    corpus.extend(fact for fact in historical if fact.fid not in seen)
     corpus.extend((head_signature, head))
     assert {fact.t for fact in corpus} == set(facts.FAMILIES)
     routes = {
@@ -168,7 +165,6 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
         "msg": (0, 0, 1, 0, 6),
         "notification_preference": (0, 2, 1, 0, 8),
         "push_endpoint": (0, 1, 3, 0, 11),
-        "removal_path_request": (0, 0, 0, 0, 4),
         "req": (0, 0, 0, 0, 4),
         "signature": (0, 1, 0, 0, 5),
         "user": (1, 1, 1, 0, 8),

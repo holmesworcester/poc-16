@@ -1,4 +1,4 @@
-"""Private authenticated point map for suppression and removal state.
+"""Private fetchable-whole authenticated map for removal judgment state.
 
 The logical map is ``suppression id -> CLEAR | ACTIVE(action_fid)``.  Its
 keys are SHA-256 hashes bound to one workspace and format domain.  A compact
@@ -13,6 +13,7 @@ Ordinary HTTP reads, direct-object grants, and public object LISTs therefore
 cannot turn a root commitment into a traversal capability.
 """
 
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from itertools import islice
 
@@ -38,6 +39,7 @@ from .object_store import (
     REMOVAL_NODE_PREFIX,
     REMOVAL_ROOT_KEY,
     STALE,
+    UNCHANGED,
     Applied,
     OutcomeUnknown,
     Versioned,
@@ -49,13 +51,13 @@ from .shape import valid_fid
 
 KEY_FORMAT = "poc16-private-suppression-key-v1"
 NODE_FORMAT = "poc16-private-suppression-node-v1"
-ROOT_FORMAT = "poc16-private-suppression-root-v1"
+ROOT_FORMAT = "poc16-private-suppression-root-v2"
 PROOF_FORMAT = "poc16-private-suppression-proof-v1"
 KEY_BITS = 256
 MAX_MAP_ROWS = (1 << 53) - 1
 
 if KEY_BITS != MAX_REMOVAL_PROOF_STEPS:
-    raise RuntimeError("private suppression proof geometry")
+    raise RuntimeError("private removal proof geometry")
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +65,7 @@ class Root:
     workspace: str
     root: str
     count: int
+    rows: tuple[tuple[str, dict], ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +112,7 @@ class _Proof:
     path: tuple[tuple[int, str], ...]
 
 
-def _suppression_id(sid):
+def _removal_id(sid):
     if not valid_bounded_text(sid, MAX_SUPPRESSION_ID_BYTES):
         raise ValueError("suppression id")
     return sid
@@ -118,14 +121,14 @@ def _suppression_id(sid):
 def logical_key(workspace, sid):
     """Hash one logical id in an exact workspace and format domain."""
     if not valid_fid(workspace):
-        raise ValueError("suppression workspace")
-    return h(canon([KEY_FORMAT, workspace, _suppression_id(sid)]))
+        raise ValueError("removal workspace")
+    return h(canon([KEY_FORMAT, workspace, _removal_id(sid)]))
 
 
 def private_node_key(oid):
     """Return the internal-only content address for one removal node."""
     if not valid_fid(oid):
-        raise ValueError("private suppression node id")
+        raise ValueError("private removal node id")
     return REMOVAL_NODE_PREFIX + oid
 
 
@@ -159,7 +162,7 @@ def join_slots(left, right):
 
 def _leaf_raw(workspace, key, value):
     if not valid_fid(workspace) or not valid_fid(key):
-        raise ValueError("private suppression leaf")
+        raise ValueError("private removal leaf")
     return _node_raw({
         "format": NODE_FORMAT,
         "key": key,
@@ -173,7 +176,7 @@ def _branch_raw(workspace, bit, left, right):
     if not valid_fid(workspace) \
             or type(bit) is not int or not 0 <= bit < KEY_BITS \
             or not valid_fid(left) or not valid_fid(right) or left == right:
-        raise ValueError("private suppression branch")
+        raise ValueError("private removal branch")
     return _node_raw({
         "bit": bit,
         "format": NODE_FORMAT,
@@ -187,16 +190,16 @@ def _branch_raw(workspace, bit, left, right):
 def _node_raw(document):
     raw = canon(document)
     if len(raw) > MAX_REMOVAL_NODE_BYTES:
-        raise PayloadTooLarge("private suppression node too large")
+        raise PayloadTooLarge("private removal node too large")
     return raw
 
 
 def _decode_node(raw, workspace):
-    value = decode_json(raw, MAX_REMOVAL_NODE_BYTES, "suppression node")
+    value = decode_json(raw, MAX_REMOVAL_NODE_BYTES, "removal node")
     if not isinstance(value, dict) or canon(value) != raw \
             or value.get("format") != NODE_FORMAT \
             or value.get("workspace") != workspace:
-        raise ValueError("private suppression node")
+        raise ValueError("private removal node")
     if value.get("kind") == "leaf" and set(value) == {
             "format", "key", "kind", "value", "workspace"} \
             and raw == _leaf_raw(
@@ -206,65 +209,86 @@ def _decode_node(raw, workspace):
             "bit", "format", "kind", "left", "right", "workspace"}:
         if raw != _branch_raw(
                 workspace, value["bit"], value["left"], value["right"]):
-            raise ValueError("private suppression branch")
+            raise ValueError("private removal branch")
         return _Branch(value["bit"], value["left"], value["right"])
-    raise ValueError("private suppression node")
+    raise ValueError("private removal node")
 
 
 def _opened_node(oid, raw, workspace):
     if not isinstance(raw, bytes) or h(raw) != oid:
-        raise ValueError("private suppression node integrity")
+        raise ValueError("private removal node integrity")
     node = _decode_node(raw, workspace)
     if node is None:
-        raise ValueError("private suppression node")
+        raise ValueError("private removal node")
     return node
 
 
-def encode_root(workspace, root="", count=0):
+def encode_root(workspace, root="", count=0, rows=None):
     """Encode the exact small value stored in the private root CAS cell."""
     if not valid_fid(workspace) or not isinstance(root, str) \
             or root and not valid_fid(root) \
             or type(count) is not int or not 0 <= count <= MAX_MAP_ROWS \
             or bool(root) != bool(count):
-        raise ValueError("private suppression root")
-    raw = canon({
+        raise ValueError("private removal root")
+    document = {
         "count": count,
         "format": ROOT_FORMAT,
         "root": root,
         "workspace": workspace,
-    })
+    }
+    if rows is not None:
+        rows = tuple(rows)
+        checked = []
+        for row in rows:
+            if not isinstance(row, (tuple, list)) or len(row) != 2 \
+                    or not valid_fid(row[0]):
+                raise ValueError("private removal root rows")
+            checked.append([row[0], _slot(row[1])])
+        if [row[0] for row in checked] != sorted(set(
+                row[0] for row in checked)) or len(checked) != count:
+            raise ValueError("private removal root rows")
+        document["rows"] = checked
+    raw = canon(document)
     if len(raw) > MAX_REMOVAL_ROOT_BYTES:
-        raise PayloadTooLarge("private suppression root too large")
+        raise PayloadTooLarge("private removal root too large")
     return raw
 
 
 def decode_root(raw, workspace=None):
     """Decode one canonical private root and optionally bind its workspace."""
-    value = decode_json(raw, MAX_REMOVAL_ROOT_BYTES, "suppression root")
-    if not isinstance(value, dict) or set(value) != {
-            "count", "format", "root", "workspace"} \
+    value = decode_json(raw, MAX_REMOVAL_ROOT_BYTES, "removal root")
+    if not isinstance(value, dict) or set(value) not in ({
+            "count", "format", "root", "workspace"}, {
+            "count", "format", "root", "rows", "workspace"}) \
             or value.get("format") != ROOT_FORMAT \
             or not valid_fid(value.get("workspace")) \
             or workspace is not None and value["workspace"] != workspace:
-        raise ValueError("private suppression root")
-    checked = encode_root(value["workspace"], value["root"], value["count"])
+        raise ValueError("private removal root")
+    rows = None if "rows" not in value else tuple(
+        (row[0], row[1])
+        for row in value["rows"]
+        if isinstance(row, list) and len(row) == 2
+    )
+    checked = encode_root(
+        value["workspace"], value["root"], value["count"], rows)
     if checked != raw:
-        raise ValueError("private suppression root")
-    return Root(value["workspace"], value["root"], value["count"])
+        raise ValueError("private removal root")
+    return Root(
+        value["workspace"], value["root"], value["count"], rows)
 
 
 def _proof_document(root_oid, key, value, path):
     if not valid_fid(root_oid) or not valid_fid(key):
-        raise ValueError("private suppression proof")
+        raise ValueError("private removal proof")
     path = tuple(path)
     if len(path) > MAX_REMOVAL_PROOF_STEPS:
-        raise PayloadTooLarge("private suppression proof path")
+        raise PayloadTooLarge("private removal proof path")
     previous = -1
     checked = []
     for bit, sibling in path:
         if type(bit) is not int or not previous < bit < KEY_BITS \
                 or not valid_fid(sibling):
-            raise ValueError("private suppression proof path")
+            raise ValueError("private removal proof path")
         checked.append([bit, sibling])
         previous = bit
     return {
@@ -279,7 +303,7 @@ def _proof_document(root_oid, key, value, path):
 def _encode_proof(root_oid, key, value, path):
     raw = canon(_proof_document(root_oid, key, value, path))
     if len(raw) > MAX_REMOVAL_PROOF_BYTES:
-        raise PayloadTooLarge("private suppression proof too large")
+        raise PayloadTooLarge("private removal proof too large")
     return raw
 
 
@@ -289,7 +313,7 @@ def _decode_proof(raw):
             "format", "key", "path", "root", "value"} \
             or value.get("format") != PROOF_FORMAT \
             or not isinstance(value.get("path"), list):
-        raise ValueError("private suppression proof")
+        raise ValueError("private removal proof")
     try:
         path = tuple(
             tuple(frame) if isinstance(frame, list) else frame
@@ -298,9 +322,9 @@ def _decode_proof(raw):
         checked = _proof_document(
             value["root"], value["key"], value["value"], path)
     except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("private suppression proof") from error
+        raise ValueError("private removal proof") from error
     if checked != value or canon(value) != raw:
-        raise ValueError("private suppression proof")
+        raise ValueError("private removal proof")
     return _Proof(
         value["root"], value["key"], _slot(value["value"]), path)
 
@@ -312,21 +336,21 @@ def _bit(key, index):
 
 def _different_bit(left, right):
     if left == right:
-        raise ValueError("duplicate private suppression key")
+        raise ValueError("duplicate private removal key")
     return KEY_BITS - (int(left, 16) ^ int(right, 16)).bit_length()
 
 
 def _bounded_rows(rows, maximum=MAX_REMOVAL_UPDATES):
     if type(maximum) is not int or not 0 <= maximum \
             <= MAX_HEAD_REMOVAL_UPDATES:
-        raise ValueError("private suppression update bound")
+        raise ValueError("private removal update bound")
     source = rows.items() if isinstance(rows, dict) else rows
     try:
         rows = tuple(islice(iter(source), maximum + 1))
     except TypeError as error:
-        raise ValueError("private suppression rows") from error
+        raise ValueError("private removal rows") from error
     if len(rows) > maximum:
-        raise PayloadTooLarge("too many private suppression updates")
+        raise PayloadTooLarge("too many private removal updates")
     return rows
 
 
@@ -335,9 +359,9 @@ def _materialize(workspace, rows, maximum=MAX_REMOVAL_UPDATES):
     by_sid, keys = {}, {}
     for row in rows:
         if not isinstance(row, (tuple, list)) or len(row) != 2:
-            raise ValueError("private suppression row")
+            raise ValueError("private removal row")
         sid, value = row
-        sid = _suppression_id(sid)
+        sid = _removal_id(sid)
         key = logical_key(workspace, sid)
         incumbent_sid = keys.setdefault(key, sid)
         if incumbent_sid != sid:
@@ -354,11 +378,11 @@ def _collector():
 
     def emit(raw):
         if not isinstance(raw, bytes) or len(raw) > MAX_REMOVAL_NODE_BYTES:
-            raise ValueError("private suppression node bytes")
+            raise ValueError("private removal node bytes")
         oid = h(raw)
         incumbent = pending.setdefault(oid, raw)
         if incumbent != raw:
-            raise ValueError("private suppression node collision")
+            raise ValueError("private removal node collision")
         return oid
 
     return pending, emit
@@ -382,8 +406,21 @@ def _reachable_pending(workspace, root, pending):
 def _build(workspace, rows, maximum=MAX_REMOVAL_UPDATES):
     """Build the canonical history-independent private tree from rows."""
     if not valid_fid(workspace):
-        raise ValueError("suppression workspace")
-    checked = _materialize(workspace, rows, maximum)
+        raise ValueError("removal workspace")
+    return _build_from_materialized(
+        workspace, _materialize(workspace, rows, maximum))
+
+
+def _build_from_materialized(workspace, rows):
+    """Rebuild commitments from sorted hashed rows already pinned whole."""
+    if not valid_fid(workspace):
+        raise ValueError("removal workspace")
+    checked = tuple(rows)
+    if tuple(key for key, _value in checked) != tuple(sorted(set(
+            key for key, _value in checked))) \
+            or any(not valid_fid(key) for key, _value in checked):
+        raise ValueError("private removal materialized rows")
+    checked = tuple((key, _slot(value)) for key, value in checked)
     pending, emit = _collector()
 
     def subtree(start, stop):
@@ -395,14 +432,14 @@ def _build(workspace, rows, maximum=MAX_REMOVAL_UPDATES):
         while middle < stop and _bit(checked[middle][0], bit) == 0:
             middle += 1
         if middle == start or middle == stop:
-            raise ValueError("private suppression partition")
+            raise ValueError("private removal partition")
         left = subtree(start, middle)
         right = subtree(middle, stop)
         return emit(_branch_raw(workspace, bit, left, right))
 
     root = "" if not checked else subtree(0, len(checked))
     return Built(
-        encode_root(workspace, root, len(checked)),
+        encode_root(workspace, root, len(checked), checked),
         _reachable_pending(workspace, root, pending),
     )
 
@@ -414,11 +451,11 @@ async def _walk(root, workspace, key, count, fetch):
         node = _opened_node(current, raw, workspace)
         if isinstance(node, _Leaf):
             if len(path) >= count:
-                raise ValueError("private suppression root count")
+                raise ValueError("private removal root count")
             return tuple(path), node, current
         if len(path) >= MAX_REMOVAL_PROOF_STEPS or len(path) >= count \
                 or node.bit <= previous:
-            raise ValueError("private suppression path")
+            raise ValueError("private removal path")
         right = bool(_bit(key, node.bit))
         path.append(_Frame(node, right, current))
         current = node.right if right else node.left
@@ -444,7 +481,7 @@ def _rewrite(workspace, key, value, root_oid, walked, emit):
         existing = path[insert].oid if insert < len(path) else leaf_oid
         fresh = emit(_leaf_raw(workspace, key, value))
         if _bit(key, bit) == _bit(leaf.key, bit):
-            raise ValueError("private suppression insertion")
+            raise ValueError("private removal insertion")
         left, right = (fresh, existing) if _bit(key, bit) == 0 \
             else (existing, fresh)
         current = emit(_branch_raw(workspace, bit, left, right))
@@ -466,6 +503,7 @@ async def _update(
     """Path-copy one bounded deterministic batch against a pinned root."""
     root = decode_root(root_bytes, workspace)
     checked = _materialize(workspace, changes, maximum)
+    materialized = None if root.rows is None else dict(root.rows)
     pending, emit = _collector()
     current, count = root.root, root.count
 
@@ -473,6 +511,8 @@ async def _update(
         return pending[oid] if oid in pending else await fetch(oid)
 
     for key, value in checked:
+        if materialized is not None:
+            materialized[key] = join_slots(materialized.get(key), value)
         if not current:
             current = emit(_leaf_raw(workspace, key, value))
             count = 1
@@ -485,7 +525,13 @@ async def _update(
         )
         count += int(added)
     return Built(
-        encode_root(workspace, current, count),
+        encode_root(
+            workspace,
+            current,
+            count,
+            None if materialized is None else tuple(sorted(
+                materialized.items())),
+        ),
         _reachable_pending(workspace, current, pending),
     )
 
@@ -515,21 +561,21 @@ def verify(root_bytes, workspace, sid, proof_bytes):
     key = logical_key(workspace, sid)
     if not root.root or proof.root != h(root_bytes) or proof.key != key \
             or len(proof.path) >= root.count:
-        raise ValueError("private suppression proof binding")
+        raise ValueError("private removal proof binding")
     current = h(_leaf_raw(workspace, key, proof.value))
     for bit, sibling in reversed(proof.path):
         left, right = (current, sibling) if _bit(key, bit) == 0 \
             else (sibling, current)
         current = h(_branch_raw(workspace, bit, left, right))
     if current != root.root:
-        raise ValueError("private suppression proof root")
+        raise ValueError("private removal proof root")
     return _slot(proof.value)
 
 
 async def _ensure_node(store, oid, raw):
     if not isinstance(raw, bytes) or len(raw) > MAX_REMOVAL_NODE_BYTES \
             or h(raw) != oid:
-        raise ValueError("private suppression node address")
+        raise ValueError("private removal node address")
     key = private_node_key(oid)
     try:
         result = await store.put_if_absent(key, raw)
@@ -538,7 +584,7 @@ async def _ensure_node(store, oid, raw):
         if incumbent == raw:
             return EXISTS
         if incumbent is not None:
-            raise ValueError("private suppression node conflict") from error
+            raise ValueError("private removal node conflict") from error
         # The exact outer permit is retained by its caller. Do not spend a
         # second provider write inside an already bounded commit; replay the
         # whole idempotent turn after this typed unknown outcome instead.
@@ -549,12 +595,12 @@ async def _ensure_node(store, oid, raw):
         raise TypeError("private node conditional-create result")
     incumbent = await store.get_bounded(key, MAX_REMOVAL_NODE_BYTES)
     if incumbent != raw:
-        raise ValueError("private suppression node conflict")
+        raise ValueError("private removal node conflict")
     return EXISTS
 
 
 @dataclass(frozen=True, slots=True)
-class SuppressionPin:
+class RemovalPin:
     """One exact root read and its private point-proof capability."""
 
     workspace: str
@@ -567,13 +613,71 @@ class SuppressionPin:
         decode_root(self.root_bytes, self.workspace)
         if self.root_oid != h(self.root_bytes) \
                 or not isinstance(self.version, VersionToken):
-            raise ValueError("private suppression pin")
+            raise ValueError("private removal pin")
         object.__setattr__(self, "_store", async_store(self._store))
 
-    async def proof(self, sid):
+    async def lookup(self, sid):
+        """Read one logical cell from the materialized pin without node I/O."""
+        return (await self.lookup_many((sid,)))[0]
+
+    async def lookup_many(self, sids):
+        """Read logical cells with one root decode and no provider node I/O."""
+        sids = tuple(sids)
+        root = decode_root(self.root_bytes, self.workspace)
+        if root.rows is None:
+            values = []
+            for sid in sids:
+                proof = await self.proof(sid)
+                values.append(
+                    None if proof is None else self.verify(sid, proof))
+            return tuple(values)
+        keys = tuple(row[0] for row in root.rows)
+        values = []
+        for sid in sids:
+            key = logical_key(self.workspace, sid)
+            at = bisect_left(keys, key)
+            values.append(
+                None if at == len(root.rows) or root.rows[at][0] != key
+                else _slot(root.rows[at][1]))
+        return tuple(values)
+
+    async def proofs(self, sids):
+        """Build several rejection proofs from one in-memory reconstruction."""
+        sids = tuple(sids)
+        root = decode_root(self.root_bytes, self.workspace)
+        if root.rows is None:
+            proofs = []
+            for sid in sids:
+                proofs.append((sid, await self.proof(sid)))
+            return tuple(proofs)
+        built = _build_from_materialized(self.workspace, root.rows)
+        if built.root != self.root_bytes:
+            raise ValueError("private removal materialized root")
+        nodes = dict(built.nodes)
+
         async def fetch(oid):
-            return await self._store.get_bounded(
-                private_node_key(oid), MAX_REMOVAL_NODE_BYTES)
+            return nodes[oid]
+
+        proofs = []
+        for sid in sids:
+            proofs.append((sid, await _prove(
+                self.root_bytes, sid, fetch)))
+        return tuple(proofs)
+
+    async def proof(self, sid):
+        root = decode_root(self.root_bytes, self.workspace)
+        if root.rows is not None:
+            built = _build_from_materialized(self.workspace, root.rows)
+            if built.root != self.root_bytes:
+                raise ValueError("private removal materialized root")
+            nodes = dict(built.nodes)
+
+            async def fetch(oid):
+                return nodes[oid]
+        else:
+            async def fetch(oid):
+                return await self._store.get_bounded(
+                    private_node_key(oid), MAX_REMOVAL_NODE_BYTES)
 
         return await _prove(self.root_bytes, sid, fetch)
 
@@ -581,23 +685,39 @@ class SuppressionPin:
         return verify(self.root_bytes, self.workspace, sid, proof_bytes)
 
 
-class SuppressionTree:
-    """The sole private-store/CAS owner for recipient suppression state."""
+class RemovalTree:
+    """The sole private-store/CAS owner for recipient removal state."""
 
     def __init__(self, workspace, store):
         if not valid_fid(workspace):
-            raise ValueError("suppression workspace")
+            raise ValueError("removal workspace")
         self.workspace = workspace
         self.store = async_store(store)
 
-    async def pin(self):
-        opened = await self.store.read_versioned(REMOVAL_ROOT_KEY)
+    async def pin(self, previous=None):
+        """Read a pin, conditionally retaining an exact previous pin."""
+        if previous is not None and (
+                not isinstance(previous, RemovalPin)
+                or previous.workspace != self.workspace
+                or previous._store is not self.store):
+            raise ValueError("foreign previous removal pin")
+        if previous is None:
+            opened = await self.store.read_versioned(REMOVAL_ROOT_KEY)
+        else:
+            conditional = getattr(
+                self.store, "read_versioned_if_changed", None)
+            opened = await conditional(
+                REMOVAL_ROOT_KEY, previous.version) \
+                if callable(conditional) else \
+                await self.store.read_versioned(REMOVAL_ROOT_KEY)
+            if opened is UNCHANGED:
+                return previous
         if opened is ABSENT:
             return None
         if not isinstance(opened, Versioned):
-            raise TypeError("private suppression root read")
+            raise TypeError("private removal root read")
         decode_root(opened.value, self.workspace)
-        return SuppressionPin(
+        return RemovalPin(
             self.workspace,
             opened.value,
             h(opened.value),
@@ -616,7 +736,7 @@ class SuppressionTree:
             self, pin, changes, *, maximum=MAX_REMOVAL_UPDATES):
         """Join changes only if ``pin`` is still the exact current root.
 
-        Authority validation can read through one :class:`SuppressionPin` and
+        Authority validation can read through one :class:`RemovalPin` and
         pass that same pin here. A concurrent removal then makes this turn
         retryable; it can never be silently rebased onto authority the caller
         did not validate.
@@ -624,12 +744,12 @@ class SuppressionTree:
         changes = _bounded_rows(changes, maximum)
         if pin is ABSENT:
             base_root, token = None, ABSENT
-        elif isinstance(pin, SuppressionPin) \
+        elif isinstance(pin, RemovalPin) \
                 and pin.workspace == self.workspace \
                 and pin._store is self.store:
             base_root, token = pin.root_bytes, pin.version
         else:
-            raise ValueError("foreign private suppression pin")
+            raise ValueError("foreign private removal pin")
 
         current = await self.store.read_versioned(REMOVAL_ROOT_KEY)
         exact = current is ABSENT if pin is ABSENT else (
@@ -669,14 +789,14 @@ class SuppressionTree:
         if result is STALE:
             return ApplyResult("retryable", base_root)
         if not isinstance(result, Applied):
-            raise TypeError("private suppression CAS result")
+            raise TypeError("private removal CAS result")
         return ApplyResult("applied", built.root)
 
 
 __all__ = (
     "ApplyResult",
-    "SuppressionPin",
-    "SuppressionTree",
+    "RemovalPin",
+    "RemovalTree",
     "join_slots",
     "verify",
 )

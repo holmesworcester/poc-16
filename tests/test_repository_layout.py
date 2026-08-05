@@ -115,7 +115,8 @@ def test_documents_describe_the_running_writer_forest_and_access_gate():
     assert "Pull is replication. Push is not." in design
     assert "Every logical writer-tree leaf is independently closed" in design
     assert "no range or page boundary splits a pile" in design
-    assert "Historical membership reveals only the caller's path" in design
+    assert "Admission creates the exact subject row once" in design
+    assert "there is no `POST /removal/path` route" in design
     assert "Every pile is signed directly by its publishing device" in design
     assert "range-based set reconciliation (RBSR)" in design
     assert "not one sync session per pile" in design
@@ -259,7 +260,6 @@ def test_http_has_one_route_table_and_only_private_removal_control():
         "/ctl", "/head/", "/heads", "/invite/", "/layout/", "/mint",
         "/mirror/", "/obj", "/obj/", "/obj/open", "/pack/open",
         "/readyz", "/removal/bootstrap",
-        "/removal/path",
     } <= routes
     assert {
         "/authority", "/page", "/page/", "/pile/", "/removal/advance",
@@ -296,7 +296,7 @@ def test_http_has_one_route_table_and_only_private_removal_control():
 
 
 def test_removal_roots_and_nodes_are_not_generic_objects_or_grants():
-    tree = (ROOT / "core/suppression_tree.py").read_text()
+    tree = (ROOT / "core/removal_tree.py").read_text()
     keys = (ROOT / "core/object_store.py").read_text()
     assert 'REMOVAL_ROOT_KEY = "removal"' in keys
     assert 'REMOVAL_NODE_PREFIX = "removal-node/"' in keys
@@ -449,7 +449,7 @@ def test_deployed_core_allowlist_is_exact_and_contains_no_retired_role():
     }
     assert {
         "access.py", "http.py", "removal_state.py",
-        "suppression_tree.py", "writer_repository.py",
+        "removal_tree.py", "writer_repository.py",
     } <= set(HOSTED_GATE_CORE_MODULES)
     assert {
         "authority.py", "repository_applier.py", "repository_reader.py",

@@ -68,20 +68,18 @@ from core.object_store import (
     STALE,
 )
 from deploy.python_role_modules import HOSTED_GATE_CORE_MODULES
-from core.suppression_tree import decode_root
+from core.removal_tree import decode_root
 from core.writer_head import (
     writer_store_binding,
 )
 from core.writer_repository import OpaqueHeadGate, WriterLog
 from facts.auth.removal import removal
-from facts.auth.removal_path_request import removal_path_request
 from facts.auth.signature import signature
 from facts.content.message import message
 from core.store import FsStore
 from tests.test_access_gate import (
     access_proof,
     head_proof as current_head_proof,
-    path_proof,
     signed,
 )
 from tests.test_removal_state import world as removal_world
@@ -154,9 +152,8 @@ def world(tmp_path):
     gate = AccessGate(workspace, node.store(workspace))
     assert run(gate.state.bootstrap(
         signed(secret, member, root, (root,)))).status in {"applied", "noop"}
-    path = run(gate.removal_path(
-        path_proof(secret, member, root, (root,)), now))
-    pile = access_proof(secret, member, root, (root,), path)
+    path = run(gate.state.pin()).root_oid
+    pile = access_proof(secret, member, root, basis=path)
     app._gateway_cache = local_gateway(node, workspace, now)
     return node, workspace, now, pile
 
@@ -180,7 +177,6 @@ def local_gateway(node, workspace, now):
         head_permit_commit=commit_permit,
         permit_secret=b"p" * 32,
         mint_authorize=gate.authorize_access,
-        path_authorize=gate.removal_path,
         removal_bootstrap=gate.state.bootstrap,
         sync_profile=peer_capability.OWNER,
     )
@@ -268,17 +264,11 @@ def test_lambda_permit_commits_one_terminal_self_removal_head(
     assert response(app.handler(event(
         "POST", "/removal/bootstrap",
         value.root.fid, bootstrap), None))[0] == 201
-    historical = path_proof(
-        value.founder_secret, value.founder,
-        value.root, (value.root,))
-    status, _, path = response(app.handler(event(
-        "POST", "/removal/path", value.root.fid,
-        proof_body(value.root.fid, historical)), None))
-    assert status == 200
+    path = h(store.get(REMOVAL_ROOT_KEY))
 
     current = access_proof(
         value.founder_secret, value.founder,
-        value.root, (value.root,), path)
+        value.root, basis=path)
     status, _, raw_mint = response(app.handler(event(
         "POST", "/mint", value.root.fid,
         proof_body(value.root.fid, current)), None))
@@ -329,18 +319,11 @@ def test_lambda_permit_commits_one_terminal_self_removal_head(
         headers={"Authorization": "Bearer " + token}), None))[0] == 404
 
     other = h(b"other member")
-    relabeled = removal_path_request(
-        value.root.fid, value.founder, other, 1_000, 7)
-    relabeled_sig = signature(
-        value.founder_secret, value.founder, relabeled, 7)
-    forged = signed(
-        value.founder_secret,
-        value.founder,
-        value.root,
-        (value.root, relabeled_sig, relabeled),
-    )
+    forged = access_proof(
+        value.founder_secret, value.founder, value.root,
+        basis=path, owner=other)
     assert response(app.handler(event(
-        "POST", "/removal/path", value.root.fid,
+        "POST", "/mint", value.root.fid,
         proof_body(value.root.fid, forged)), None))[0] == 403
 
     ordinary = message(
@@ -437,7 +420,7 @@ def test_lambda_permit_commits_one_terminal_self_removal_head(
         current_head_proof(
             value.founder_secret, value.founder,
             value.root, (value.root,), path, rejected_head)), None))[0] \
-        == 409
+        == 403
     assert store.get(
         f"heads/{value.root.fid}/{value.founder}") == accepted_slot
     assert response(app.handler(event(
@@ -445,22 +428,15 @@ def test_lambda_permit_commits_one_terminal_self_removal_head(
         encode_head_permit_request(current_head_proof(
             value.founder_secret, value.founder,
             value.root, (value.root,), path, rejected_head),
-            (control,))), None))[0] == 409
+            (control,))), None))[0] == 403
     stale = response(app.handler(event(
         "POST", "/mint", value.root.fid,
         proof_body(value.root.fid, current)), None))
-    assert stale[0] == 409
-    assert json.loads(stale[2]) == {"error": "proof_refresh_required"}
-    refreshed = response(app.handler(event(
-        "POST", "/removal/path", value.root.fid,
-        proof_body(value.root.fid, historical)), None))
-    assert refreshed[0] == 200
-    denied = access_proof(
-        value.founder_secret, value.founder,
-        value.root, (value.root,), refreshed[2])
-    assert response(app.handler(event(
-        "POST", "/mint", value.root.fid,
-        proof_body(value.root.fid, denied)), None))[0] == 403
+    assert stale[0] == 403
+    rejected = json.loads(stale[2])
+    assert rejected["error"] == "removed"
+    assert rejected["tip"] == h(store.get(REMOVAL_ROOT_KEY))
+    assert base64.b64decode(rejected["path"], validate=True)
 
 
 def test_lambda_applies_route_specific_exact_body_limits(monkeypatch):
@@ -545,9 +521,8 @@ def test_lambda_rejects_a_request_pile_from_another_workspace(tmp_path):
     assert run(first_gate.state.bootstrap(
         signed(secret, member, root, (root,)))).status in {
             "applied", "noop"}
-    path = run(first_gate.removal_path(
-        path_proof(secret, member, root, (root,)), now))
-    pile = access_proof(secret, member, root, (root,), path)
+    path = run(first_gate.state.pin()).root_oid
+    pile = access_proof(secret, member, root, basis=path)
     app._gateway_cache = local_gateway(node, second, now)
     request_body = json.dumps({
         "ws": second,

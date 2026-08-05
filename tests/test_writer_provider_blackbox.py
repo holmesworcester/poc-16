@@ -46,7 +46,7 @@ def authority_proof(
         secret, public, root, device_signature, device, proposed_head):
     request = head_request(
         root.fid, public, public, None, proposed_head, 1_000,
-        b"mechanical removal path", 4)
+        h(b"mechanical removal path"), 4)
     request_signature = signature_fact(secret, public, request, 4)
     return encode_signed_pile(make_signed_pile(
         secret,

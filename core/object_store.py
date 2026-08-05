@@ -9,7 +9,7 @@ The protocol uses these namespaces:
     use the direct streaming HTTP path rather than buffered semantic reads.
 
 ``removal``, ``removal-node/<sha256>``
-    One private suppression-root CAS cell and its immutable proof nodes.
+    One private removal-root CAS cell and its immutable proof nodes.
     These names are available only to the access engine; they are never
     mapped into generic object, pack, grant, or public LIST routes.
 
@@ -202,6 +202,15 @@ class Absent(Enum):
 ABSENT = Absent.RESULT
 
 
+class Unchanged(Enum):
+    """A conditional versioned read matched the caller's opaque token."""
+
+    RESULT = "unchanged"
+
+
+UNCHANGED = Unchanged.RESULT
+
+
 class Stale(Enum):
     """The conditional replacement definitely did not commit."""
 
@@ -304,6 +313,15 @@ class SyncStoreAdapter:
 
     async def read_versioned(self, key):
         return self.store.read_versioned(key)
+
+    async def read_versioned_if_changed(self, key, token):
+        conditional = getattr(
+            self.store, "read_versioned_if_changed", None)
+        if callable(conditional):
+            return conditional(key, token)
+        opened = self.store.read_versioned(key)
+        return UNCHANGED if isinstance(opened, Versioned) \
+            and opened.token == token else opened
 
     async def put_if_absent(self, key, value):
         return self.store.put_if_absent(key, value)

@@ -85,7 +85,7 @@ def authority_proof(
         base_head,
         proposed_head,
         1_000_000,
-        b"mechanical removal path",
+        h(b"mechanical removal path"),
         timestamp,
     )
     request_signature = signature_fact(

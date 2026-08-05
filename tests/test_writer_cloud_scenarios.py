@@ -210,7 +210,7 @@ def proof(root, spec, proposed_head, base_head):
         base_head,
         proposed_head,
         9_000_000,
-        b"mechanical removal path",
+        h(b"mechanical removal path"),
         8_000_000,
     )
     request_signature = signature_fact(

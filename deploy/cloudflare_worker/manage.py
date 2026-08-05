@@ -281,7 +281,7 @@ def _verify_bundle(directory):
         "core/kernel.py",
         "core/removal_path.py",
         "core/removal_state.py",
-        "core/suppression_tree.py",
+        "core/removal_tree.py",
         "core/writer_repository.py",
         "facts/auth/request.py",
         "adapters/r2/listing.py",

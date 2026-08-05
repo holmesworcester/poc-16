@@ -2,7 +2,7 @@
 
 Fact families select one semantic sink from each ordinary closed-pile
 judgment. The recipient ACI-joins those sink rows into one bounded
-``SuppressionTree`` CAS turn. Pile bytes and validation receipts disappear as
+``RemovalTree`` CAS turn. Pile bytes and validation receipts disappear as
 soon as a self-contained permit has authenticated the canonical rows.
 """
 
@@ -24,8 +24,8 @@ from .limits import (
     valid_bounded_text,
 )
 from .shape import valid_fid
-from .suppression import checked_suppression_slot
-from .suppression_tree import SuppressionTree, join_slots
+from .suppression import checked_suppression_slot, suppression_slot
+from .removal_tree import RemovalTree, join_slots
 
 
 def checked_updates(rows, maximum=MAX_HEAD_REMOVAL_UPDATES):
@@ -106,13 +106,13 @@ class RecipientRemovalState:
             raise ValueError("recipient removal-state workspace")
         self.workspace = workspace
         self.store = store
-        self.tree = SuppressionTree(workspace, store)
+        self.tree = RemovalTree(workspace, store)
         self.evaluator = ClosedPileEvaluator(
             workspace, max_bytes=MAX_CONTROL_PILE_BYTES)
 
-    async def pin(self):
+    async def pin(self, previous=None):
         """Pin the current private root for subsequent point proofs."""
-        return await self.tree.pin()
+        return await self.tree.pin(previous)
 
     async def _result(self, status):
         pin = await self.pin()
@@ -164,10 +164,59 @@ class RecipientRemovalState:
             byte_count,
         )
 
+    async def plan_control_missing(self, pin, raw_signed_piles, writer):
+        """Plan only rows not already subsumed by the issue-time live pin.
+
+        A hosted recipient can know most of a writer's cumulative control
+        suffix already through other writers. Each source pile remains
+        independently bounded and evaluated once; only the still-effective
+        rows consume the six-row atomic permit budget.
+        """
+        try:
+            raws = tuple(islice(
+                iter(raw_signed_piles), MAX_HEAD_CONTROL_PILES + 1))
+        except TypeError as error:
+            raise ValueError("control head piles") from error
+        if not raws or len(raws) > MAX_HEAD_CONTROL_PILES \
+                or any(not isinstance(raw, bytes) or not raw for raw in raws):
+            raise ValueError("control head piles")
+        byte_count = sum(map(len, raws))
+        if byte_count > MAX_HEAD_CONTROL_BYTES:
+            raise PayloadTooLarge("control head piles too large")
+        joined, fact_count = {}, 0
+        for raw in raws:
+            plan = self.plan_control((raw,), writer)
+            fact_count += plan.fact_count
+            if fact_count > MAX_HEAD_CONTROL_FACTS:
+                raise PayloadTooLarge("too many head control facts")
+            for sid, value in plan.updates:
+                joined[sid] = join_slots(joined.get(sid), value)
+
+        ordered = tuple(sorted(joined.items()))
+        currents = await pin.lookup_many(sid for sid, _expected in ordered)
+        missing = []
+        for (sid, expected), current in zip(ordered, currents):
+            if join_slots(current, expected) != current:
+                missing.append((sid, expected))
+        # An exact all-known control suffix still needs a nonempty permit to
+        # bind its head transition. Reapplying one canonical incumbent is an
+        # authenticated no-op and preserves the permit codec's fail-closed
+        # nonempty-plan invariant.
+        updates = checked_updates(
+            missing or (ordered[0],))
+        return ControlHeadPlan(
+            self.workspace,
+            writer,
+            updates,
+            len(raws),
+            fact_count,
+            byte_count,
+        )
+
     async def _apply(self, updates, maximum):
         outcome = await self.tree.apply(updates, maximum=maximum)
         if outcome.status not in {"applied", "noop", "retryable"}:
-            raise TypeError("private suppression apply result")
+            raise TypeError("private removal apply result")
         return await self._result(outcome.status)
 
     async def apply_plan(self, plan):
@@ -214,6 +263,24 @@ class RecipientRemovalState:
                 raise ValueError("bootstrap cannot activate removal state")
         except ValueError:
             return RemovalStateResult("rejected", None)
+        return await self._apply(updates, MAX_REMOVAL_UPDATES)
+
+    async def admit(self, identity):
+        """Persist one fully evaluated positive subject chain exactly once."""
+        device = getattr(identity, "device", None)
+        owner = getattr(identity, "owner", None)
+        scopes = getattr(identity, "scopes", None)
+        if not valid_fid(device) or not valid_fid(owner):
+            return await self._result("rejected")
+        try:
+            updates = checked_updates(
+                ((sid, suppression_slot()) for sid in scopes),
+                MAX_REMOVAL_UPDATES,
+            )
+        except (TypeError, ValueError):
+            return await self._result("rejected")
+        if not updates:
+            return await self._result("rejected")
         return await self._apply(updates, MAX_REMOVAL_UPDATES)
 
     async def apply_control(self, raw_signed_pile, writer):

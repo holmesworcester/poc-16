@@ -16,10 +16,11 @@ import pytest
 import facts
 
 from core import limits, peer_capability
-from core.access import AccessGate
+from core.access import AccessGate, LookupActive
 from core.object_store import MAX_STORE_PREFIX_BYTES
 from core.crypto import (
     h,
+    keypair,
     load_sk,
     seal_to as native_seal,
     unseal as native_unseal,
@@ -39,7 +40,9 @@ from core.pack_access import (
     encode_object_open,
     encode_pack_open,
 )
-from core.suppression_tree import decode_root
+from core.removal_path import decode as decode_removal_path
+from core.removal_tree import decode_root
+from core.suppression import scoped_id, suppression_slot
 from core.writer_head import (
     head_slot_key,
     writer_store_binding,
@@ -50,13 +53,11 @@ from full_peer.node import FullPeer
 from deploy.cloudflare_worker import crypto_compat, manage, runtime
 from deploy.python_role_modules import HOSTED_GATE_CORE_MODULES
 from facts.auth.removal import removal
-from facts.auth.removal_path_request import removal_path_request
 from facts.auth.signature import signature
 from facts.content.message import message
 from tests.test_access_gate import (
     access_proof,
     head_proof as current_head_proof,
-    path_proof,
     signed,
 )
 from tests.test_removal_state import world as removal_world
@@ -85,6 +86,7 @@ class Bucket:
         }
         self.generation = len(self.etags)
         self.calls = []
+        self.conditional_gets = 0
 
     def _etag(self, key):
         if key not in self.etags:
@@ -92,9 +94,20 @@ class Bucket:
             self.etags[key] = f"opaque-{self.generation}"
         return self.etags[key]
 
-    async def get(self, key):
+    async def get(self, key, options=None):
         self.calls.append(("get", key))
         value = self.data.get(key)
+        condition = options.get("onlyIf") \
+            if isinstance(options, dict) else None
+        if value is not None and isinstance(condition, dict) \
+                and condition.get("etagDoesNotMatch") == self._etag(key):
+            self.conditional_gets += 1
+            return SimpleNamespace(
+                body=None,
+                etag=self._etag(key),
+                key=key,
+                size=len(value),
+            )
         return None if value is None else R2Object(
             value, key=key, etag=self._etag(key))
 
@@ -290,9 +303,8 @@ def worker_world(tmp_path, monkeypatch):
     gate = AccessGate(workspace, node.store(workspace))
     assert run(gate.state.bootstrap(
         signed(secret, member, root, (root,)))).status in {"applied", "noop"}
-    path = run(gate.removal_path(
-        path_proof(secret, member, root, (root,)), now))
-    pile = access_proof(secret, member, root, (root,), path)
+    basis = run(gate.state.pin()).root_oid
+    pile = access_proof(secret, member, root, basis=basis)
     prefix = f"workspaces/{workspace}"
     store = node.store(workspace)
     bucket = Bucket({
@@ -328,20 +340,11 @@ def test_runtime_permit_commits_one_terminal_self_removal_head():
         bootstrap,
     ), environment, clock=lambda: 10))
     assert published.status == 201
-    historical = path_proof(
-        value.founder_secret, value.founder,
-        value.root, (value.root,))
-    path_response = run(runtime.handle(Request(
-        "POST",
-        f"https://worker.example/removal/path?ws={value.root.fid}",
-        proof_body(value.root.fid, historical),
-    ), environment, clock=lambda: 10))
-    assert path_response.status == 200
-    path = path_response.body
+    path = h(bucket.data[f"{prefix}/removal"])
 
     current = access_proof(
         value.founder_secret, value.founder,
-        value.root, (value.root,), path)
+        value.root, basis=path)
     minted = run(runtime.handle(Request(
         "POST", f"https://worker.example/mint?ws={value.root.fid}",
         proof_body(value.root.fid, current),
@@ -400,19 +403,12 @@ def test_runtime_permit_commits_one_terminal_self_removal_head():
     ), environment, clock=lambda: 10)).status == 404
 
     other = h(b"other member")
-    relabeled = removal_path_request(
-        value.root.fid, value.founder, other, 1_000, 7)
-    relabeled_sig = signature(
-        value.founder_secret, value.founder, relabeled, 7)
-    forged = signed(
-        value.founder_secret,
-        value.founder,
-        value.root,
-        (value.root, relabeled_sig, relabeled),
-    )
+    forged = access_proof(
+        value.founder_secret, value.founder, value.root,
+        basis=path, owner=other)
     assert run(runtime.handle(Request(
         "POST",
-        f"https://worker.example/removal/path?ws={value.root.fid}",
+        f"https://worker.example/mint?ws={value.root.fid}",
         proof_body(value.root.fid, forged),
     ), environment, clock=lambda: 10)).status == 403
 
@@ -526,7 +522,7 @@ def test_runtime_permit_commits_one_terminal_self_removal_head():
         current_head_proof(
             value.founder_secret, value.founder,
             value.root, (value.root,), path, rejected_head),
-    ), environment, clock=lambda: 10)).status == 409
+    ), environment, clock=lambda: 10)).status == 403
     assert bucket.data[slot_key] == accepted_slot
     assert run(runtime.handle(Request(
         "POST",
@@ -535,26 +531,16 @@ def test_runtime_permit_commits_one_terminal_self_removal_head():
         encode_head_permit_request(current_head_proof(
             value.founder_secret, value.founder,
             value.root, (value.root,), path, rejected_head), (control,)),
-    ), environment, clock=lambda: 10)).status == 409
+    ), environment, clock=lambda: 10)).status == 403
     stale = run(runtime.handle(Request(
         "POST", f"https://worker.example/mint?ws={value.root.fid}",
         proof_body(value.root.fid, current),
     ), environment, clock=lambda: 10))
-    assert stale.status == 409
-    assert json.loads(stale.body) == {"error": "proof_refresh_required"}
-    refreshed = run(runtime.handle(Request(
-        "POST",
-        f"https://worker.example/removal/path?ws={value.root.fid}",
-        proof_body(value.root.fid, historical),
-    ), environment, clock=lambda: 10))
-    assert refreshed.status == 200
-    denied = access_proof(
-        value.founder_secret, value.founder,
-        value.root, (value.root,), refreshed.body)
-    assert run(runtime.handle(Request(
-        "POST", f"https://worker.example/mint?ws={value.root.fid}",
-        proof_body(value.root.fid, denied),
-    ), environment, clock=lambda: 10)).status == 403
+    assert stale.status == 403
+    rejected = json.loads(stale.body)
+    assert rejected["error"] == "removed"
+    assert rejected["tip"] == h(bucket.data[f"{prefix}/removal"])
+    assert base64.b64decode(rejected["path"], validate=True)
 
 
 def test_runtime_mints_and_reads_the_writer_directory_from_r2(
@@ -590,6 +576,81 @@ def test_runtime_mints_and_reads_the_writer_directory_from_r2(
     assert heads.headers["Cache-Control"] == "no-store"
     assert heads.headers["X-Content-Type-Options"] == "nosniff"
     assert {call[0] for call in bucket.calls} <= {"get", "list"}
+
+
+def test_worker_and_full_peer_make_identical_lookup_gate_decisions(
+        tmp_path, monkeypatch):
+    """The two runtimes differ only at the private-store adapter boundary."""
+    node, workspace, clear_proof, bucket, environment = worker_world(
+        tmp_path, monkeypatch)
+    secret, member = node.identity(workspace)
+    root = node.fact_of(workspace, workspace)
+    peer_gate = node.access_gate(workspace)
+
+    peer_clear = run(peer_gate.authorize_access(clear_proof, 100))
+    worker_clear = run(runtime.handle(Request(
+        "POST", f"https://worker.example/mint?ws={workspace}",
+        proof_body(workspace, clear_proof),
+    ), environment))
+    assert worker_clear.status == 200
+    assert json.loads(worker_clear.body)["tip"] == peer_clear[2]
+
+    _other_secret, other = keypair()
+    unknown_proof = access_proof(
+        secret, member, root, basis=peer_clear[2], owner=other)
+    assert run(peer_gate.authorize_access(unknown_proof, 100)) is None
+    worker_unknown = run(runtime.handle(Request(
+        "POST", f"https://worker.example/mint?ws={workspace}",
+        proof_body(workspace, unknown_proof),
+    ), environment))
+    assert (worker_unknown.status, worker_unknown.body) == (403, b"")
+
+    active = ((
+        scoped_id("member", member),
+        suppression_slot(h(b"cross-runtime removal")),
+    ),)
+    assert run(peer_gate.state.tree.apply(active)).status == "applied"
+    worker_state = AccessGate(
+        workspace,
+        R2BindingStore(bucket, f"workspaces/{workspace}"),
+    )
+    assert run(worker_state.state.tree.apply(active)).status == "applied"
+
+    with pytest.raises(LookupActive) as peer_active:
+        run(peer_gate.authorize_access(clear_proof, 100))
+    worker_active = run(runtime.handle(Request(
+        "POST", f"https://worker.example/mint?ws={workspace}",
+        proof_body(workspace, clear_proof),
+    ), environment))
+    assert worker_active.status == 403
+    body = json.loads(worker_active.body)
+    worker_path = decode_removal_path(base64.b64decode(
+        body["path"], validate=True))
+    peer_path = decode_removal_path(peer_active.value.path)
+    assert body["tip"] == worker_path.root == peer_active.value.tip
+    assert tuple(sid for sid, _proof in worker_path.proofs) == tuple(
+        sid for sid, _proof in peer_path.proofs)
+
+
+def test_worker_warm_lookup_uses_one_conditional_root_get_without_body(
+        tmp_path, monkeypatch):
+    _node, workspace, proof, bucket, environment = worker_world(
+        tmp_path, monkeypatch)
+    def mint_request():
+        return Request(
+            "POST", f"https://worker.example/mint?ws={workspace}",
+            proof_body(workspace, proof),
+        )
+
+    first = run(runtime.handle(mint_request(), environment))
+    before = len(bucket.calls)
+    second = run(runtime.handle(mint_request(), environment))
+    warm_calls = bucket.calls[before:]
+
+    assert first.status == second.status == 200
+    assert bucket.conditional_gets == 1
+    removal_key = f"workspaces/{workspace}/removal"
+    assert warm_calls.count(("get", removal_key)) == 1
 
 
 def test_deployed_entry_issues_direct_object_and_pack_requests(

@@ -302,7 +302,7 @@ def test_request_time_is_not_persistent_kernel_state(anchor_chain):
     ts = now_ms()
     m = message(g.fid, pk, "c", "still valid", ts)
     s = signature(sk, pk, m, ts)
-    rq = request(g.fid, pk, pk, "sync", ts + 9999, b"[]", ts)
+    rq = request(g.fid, pk, pk, "sync", ts + 9999, "", ts)
     sr = signature(sk, pk, rq, ts)
     assert validate([g, s, m], g.fid)
     assert judge([g, sr, rq], g.fid)

@@ -30,7 +30,7 @@ def authority_proof(
         base_head=None):
     request = head_request(
         root.fid, writer, owner, base_head,
-        proposed_head, 1_000_000, b"mechanical removal path", ts)
+        proposed_head, 1_000_000, h(b"mechanical removal path"), ts)
     signed = signature_fact(secret, writer, request, ts)
     return encode_signed_pile(make_signed_pile(
         secret,

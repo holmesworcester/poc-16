@@ -22,6 +22,7 @@ from core.object_store import (
     RetryableStoreError,
     STALE,
     StoreError,
+    UNCHANGED,
     async_store,
     ensure_object_async,
 )
@@ -108,10 +109,17 @@ class Bucket:
         self.generation += 1
         return f"opaque-r2-{self.generation}"
 
-    async def get(self, key):
+    async def get(self, key, options=None):
         self.calls.append(("get", key))
         if key not in self.data:
             return None
+        condition = options.get("onlyIf") \
+            if isinstance(options, dict) else None
+        if isinstance(condition, dict) and condition.get(
+                "etagDoesNotMatch") == self.etags[key]:
+            result = R2Object(key, self.data[key], self.etags[key])
+            result.body = None
+            return result
         return R2Object(key, self.data[key], self.etags[key])
 
     async def head(self, key):
@@ -170,10 +178,16 @@ def test_native_r2_preserves_opaque_tokens_and_conditional_outcomes():
     assert pair.value == b"removal-1"
     assert pair.token == created.token
     assert pair.token.value != h(pair.value)
+    assert run(store.read_versioned_if_changed(
+        "removal", pair.token)) is UNCHANGED
 
     assert run(store.cas("removal", ABSENT, b"loser")) is STALE
     replaced = run(store.cas("removal", pair.token, b"removal-2"))
     assert isinstance(replaced, Applied)
+    changed = run(store.read_versioned_if_changed(
+        "removal", pair.token))
+    assert changed.value == b"removal-2"
+    assert changed.token == replaced.token
     assert run(store.get("removal")) == b"removal-2"
 
 

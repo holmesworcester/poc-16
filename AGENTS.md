@@ -51,15 +51,16 @@ hosted owner publication
   -> CAS only the caller's writer slot
 ```
 
-The logical `AccessGate` is actor-neutral. Hosted and full peers use the
-same pile codec, removal-path verifier, family queries, and `OpaqueHeadGate`.
-It has two device-signed, discarded proof turns. First, a historical-member
-proof containing the owning member's signature over the requesting device may
-fetch only that member/device pair's path from the recipient's current removal
-tree. Second, a current-member proof carries that path and binds an exact mint,
-read, sync, or head action. Neither turn installs authority facts or asks the
-recipient to synchronize an authority repository. A head proof can authorize
-only the proposed head OID named in the request and never validates the
+The logical `AccessGate` is actor-neutral. Hosted and full peers use the same
+pile codec, subject lookup, family queries, and `OpaqueHeadGate`. Admission is
+the only request that carries and evaluates the positive membership chain; it
+creates the exact CLEAR subject row. Later mint, read, sync, and head requests
+carry only their signed action and last-seen basis. The gate pins its private
+removal tree and looks up that subject: UNKNOWN fails closed without detail,
+CLEAR proceeds, ACTIVE fails with exactly that subject's path and the current
+tip, and a stale nonempty basis receives the current tip for retry. There is no
+standalone removal-path route or caller-supplied standing proof. A head request
+can authorize only the proposed head OID it names and never validates the
 advertised content tree.
 
 A control-bearing head is the one removal-state exception. While the ordinary
@@ -71,11 +72,14 @@ bearer-only removal update, accepted-leaf poke, scan, cursor, or cached repair
 state. Removal may be ahead after a crash; an accepted head may never be ahead
 of its removal effects.
 
-Removal state is private point-read state. Never store or serve its roots/pages
-through generic `obj/`, pack, direct-open, or public LIST paths. A writer slot's
-recorded removal-root hash is audit identity, not a read capability. Path
-responses contain only the requested member/device values and non-disclosing
-sibling commitments; dense leaves with neighboring members are forbidden.
+Removal state is private, fetchable-whole judgment state cached by its root
+etag. Never store or serve its roots/nodes through generic `obj/`, pack,
+direct-open, or public LIST paths. A writer slot's recorded removal-root hash is
+audit identity, not a read capability. ACTIVE rejection paths contain only the
+requesting subject's member/device values and non-disclosing sibling
+commitments; dense leaves with neighboring members are forbidden. A steady
+request must not walk removal nodes: it costs one request signature check, one
+in-memory lookup, and at most one conditional root read.
 
 Cloud publication is owner-confined. A device may create immutable objects and
 advance only its own writer slot. The passive store never maintains a shared
@@ -120,10 +124,11 @@ closed piles. The governing decision is `poc-16-6j4.29`; implement
    RBSR index, coverage honesty, closed-run proofs, and one-sided walk. Reuse
    the pre-forest implementation from git history where its shape still fits;
    do not revive its passive-store mutable manifest or stored pile format.
-5. `core/access.py`, `core/removal_path.py`, `core/removal_state.py`, and
-   `core/suppression_tree.py`: the two discarded proof purposes and bounded
-   verification against the recipient's private pinned removal tree. P2P peers
-   and cloud gates use the same ACI fold but never synchronize these trees.
+5. `core/access.py`, `core/removal_state.py`, `core/removal_tree.py`, and
+   `core/removal_path.py`: one shared subject lookup gate, the recipient's
+   private fetchable-whole judgment tree, and the ACTIVE-only rejection-path
+   codec. P2P peers and cloud gates use the same ACI fold but never synchronize
+   these trees.
 6. `core/http.py`: the one route and grant gate used by every runtime.
 7. `full_peer/pile_sender.py`, `full_peer/node.py`, and
    `full_peer/sql_store.py`: stateful authorship, composition, and the sole SQL
@@ -205,7 +210,7 @@ fact bytes must select it explicitly. Suppression selectors are explicit:
 SELF, one named parent, an immutable-ref ancestor path, several selectors, or
 none. A family offering no suppression key cannot be directly suppressed.
 
-`SuppressionTree` maps a known suppression ID to `CLEAR` or
+`RemovalTree` maps a known suppression ID to `CLEAR` or
 `ACTIVE(action_fid)`. Absence is not clear. This lets a database-free node
 answer exact suppression and principal-liveness questions with authenticated
 point reads.

@@ -125,7 +125,6 @@ class StdlibPeerHandler(BaseHTTPRequestHandler):
                 "head_permit_commit": commit_permit,
                 "permit_secret": self.peer.permit_secret,
                 "mint_authorize": access.authorize_access,
-                "path_authorize": access.removal_path,
                 "removal_bootstrap": access.state.bootstrap,
             }
 

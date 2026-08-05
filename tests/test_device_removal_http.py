@@ -29,7 +29,6 @@ from facts.auth.device import device
 from facts.auth.device_invite import device_invite
 from facts.auth.device_removal import device_removal
 from facts.auth.head_request import head_request
-from facts.auth.removal_path_request import removal_path_request
 from facts.auth.request import request
 from facts.auth.signature import signature
 from facts.auth.workspace import workspace
@@ -58,32 +57,20 @@ def envelope(root, pile):
     }, sort_keys=True, separators=(",", ":")).encode()
 
 
-def historical_proof(secret, device_pk, owner, root, identity, ts):
-    item = removal_path_request(
-        root.fid, device_pk, owner, EXPIRY, ts)
-    item_signature = signature(secret, device_pk, item, ts)
-    return signed(
-        secret, device_pk, root, (*identity, item_signature, item))
-
-
 def current_proof(
-        secret, device_pk, owner, root, identity, path, ts):
+        secret, device_pk, owner, root, identity, basis, ts):
     item = request(
-        root.fid, device_pk, owner, "sync", EXPIRY, path, ts)
-    item_signature = signature(secret, device_pk, item, ts)
-    return signed(
-        secret, device_pk, root, (*identity, item_signature, item))
+        root.fid, device_pk, owner, "sync", EXPIRY, basis, ts)
+    return signed(secret, device_pk, root, (item,))
 
 
 def exact_head_proof(
-        secret, device_pk, owner, root, identity, path,
+        secret, device_pk, owner, root, identity, basis,
         proposed, ts, base=None):
     item = head_request(
         root.fid, device_pk, owner, base, proposed,
-        EXPIRY, path, ts)
-    item_signature = signature(secret, device_pk, item, ts)
-    return signed(
-        secret, device_pk, root, (*identity, item_signature, item))
+        EXPIRY, basis, ts)
+    return signed(secret, device_pk, root, (item,))
 
 
 def put_head(store, label):
@@ -91,13 +78,6 @@ def put_head(store, label):
     oid = h(raw)
     store.put_if_absent("obj/" + oid, raw)
     return oid
-
-
-def path_response(http, root, proof):
-    return run(http.handle(
-        "POST", "/removal/path", {"ws": root.fid}, {},
-        envelope(root, proof),
-    ))
 
 
 def mint_response(http, root, proof):
@@ -126,7 +106,6 @@ def gateway(root, store):
         head_permit_commit=commit_permit,
         permit_secret=PERMIT_SECRET,
         mint_authorize=access.authorize_access,
-        path_authorize=access.removal_path,
         removal_bootstrap=access.state.bootstrap,
     )
     return access, http
@@ -172,10 +151,7 @@ def test_secondary_self_removal_refreshes_and_denies_only_that_device(
 
     # Establish the member-signed primary and both device grants through the
     # same removal-first control-head protocol used for later removal.
-    founder_historical = historical_proof(
-        founder_secret, founder, founder, root, (root,), 5)
-    founder_path = path_response(
-        http, root, founder_historical).body
+    founder_path = run(access.state.pin()).root_oid
     founder_writer = WriterLog(
         root.fid,
         founder,
@@ -222,19 +198,8 @@ def test_secondary_self_removal_refreshes_and_denies_only_that_device(
         encode_head_commit_request(permit_response.body),
     )).status == 201
 
-    # The secondary's discarded historical closure reveals exactly its own
-    # liveness points. It can mint and install an ordinary head while clear.
-    target_historical = historical_proof(
-        target_secret, target, founder, root, target_identity, 7)
-    target_path_response = path_response(
-        http, root, target_historical)
-    assert target_path_response.status == 200
-    stale_path = target_path_response.body
-    target_sids = {
-        sid for sid, _proof in decode_path(stale_path).proofs
-    }
-    assert facts.principal_sid("device", target) in target_sids
-    assert facts.principal_sid("device", sibling) not in target_sids
+    # The admitted secondary uses only its device-signed lookup and live tip.
+    stale_path = run(access.state.pin()).root_oid
     stale_current = current_proof(
         target_secret, target, founder, root,
         target_identity, stale_path, 8)
@@ -321,21 +286,18 @@ def test_secondary_self_removal_refreshes_and_denies_only_that_device(
         access, facts.principal_sid("member", founder)
     ))["state"] == "clear"
 
-    # The old root fails closed with a typed refresh. Historical membership
-    # remains valid, but its fresh path now proves permanent device removal.
+    # ACTIVE wins over stale-basis refresh and carries exactly this device's
+    # own path plus the recipient's current tip in the rejection.
     stale = mint_response(http, root, stale_current)
-    assert stale.status == 409
-    assert json.loads(stale.body) == {
-        "error": "proof_refresh_required",
-    }
-    fresh_path_response = path_response(
-        http, root, target_historical)
-    assert fresh_path_response.status == 200
-    assert fresh_path_response.body != stale_path
-    fresh_current = current_proof(
-        target_secret, target, founder, root,
-        target_identity, fresh_path_response.body, 12)
-    assert mint_response(http, root, fresh_current).status == 403
+    assert stale.status == 403
+    rejected = json.loads(stale.body)
+    target_path = decode_path(base64.b64decode(
+        rejected["path"], validate=True))
+    target_sids = {sid for sid, _proof in target_path.proofs}
+    assert rejected["tip"] == target_path.root \
+        == run(access.state.pin()).root_oid
+    assert facts.principal_sid("device", target) in target_sids
+    assert facts.principal_sid("device", sibling) not in target_sids
 
     denied_head = put_head(store, "target denied later head")
     denied_proof = exact_head_proof(
@@ -344,7 +306,7 @@ def test_secondary_self_removal_refreshes_and_denies_only_that_device(
         founder,
         root,
         target_identity,
-        fresh_path_response.body,
+        rejected["tip"],
         denied_head,
         13,
         base=terminal_head,
@@ -354,18 +316,8 @@ def test_secondary_self_removal_refreshes_and_denies_only_that_device(
         denied_proof,
     )).status == 403
 
-    # The sibling's path omits the removed target and still grants access.
-    sibling_historical = historical_proof(
-        sibling_secret, sibling, founder, root, sibling_identity, 14)
-    sibling_path_response = path_response(
-        http, root, sibling_historical)
-    assert sibling_path_response.status == 200
-    sibling_sids = {
-        sid for sid, _proof in decode_path(sibling_path_response.body).proofs
-    }
-    assert target_sid not in sibling_sids
-    assert facts.principal_sid("device", sibling) in sibling_sids
+    # The sibling's independent subject row stays CLEAR.
     sibling_current = current_proof(
         sibling_secret, sibling, founder, root,
-        sibling_identity, sibling_path_response.body, 15)
+        sibling_identity, rejected["tip"], 15)
     assert mint_response(http, root, sibling_current).status == 200

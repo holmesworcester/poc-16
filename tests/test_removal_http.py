@@ -1,4 +1,4 @@
-"""HTTP contract for self-confined removal paths and strong access proofs."""
+"""HTTP contract for the shared lookup gate and control-head permit."""
 
 import asyncio
 import base64
@@ -15,25 +15,17 @@ from core.http import (
     encode_head_permit_request,
 )
 from core.limits import MAX_CONTROL_PILE_BYTES
+from core.removal_path import decode as decode_path
 from core.store import FsStore
 from core.suppression import scoped_id, suppression_slot
-from core.writer_head import (
-    decode_slot_at,
-    head_slot_key,
-    writer_store_binding,
-)
+from core.writer_head import decode_slot_at, head_slot_key, writer_store_binding
 from core.writer_repository import OpaqueHeadGate, WriterLog
+from facts.auth._access import lookup_claim
 from facts.auth.device import device
 from facts.auth.device_invite import device_invite
 from facts.auth.signature import signature
 from facts.content.message import message
-from tests.test_access_gate import (
-    access_proof,
-    head_proof,
-    path_proof,
-    signed,
-    world,
-)
+from tests.test_access_gate import access_proof, head_proof, signed, world
 
 
 PERMIT_SECRET = b"removal-http-permit-secret" * 2
@@ -63,7 +55,6 @@ def gateway(root, store):
         root.fid,
         b"removal-http-secret" * 2,
         lambda: 10,
-        path_authorize=access.removal_path,
         mint_authorize=access.authorize_access,
         removal_bootstrap=access.state.bootstrap,
         head_advance=head_gate.advance,
@@ -87,99 +78,67 @@ def prepared_head(store, secret, member, root, closure):
     return update
 
 
-def test_two_public_proof_phases_mint_and_advance_only_bound_head(tmp_path):
-    root, secret, member, membership = world()
-    store = FsStore(str(tmp_path / "repository"))
-    access, http = gateway(root, store)
-    bootstrap = signed(secret, member, root, membership)
-
-    assert run(http.handle(
-        "POST", "/removal/bootstrap", {"ws": root.fid}, {},
-        bootstrap)).status == 201
-    assert run(http.handle(
-        "POST", "/removal/bootstrap", {"ws": root.fid}, {},
-        bootstrap)).status == 204
-    initial = run(access.state.pin()).root_oid
-
-    historical = path_proof(secret, member, root, membership)
-    path_response = run(http.handle(
-        "POST", "/removal/path", {"ws": root.fid}, {},
-        envelope(root.fid, historical)))
-    assert path_response.status == 200
-    assert path_response.headers["Cache-Control"] == "no-store"
-    assert run(access.state.pin()).root_oid == initial
-
-    current = access_proof(
-        secret, member, root, membership, path_response.body)
-    minted = run(http.handle(
+def mint(http, root, proof):
+    return run(http.handle(
         "POST", "/mint", {"ws": root.fid}, {},
-        envelope(root.fid, current)))
-    assert minted.status == 200
-    assert run(access.state.pin()).root_oid == initial
-
-    item = message(root.fid, member, "general", "ordinary", 7)
-    item_signature = signature(secret, member, item, 7)
-    proposed = prepared_head(
-        store,
-        secret,
-        member,
-        root,
-        (*membership, item_signature, item),
-    ).head_oid
-    proof = head_proof(
-        secret, member, root, membership, path_response.body, proposed)
-    route = "/head/" + proposed
-    assert run(http.handle(
-        "POST", route, {"ws": root.fid}, {}, proof)).status == 201
-    assert run(http.handle(
-        "POST", route, {"ws": root.fid}, {}, proof)).status == 204
-
-    key = head_slot_key(root.fid, member)
-    accepted = store.get(key)
-    slot = decode_slot_at(key, accepted)
-    assert (slot.head, slot.removal_root) == (proposed, initial)
-
-    redirected = h(b"redirected writer head")
-    assert run(http.handle(
-        "POST", "/head/" + redirected,
-        {"ws": root.fid}, {}, proof)).status == 403
-    assert store.get(key) == accepted
+        envelope(root.fid, proof)))
 
 
-def test_stale_path_gets_typed_refresh_then_current_removal_denies(tmp_path):
+def test_unknown_admits_clear_refreshes_and_active_returns_own_story(tmp_path):
     root, secret, member, membership = world()
     store = FsStore(str(tmp_path / "repository"))
     access, http = gateway(root, store)
-    bootstrap = signed(secret, member, root, membership)
-    assert run(http.handle(
-        "POST", "/removal/bootstrap", {"ws": root.fid}, {},
-        bootstrap)).status == 201
-    historical = path_proof(secret, member, root, membership)
-    stale = run(http.handle(
-        "POST", "/removal/path", {"ws": root.fid}, {},
-        envelope(root.fid, historical))).body
+
+    unknown = signed(secret, member, root, ())
+    denied = mint(http, root, unknown)
+    assert (denied.status, denied.body) == (403, b"")
+
+    admitted = mint(
+        http, root, access_proof(secret, member, root, membership))
+    assert admitted.status == 200
+    admission = json.loads(admitted.body)
+    tip = admission["tip"]
+
+    clear = mint(http, root, access_proof(
+        secret, member, root, basis=tip))
+    assert clear.status == 200
+    assert json.loads(clear.body)["tip"] == tip
+
+    assert run(access.state.tree.apply(((
+        scoped_id("member", h(b"unrelated")), suppression_slot()),
+    ))).status == "applied"
+    stale = mint(http, root, access_proof(
+        secret, member, root, basis=tip))
+    assert stale.status == 409
+    refreshed = json.loads(stale.body)
+    assert refreshed == {
+        "error": "proof_refresh_required",
+        "tip": run(access.state.pin()).root_oid,
+    }
 
     assert run(access.state.tree.apply(((
         scoped_id("member", member),
-        suppression_slot(h(b"remove member")),
-    ),))).status == "applied"
+        suppression_slot(h(b"remove member"))),
+    ))).status == "applied"
+    active = mint(http, root, access_proof(
+        secret, member, root, basis=refreshed["tip"]))
+    assert active.status == 403
+    body = json.loads(active.body)
+    path = decode_path(base64.b64decode(body["path"], validate=True))
+    assert body["error"] == "removed"
+    assert body["tip"] == path.root == run(access.state.pin()).root_oid
+    assert tuple(sid for sid, _proof in path.proofs) == \
+        lookup_claim(member, member).scopes
 
-    stale_response = run(http.handle(
-        "POST", "/mint", {"ws": root.fid}, {},
-        envelope(root.fid, access_proof(
-            secret, member, root, membership, stale))))
-    assert stale_response.status == 409
-    assert json.loads(stale_response.body) == {
-        "error": "proof_refresh_required"}
 
-    fresh = run(http.handle(
-        "POST", "/removal/path", {"ws": root.fid}, {},
-        envelope(root.fid, historical))).body
-    denied = run(http.handle(
-        "POST", "/mint", {"ws": root.fid}, {},
-        envelope(root.fid, access_proof(
-            secret, member, root, membership, fresh))))
-    assert denied.status == 403
+def test_removal_path_route_is_not_a_gate_surface(tmp_path):
+    root, _secret, _member, _membership = world()
+    _access, http = gateway(root, FsStore(tmp_path / "repository"))
+    assert HttpGate.request_limit("POST", "/removal/path") == 0
+    assert not HttpGate.requires_access_callbacks("POST", "/removal/path")
+    response = run(http.handle(
+        "POST", "/removal/path", {"ws": root.fid}, {}, b"anything"))
+    assert response.status == 401
 
 
 def test_bootstrap_rejects_content_and_bounds_before_provider_work(tmp_path):
@@ -205,8 +164,9 @@ def test_exact_control_permit_commits_removal_before_head(tmp_path):
     root, secret, member, membership = world()
     store = FsStore(str(tmp_path / "repository"))
     access, http = gateway(root, store)
-    assert run(access.state.bootstrap(signed(
-        secret, member, root, membership))).status == "applied"
+    admitted = mint(
+        http, root, access_proof(secret, member, root, membership))
+    basis = json.loads(admitted.body)["tip"]
     primary = device(root.fid, member, "phone", 7)
     primary_signature = signature(secret, member, primary, 7)
     _secondary_secret, secondary = keypair()
@@ -221,19 +181,11 @@ def test_exact_control_permit_commits_removal_before_head(tmp_path):
         secondary_signature,
         secondary_grant,
     )
-    control = signed(
-        secret, member, root, closure)
-    path = run(access.removal_path(
-        path_proof(secret, member, root, membership), 10))
+    control = signed(secret, member, root, closure)
     proposed = prepared_head(
-        store,
-        secret,
-        member,
-        root,
-        closure,
-    ).head_oid
+        store, secret, member, root, closure).head_oid
     proof = head_proof(
-        secret, member, root, membership, path, proposed)
+        secret, member, root, membership, basis, proposed)
     permit_route = f"/head/{proposed}/permit"
     commit_route = f"/head/{proposed}/commit"
     before = run(access.state.pin()).root_oid
@@ -251,10 +203,6 @@ def test_exact_control_permit_commits_removal_before_head(tmp_path):
         "POST", commit_route, {"ws": root.fid}, {},
         encode_head_commit_request(issued.body))).status == 204
 
-    assert HttpGate.request_limit("POST", "/removal/apply") == 0
-    assert run(http.handle(
-        "POST", "/removal/apply", {"ws": root.fid}, {},
-        control)).status == 401
     assert run(http.handle(
         "POST", permit_route, {"ws": root.fid}, {}, b"malformed"
     )).status == 403
@@ -263,35 +211,25 @@ def test_exact_control_permit_commits_removal_before_head(tmp_path):
         b"x" * (MAX_HEAD_CONTROL_REQUEST_BYTES + 1))).status == 413
 
 
-def test_permit_issue_creates_no_slot_before_control_commit(
-        tmp_path):
+def test_permit_issue_creates_no_slot_before_control_commit(tmp_path):
     root, secret, member, membership = world()
     store = FsStore(str(tmp_path / "repository"))
     access, http = gateway(root, store)
-    assert run(access.state.bootstrap(signed(
-        secret, member, root, membership))).status == "applied"
-    path = run(access.removal_path(
-        path_proof(secret, member, root, membership), 10))
+    basis = json.loads(mint(
+        http, root,
+        access_proof(secret, member, root, membership)).body)["tip"]
     primary = device(root.fid, member, "phone", 7)
     primary_signature = signature(secret, member, primary, 7)
-    control = signed(
-        secret, member, root,
-        (*membership, primary_signature, primary))
-    update = prepared_head(
-        store,
-        secret,
-        member,
-        root,
-        (*membership, primary_signature, primary),
-    )
-    proposed = update.head_oid
+    closure = (*membership, primary_signature, primary)
+    control = signed(secret, member, root, closure)
+    proposed = prepared_head(
+        store, secret, member, root, closure).head_oid
     proof = head_proof(
-        secret, member, root, membership, path, proposed)
+        secret, member, root, membership, basis, proposed)
     issued = run(http.handle(
         "POST", f"/head/{proposed}/permit", {"ws": root.fid}, {},
         encode_head_permit_request(proof, (control,))))
     assert issued.status == 200
-
     assert store.get(head_slot_key(root.fid, member)) is None
 
     token = make_token(
@@ -302,16 +240,9 @@ def test_permit_issue_creates_no_slot_before_control_commit(
         ttl_ms=1_000,
     )
     headers = {"Authorization": "Bearer " + token}
-    hidden = run(http.handle(
-        "GET", f"/head/{member}", {"ws": root.fid}, headers))
-    assert hidden.status == 404
     directory = run(http.handle(
         "GET", "/heads", {"ws": root.fid}, headers))
-    assert directory.status == 200
-    document = json.loads(directory.body)
-    assert document["heads"] == []
-    assert proposed.encode() not in directory.body
-    assert h(issued.body).encode() not in directory.body
+    assert json.loads(directory.body)["heads"] == []
 
     committed = run(http.handle(
         "POST", f"/head/{proposed}/commit", {"ws": root.fid}, {},

@@ -1,8 +1,7 @@
-"""Canonical self-confined removal paths for the two-phase access gate."""
+"""Canonical self-confined paths carried only by ACTIVE rejections."""
 
 import base64
 from dataclasses import dataclass
-from itertools import islice
 
 from .fact import canon
 from .limits import (
@@ -15,18 +14,9 @@ from .limits import (
     valid_bounded_text,
 )
 from .shape import valid_fid
-from .suppression_tree import SuppressionPin
 
 
 FORMAT = "poc16-removal-path-v1"
-
-
-class ProofRefreshRequired(ValueError):
-    """The recipient no longer pins the root named by this path."""
-
-
-class RemovalDenied(ValueError):
-    """One exact caller scope is ACTIVE at the pinned root."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,56 +90,8 @@ def decode(raw):
     return path
 
 
-def _scopes(values):
-    try:
-        bounded = tuple(islice(iter(values), MAX_REMOVAL_PATH_SCOPES + 1))
-    except TypeError as error:
-        raise ValueError("removal path scopes") from error
-    if len(bounded) > MAX_REMOVAL_PATH_SCOPES:
-        raise PayloadTooLarge("too many removal path scopes")
-    if not all(valid_bounded_text(sid, MAX_SUPPRESSION_ID_BYTES)
-               for sid in bounded):
-        raise ValueError("removal path scope")
-    return tuple(sorted(set(bounded)))
-
-
-async def build(pin, scopes):
-    """Read only the exact caller-derived points from one private pin."""
-    if not isinstance(pin, SuppressionPin):
-        raise TypeError("removal path pin")
-    proofs = []
-    for sid in _scopes(scopes):
-        proof = await pin.proof(sid)
-        if proof is None:
-            raise ValueError("missing removal state")
-        proofs.append((sid, proof))
-    return RemovalPath(pin.workspace, pin.root_oid, tuple(proofs))
-
-
-def verify_clear(pin, supplied, scopes):
-    """Verify an exact path set and require every caller scope to be CLEAR."""
-    if not isinstance(pin, SuppressionPin):
-        raise TypeError("removal path pin")
-    path = decode(supplied) if isinstance(supplied, bytes) else supplied
-    if not isinstance(path, RemovalPath) or path.workspace != pin.workspace:
-        raise ValueError("removal path binding")
-    if path.root != pin.root_oid:
-        raise ProofRefreshRequired("proof_refresh_required")
-    expected = _scopes(scopes)
-    if tuple(sid for sid, _proof in path.proofs) != expected:
-        raise ValueError("removal path scope set")
-    for sid, proof in path.proofs:
-        if pin.verify(sid, proof).get("state") != "clear":
-            raise RemovalDenied("removal denied")
-    return True
-
-
 __all__ = (
-    "ProofRefreshRequired",
-    "RemovalDenied",
     "RemovalPath",
-    "build",
     "decode",
     "encode",
-    "verify_clear",
 )

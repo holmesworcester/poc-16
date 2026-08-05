@@ -1,8 +1,14 @@
-"""Database-free two-phase access decisions over one private removal pin."""
+"""One database-free subject lookup gate shared by every recipient."""
+
+from dataclasses import dataclass
 
 import facts
 
-from .close import ClosedPileEvaluator, signed_pile_oid
+from .close import (
+    ClosedPileEvaluator,
+    decode_signed_pile,
+    signed_pile_oid,
+)
 from .crypto import h
 from .head_permit import (
     ControlHeadPermit,
@@ -10,7 +16,7 @@ from .head_permit import (
     encode as encode_permit,
 )
 from .limits import MAX_CONTROL_APPLY_ATTEMPTS, MAX_MINT_REQUEST_BYTES
-from .removal_path import build as build_path, encode as encode_path
+from .removal_path import RemovalPath, encode as encode_path
 from .removal_state import RecipientRemovalState
 from .shape import valid_fid
 from .writer_head import WriterBinding, writer_store_binding
@@ -19,6 +25,41 @@ from .writer_repository import HeadGrant, control_extension
 
 class ControlHeadRetry(ValueError):
     """One exact permitted control-head turn lost a removal-root CAS."""
+
+
+class LookupRefresh(ValueError):
+    """The caller names a stale judgment tip and must retry at ``tip``."""
+
+    def __init__(self, tip):
+        super().__init__("proof_refresh_required")
+        self.tip = tip
+
+
+class LookupActive(ValueError):
+    """The subject is removed; only its own authenticated story is carried."""
+
+    def __init__(self, tip, path):
+        super().__init__("removal denied")
+        self.tip = tip
+        self.path = path
+
+
+@dataclass(frozen=True, slots=True)
+class LookupJudgment:
+    status: str
+    tip: str | None
+    path: bytes | None
+    pin: object = None
+
+    def __post_init__(self):
+        if self.status not in {"unknown", "clear", "active"} \
+                or self.status == "unknown" and (
+                    self.tip is not None or self.path is not None) \
+                or self.status != "unknown" and not valid_fid(self.tip) \
+                or self.status == "clear" and self.path is not None \
+                or self.status == "active" and not isinstance(
+                    self.path, bytes):
+            raise ValueError("lookup judgment")
 
 
 class AccessGate:
@@ -32,40 +73,99 @@ class AccessGate:
         self.state = RecipientRemovalState(workspace, store)
         self.evaluator = ClosedPileEvaluator(
             workspace, max_bytes=MAX_MINT_REQUEST_BYTES)
+        self._pin_cache = None
+        self._lookup_cache = {}
 
     def _evaluate(self, raw):
         return self.evaluator.evaluate(raw)
 
-    async def removal_path(self, proof, trusted_now):
-        """Answer historical membership with only caller-derived points."""
-        evaluated = self._evaluate(proof)
-        identity = facts.authorize_removal_path(
-            evaluated.judgment,
-            evaluated.pile.facts,
-            evaluated.pile.writer,
-            trusted_now,
-        )
-        if identity is None:
-            return None
-        pin = await self.state.pin()
+    async def _pin(self):
+        previous = self._pin_cache
+        pin = await self.state.pin(previous)
+        if previous is not None and (
+                pin is None or pin.root_oid != previous.root_oid):
+            self._lookup_cache.clear()
+        self._pin_cache = pin
+        return pin
+
+    async def _lookup(self, identity):
+        """Judge one admitted device/owner tuple at the recipient's live pin."""
+        pin = await self._pin()
         if pin is None:
+            return LookupJudgment("unknown", None, None)
+        key = pin.root_oid, identity.device, identity.owner
+        cached = self._lookup_cache.get(key)
+        if cached is not None:
+            status, path = cached
+            if status == "unknown":
+                return LookupJudgment("unknown", None, None)
+            return LookupJudgment(status, pin.root_oid, path, pin)
+
+        states = await pin.lookup_many(identity.scopes)
+        active = any(
+            value is not None and value.get("state") == "active"
+            for value in states)
+        if not active and any(value is None for value in states):
+            self._lookup_cache[key] = ("unknown", None)
+            return LookupJudgment("unknown", None, None)
+        status = "active" if active else "clear"
+        path = None
+        if status == "active":
+            present = tuple(
+                sid for sid, value in zip(identity.scopes, states)
+                if value is not None)
+            proofs = await pin.proofs(present)
+            path = encode_path(RemovalPath(
+                self.workspace, pin.root_oid, proofs))
+        self._lookup_cache[key] = status, path
+        return LookupJudgment(status, pin.root_oid, path, pin)
+
+    @staticmethod
+    def _finish_lookup(judgment, basis, *, admitted=False):
+        if judgment.status == "unknown":
             return None
-        return encode_path(await build_path(pin, identity.scopes))
+        if judgment.status == "active":
+            raise LookupActive(judgment.tip, judgment.path)
+        if not admitted and basis and basis != judgment.tip:
+            raise LookupRefresh(judgment.tip)
+        return judgment
 
     async def authorize_access(self, proof, trusted_now, *, purpose="sync"):
-        """Require one current self-confined path at the exact pinned root."""
-        pin = await self.state.pin()
-        if pin is None:
+        """Lookup current standing; evaluate a positive chain only if UNKNOWN."""
+        pile = decode_signed_pile(proof, workspace=self.workspace)
+        looked = facts.lookup_request(
+            pile, trusted_now, purpose=purpose)
+        if looked is None:
             return None
-        evaluated = self._evaluate(proof)
-        return facts.authorize_access(
-            evaluated.judgment,
-            evaluated.pile.facts,
-            pin,
-            trusted_now,
-            purpose=purpose,
-            writer=evaluated.pile.writer,
-        )
+        identity, basis, verb = looked
+        judgment = await self._lookup(identity)
+        admitted = False
+        if judgment.status == "unknown":
+            try:
+                evaluated = self._evaluate(proof)
+            except ValueError:
+                return None
+            admission = facts.authorize_admission(
+                evaluated.judgment,
+                evaluated.pile.facts,
+                trusted_now,
+                purpose=purpose,
+                writer=evaluated.pile.writer,
+            )
+            if admission is None:
+                return None
+            evaluated_identity, evaluated_verb = admission
+            if (evaluated_identity.device, evaluated_identity.owner,
+                    evaluated_verb) != (identity.device, identity.owner, verb):
+                return None
+            result = await self.state.admit(evaluated_identity)
+            if result.status not in {"applied", "noop"}:
+                return None
+            judgment = await self._lookup(identity)
+            admitted = True
+        judgment = self._finish_lookup(
+            judgment, basis, admitted=admitted)
+        return identity.device, verb, judgment.tip
 
     async def authorize_head(self, proof, proposed_head, trusted_now):
         """Bind a current path to one exact writer-head CAS request."""
@@ -96,33 +196,26 @@ class AccessGate:
         )
 
     async def _head_decision(self, proof, proposed_head, trusted_now):
-        """Return the exact pin and family-owned caller identity decision."""
+        """Return the live lookup pin and exact outer-signed head claim."""
         if not valid_fid(proposed_head):
             return None
-        pin = await self.state.pin()
-        if pin is None:
+        pile = decode_signed_pile(proof, workspace=self.workspace)
+        looked = facts.lookup_request(
+            pile, trusted_now, proposed_head=proposed_head)
+        if looked is None:
             return None
-        evaluated = self._evaluate(proof)
-        decision = facts.authorize_writer_head(
-            evaluated.judgment,
-            evaluated.pile.facts,
-            pin,
-            evaluated.pile.writer,
-            proposed_head,
-            trusted_now,
+        identity, basis, base_head = looked
+        judgment = self._finish_lookup(
+            await self._lookup(identity), basis)
+        if judgment is None:
+            return None
+        return (
+            judgment.pin,
+            identity.device,
+            identity.owner,
+            base_head,
+            identity.scopes,
         )
-        if decision is None:
-            return None
-        try:
-            device, owner, base_head, scopes = decision
-            scopes = tuple(scopes)
-        except (TypeError, ValueError):
-            return None
-        if not valid_fid(device) or not valid_fid(owner) \
-                or base_head is not None and not valid_fid(base_head) \
-                or not scopes:
-            return None
-        return pin, device, owner, base_head, scopes
 
     async def issue_head_permit(
             self, proof, proposed_head, control_piles, trusted_now, secret):
@@ -150,7 +243,8 @@ class AccessGate:
         supplied = tuple(signed_pile_oid(raw) for raw in control_piles)
         if supplied != declared:
             return None
-        plan = self.state.plan_control(control_piles, device)
+        plan = await self.state.plan_control_missing(
+            pin, control_piles, device)
         return encode_permit(ControlHeadPermit(
             self.workspace,
             device,
@@ -203,4 +297,10 @@ class AccessGate:
             grant, permit_oid, result.root_oid)
 
 
-__all__ = ("AccessGate", "ControlHeadRetry")
+__all__ = (
+    "AccessGate",
+    "ControlHeadRetry",
+    "LookupActive",
+    "LookupJudgment",
+    "LookupRefresh",
+)

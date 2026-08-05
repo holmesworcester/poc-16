@@ -158,17 +158,11 @@ def test_post_kernel_dispatch_uses_current_form_and_source_identity(
 
     expected_writer = writer
 
-    def authorize(
-            _view, valid, stream, _trusted_now, *, purpose, writer=None):
+    def authorize_admission(
+            valid, stream, _trusted_now, *, purpose, writer=None):
         assert writer == expected_writer
-        check(valid, stream, "access")
+        check(valid, stream, "admission")
         return writer, purpose
-
-    def authorize_head(
-            _view, valid, stream, candidate_writer,
-            _proposed_head, _trusted_now):
-        check(valid, stream, "head")
-        return candidate_writer, candidate_writer, None
 
     family = SimpleNamespace(
         TAG="test_grant",
@@ -177,8 +171,7 @@ def test_post_kernel_dispatch_uses_current_form_and_source_identity(
         needs=lambda _fact: (),
         validate=validate,
         reextract=reextract,
-        authorize=authorize,
-        authorize_head=authorize_head,
+        authorize_admission=authorize_admission,
     )
     real_family_for = facts.family_for
     monkeypatch.setattr(
@@ -192,13 +185,10 @@ def test_post_kernel_dispatch_uses_current_form_and_source_identity(
 
     assert judgment.ok
     assert judgment.valids[0].fact is source
-    assert facts.authorize_access(
-        judgment, (source,), object(), 8,
+    assert facts.authorize_admission(
+        judgment, (source,), 8,
         purpose="sync", writer=writer) == (writer, "sync")
-    assert facts.authorize_writer_head(
-        judgment, (source,), object(), writer, "2" * 64, 8) == (
-            writer, writer, None)
-    assert observed == ["access", "head"]
+    assert observed == ["admission"]
 
 
 def test_every_family_validator_is_total_for_a_malformed_body():
@@ -240,8 +230,13 @@ def test_cli_and_daemon_have_no_application_command_inventory():
 
 def test_only_ephemeral_families_have_worker_grants():
     grants = [
-        module for module in facts.MODULES if hasattr(module, "authorize")
+        module for module in facts.MODULES if hasattr(module, "lookup")
     ]
     assert grants
     assert all(module.DURABLE is False for module in grants)
-    assert all(module.authorize.__code__.co_argcount == 4 for module in grants)
+    assert all(callable(module.lookup) for module in grants)
+    admissions = [
+        module for module in grants
+        if hasattr(module, "authorize_admission")
+    ]
+    assert admissions == [facts.auth.request]

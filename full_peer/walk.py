@@ -101,6 +101,7 @@ class Peer:
         # again and receives a fresh profile.
         self._token = None
         self._sync_profile = None
+        self._tip = None
         self._opened_head_page = None
         self._observed_heads = {}
         self._head_directory_complete = False
@@ -116,6 +117,12 @@ class Peer:
         """Whether this peer accepts immutable owner-log publication."""
         return peer_capability.allows_object_put(
             self._sync_profile)
+
+    def judgment_tip(self):
+        """Return this responder's current pairwise-disclosed gate tip."""
+        if self._tip is None:
+            self.mint()
+        return self._tip
 
     def _http(
             self, method, path, data=None, etag=None, auth=True, retry=True,
@@ -190,47 +197,11 @@ class Peer:
             raise ValueError("access proof request too large")
         return body
 
-    def removal_path(self):
-        """Fetch only this device/member's path after historical proof."""
-        with self.node.lock:
-            proof = self.node.removal_path_proof(self.ws)
-        body = self._proof_body(proof)
-        try:
-            _, path, _ = self._http(
-                "POST",
-                "/removal/path",
-                body,
-                auth=False,
-                response_limit=MAX_MINT_REQUEST_BYTES,
-            )
-        except urllib.error.HTTPError as error:
-            if error.code != 403:
-                raise
-            # A new recipient may not know this member yet. Reuse only the
-            # writer's original signed clear-only control leaf; the gate
-            # evaluates and discards it, then owns all subsequent state.
-            bootstrap = self.node.removal_bootstrap_pile(self.ws)
-            self._http(
-                "POST",
-                "/removal/bootstrap",
-                bootstrap,
-                auth=False,
-                response_limit=MAX_CONTROL_BYTES,
-            )
-            _, path, _ = self._http(
-                "POST",
-                "/removal/path",
-                body,
-                auth=False,
-                response_limit=MAX_MINT_REQUEST_BYTES,
-            )
-        return path
-
     def mint(self):
-        """Run historical-path then current-membership proof phases."""
+        """Present an admission chain once, then use tip-bound lookups."""
         n = self.node
-        for attempt in range(2):
-            path = self.removal_path()
+        admission = False
+        for attempt in range(3):
             with n.lock:
                 ts = now_ms()
                 closed = families.proof_payload(
@@ -239,7 +210,8 @@ class Peer:
                     "sync",
                     ts + ACCESS_PROOF_TTL_MS,
                     ts,
-                    removal_path=path,
+                    basis=self._tip or "",
+                    admission=admission,
                 )
                 proof = n.sender(self.ws).pack(closed)
             try:
@@ -252,8 +224,22 @@ class Peer:
                 )
                 break
             except urllib.error.HTTPError as error:
-                if error.code != 409 or attempt:
+                response = read_bounded(
+                    error, MAX_CONTROL_BYTES, "mint rejection")
+                if error.code == 403 and not response and not admission:
+                    admission = True
+                    continue
+                if error.code != 409 or attempt == 2:
                     raise
+                refresh = decode_json(
+                    response,
+                    MAX_CONTROL_BYTES,
+                    "mint refresh",
+                )
+                if refresh.get("error") != "proof_refresh_required" \
+                        or not isinstance(refresh.get("tip"), str):
+                    raise
+                self._tip = refresh["tip"]
         else:  # pragma: no cover - the bounded loop either breaks or raises.
             raise RuntimeError("mint proof refresh")
         o = decode_json(resp, MAX_CONTROL_BYTES, "mint response")
@@ -261,6 +247,7 @@ class Peer:
         token = unseal(secret, base64.b64decode(o["grant"])).decode()
         self._token = token
         self._sync_profile = peer_capability.negotiate(token, o)
+        self._tip = o["tip"]
 
     def issue_head_permit(self, proof, proposed_head, control_piles):
         """Obtain one exact non-expiring permit before control takes effect."""

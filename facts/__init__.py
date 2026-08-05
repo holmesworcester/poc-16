@@ -316,6 +316,7 @@ def removal_state_updates(judgment, stream):
     rows = {
         sid: suppression_slot()
         for sid in current_scopes(fact) | clear_sids(fact)
+        | gate_subject_sids(fact)
     }
     rows.update(
         (sid, suppression_slot(fact.fid))
@@ -336,63 +337,49 @@ def bootstrap_member(judgment, stream, writer):
     return sink
 
 
-def authorize_writer_head(
-        judgment, stream, view, writer, proposed_head, trusted_now):
-    """Dispatch one pinned-current exact-head decision through its family."""
-    decisions = []
+def lookup_request(
+        pile, trusted_now, *, purpose=None, proposed_head=None):
+    """Inspect one outer-signed ephemeral request without draining its chain."""
+    writer = getattr(pile, "writer", None)
+    stream = getattr(pile, "facts", ())
+    candidates = []
+    for fact in stream:
+        family = family_for(getattr(fact, "t", None))
+        lookup = None if family is None or family.DURABLE else \
+            getattr(family, "lookup", None)
+        if not callable(lookup):
+            continue
+        if not family.validate(fact, None):
+            return None
+        candidates.append(lookup(
+            fact,
+            writer,
+            trusted_now,
+            purpose=purpose,
+            proposed_head=proposed_head,
+        ))
+    accepted = [candidate for candidate in candidates if candidate is not None]
+    return accepted[0] if len(candidates) == len(accepted) == 1 else None
+
+
+def authorize_admission(
+        judgment, stream, trusted_now, *, purpose, writer=None):
+    """Evaluate one positive admission chain for an UNKNOWN mint subject."""
     valids, current_stream = semantic_evaluation(judgment, stream)
+    candidates = []
     for valid in valids:
         family = family_for(valid.fact.t)
-        authorize = getattr(family, "authorize_head", None)
+        authorize = getattr(family, "authorize_admission", None)
         if callable(authorize):
-            decision = authorize(
-                view, valid, current_stream,
-                writer, proposed_head, trusted_now)
-            if decision is not None:
-                decisions.append(decision)
-    return decisions[0] if len(decisions) == 1 else None
-
-
-def authorize_removal_path(judgment, stream, writer, trusted_now):
-    """Dispatch exactly one historical path request from one signed pile."""
-    valids, current_stream = semantic_evaluation(judgment, stream)
-    requests = []
-    for valid in valids:
-        family = family_for(valid.fact.t)
-        authorize = getattr(family, "authorize_path", None)
-        if callable(authorize):
-            requests.append(authorize(
-                valid, current_stream, writer, trusted_now))
-    accepted = [request for request in requests if request is not None]
-    return accepted[0] if len(requests) == 1 and len(accepted) == 1 else None
-
-
-def authorize_access(
-        judgment, stream, view, trusted_now, *, purpose, writer=None):
-    """Dispatch one ephemeral access request from a signed pile judgment.
-
-    The caller supplies a verifier-pinned current-authority view.  The pile
-    supplies its complete historical membership closure, while the view
-    decides whether the exact selected provider is still current and clear.
-    """
-    valids, current_stream = semantic_evaluation(judgment, stream)
-    ephemeral = []
-    for valid in valids:
-        family = family_for(valid.fact.t)
-        if family is not None and not family.DURABLE:
-            ephemeral.append((family, valid))
-    if len(ephemeral) != 1:
-        return None
-    family, valid = ephemeral[0]
-    authorize = getattr(family, "authorize", None)
-    return authorize(
-        view,
-        valid,
-        current_stream,
-        trusted_now,
-        purpose=purpose,
-        writer=writer,
-    ) if callable(authorize) else None
+            candidates.append(authorize(
+                valid,
+                current_stream,
+                trusted_now,
+                purpose=purpose,
+                writer=writer,
+            ))
+    accepted = [candidate for candidate in candidates if candidate is not None]
+    return accepted[0] if len(candidates) == len(accepted) == 1 else None
 
 
 def is_genesis(tag):
@@ -420,6 +407,27 @@ def principal_sids(fact):
     family = family_for(fact.t)
     return frozenset() if family is None else frozenset(
         _offer_sids(fact, family.POLICY.principal_offers))
+
+
+def gate_subject_sids(fact):
+    """Return exact device/owner admission rows declared by principal offers."""
+    from .auth._access import subject_sid
+
+    family = family_for(fact.t)
+    if family is None:
+        return frozenset()
+    declarations = {
+        row.name: row.namespace
+        for row in family.POLICY.principal_offers
+    }
+    subjects = set()
+    for name, device, owner in fact.offers():
+        namespace = declarations.get(name)
+        if namespace == "member" and device == owner:
+            subjects.add(subject_sid(device, owner))
+        elif namespace == "device" and owner:
+            subjects.add(subject_sid(device, owner))
+    return frozenset(subjects)
 
 
 def clear_sids(fact):

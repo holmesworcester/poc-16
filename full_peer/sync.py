@@ -139,13 +139,13 @@ def sync(node, workspace, url):
 
         async def make_proof(base, proposed):
             def build():
-                path = peer.removal_path()
+                basis = peer.judgment_tip()
                 return node.head_proof(
                     workspace,
                     binding.owner,
                     base,
                     proposed,
-                    removal_path=path,
+                    basis=basis,
                 )
 
             return await asyncio.to_thread(build)

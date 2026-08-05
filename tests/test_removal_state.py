@@ -11,7 +11,7 @@ from core.object_store import ABSENT, REMOVAL_ROOT_KEY
 from core.removal_state import RecipientRemovalState
 from core.store import FsStore
 from core.suppression import scoped_id, suppression_slot
-from core.suppression_tree import SuppressionTree
+from core.removal_tree import RemovalTree
 from core.writer_head import (
     HeadSlot,
     WriterBinding,
@@ -277,7 +277,7 @@ def test_access_like_pile_is_discarded_without_mutating_existing_state(
         value.member,
         "sync",
         1_000,
-        b"discarded path",
+        "",
         8,
     )
     access_sig = signature(
@@ -324,7 +324,7 @@ def test_partial_stale_advance_is_retryable_and_idempotent():
         advancing = pool.submit(
             run, recipient.apply_control(primary_pile, value.member))
         paused.wait()
-        concurrent = SuppressionTree(
+        concurrent = RemovalTree(
             value.root.fid, PileHandle(bucket.handle("concurrent")))
         assert run(concurrent.apply((
             (other_sid, suppression_slot()),
@@ -419,7 +419,7 @@ def test_mirror_retries_pre_cas_control_application_in_the_same_turn(
     )) == suppression_slot(evicted.fid)
 
 
-def test_mirror_finishes_pending_head_before_newer_source_head(tmp_path):
+def test_mirror_finishes_interrupted_head_before_newer_source_head(tmp_path):
     """A crashed H1 control turn cannot wedge a later H2 sync."""
     value = world()
     source = FsStore(str(tmp_path / "source"))

@@ -1,9 +1,6 @@
-"""facts/auth/request.py — current removal-path proof of workspace access."""
-
-import base64
+"""facts/auth/request.py — device-signed lookup or admission request."""
 
 from core.fact import Fact
-from core.removal_path import verify_clear
 from core.shape import valid_fid
 from .._policy import FamilyPolicy
 from . import _access, signature
@@ -16,13 +13,7 @@ PURPOSES = frozenset({"sync"})
 
 
 # SHAPE
-def _encoded_path(raw):
-    if not isinstance(raw, bytes):
-        raise ValueError("removal path bytes")
-    return base64.b64encode(raw).decode("ascii")
-
-
-def request(workspace, device, owner, verb, exp, removal_path, ts):
+def request(workspace, device, owner, verb, exp, basis, ts):
     return Fact(
         TAG, ts, [],
         {
@@ -30,7 +21,7 @@ def request(workspace, device, owner, verb, exp, removal_path, ts):
             "owner": owner,
             "verb": verb,
             "exp": exp,
-            "path": _encoded_path(removal_path),
+            "basis": basis,
         },
         workspace,
     )
@@ -45,15 +36,15 @@ def needs(fact):
 def validate(fact, _ctx):
     try:
         body = fact.body
-        path = base64.b64decode(body["path"], validate=True)
-        return set(body) == {"device", "owner", "verb", "exp", "path"} \
+        return set(body) == {"basis", "device", "owner", "verb", "exp"} \
             and valid_fid(body["device"]) \
             and valid_fid(body["owner"]) \
+            and (body["basis"] == "" or valid_fid(body["basis"])) \
             and isinstance(body["verb"], str) and body["verb"] \
             and type(body["exp"]) is int \
             and fact == request(
                 fact.ws, body["device"], body["owner"], body["verb"],
-                body["exp"], path, fact.ts)
+                body["exp"], body["basis"], fact.ts)
     except (KeyError, TypeError, ValueError):
         return False
 
@@ -63,27 +54,41 @@ DURABLE = False
 
 
 # COMMANDS
-def payload(node, workspace, verb, exp, ts, *, removal_path):
+def payload(
+        node, workspace, verb, exp, ts, *, basis="", admission=False,
+        closures=()):
     secret, device = node.identity(workspace)
     owner = historical_owner(node, workspace, device)
     item = request(
-        workspace, device, owner, verb, exp, removal_path, ts)
+        workspace, device, owner, verb, exp, basis, ts)
+    if not admission:
+        return (item,)
     signed = signature.signature(secret, device, item, ts)
-    return identity_closure(node, workspace, item, signed)
+    return identity_closure(
+        node, workspace, item, signed, closures=closures)
 
 
 PROOF_COMMANDS = {purpose: payload for purpose in PURPOSES}
 
 
 # QUERIES
-def authorize(view, valid, stream, trusted_now, *, purpose="sync", writer=None):
+def lookup(fact, writer, trusted_now, *, purpose="sync", proposed_head=None):
+    """Read the outer-device-bound request without evaluating its chain."""
+    body = fact.body
+    if fact.t != TAG or writer != body["device"] \
+            or purpose not in PURPOSES or body["verb"] != purpose \
+            or body["exp"] < trusted_now or proposed_head is not None:
+        return None
+    return _access.lookup_claim(body["device"], body["owner"]), \
+        body["basis"], body["verb"]
+
+
+def authorize_admission(
+        valid, stream, trusted_now, *, purpose="sync", writer=None):
+    """Evaluate the positive chain only while creating an UNKNOWN row."""
     body = valid.fact.body
     if valid.fact.t != TAG or purpose not in PURPOSES \
             or body["verb"] != purpose or body["exp"] < trusted_now:
         return None
     identity = _access.claim(valid, stream, writer)
-    if identity is None:
-        return None
-    path = base64.b64decode(body["path"], validate=True)
-    verify_clear(view, path, identity.scopes)
-    return identity.device, body["verb"]
+    return None if identity is None else (identity, body["verb"])

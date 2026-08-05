@@ -37,7 +37,7 @@ def proof(values, proposed_head, base_head=None):
     secret, public, root, device_signature, device = values
     request = head_request(
         root.fid, public, public, base_head,
-        proposed_head, 1_000_000, b"mechanical removal path", 3)
+        proposed_head, 1_000_000, h(b"mechanical removal path"), 3)
     request_signature = signature_fact(secret, public, request, 3)
     return encode_signed_pile(make_signed_pile(
         secret, root.fid, public,

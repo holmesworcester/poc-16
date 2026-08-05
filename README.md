@@ -6,9 +6,10 @@ database-free authority, object, head, and HTTP core. A hosted owner target
 needs an object store but no database. SQLite exists only as a disposable
 full-client query and authorship accelerator.
 
-The writer forest and section 7's two-phase, self-confined removal-path gate
-are the running publication and access protocol. No predecessor authority
-repository or compatibility route is retained behind the cut.
+The writer forest and section 7's subject lookup gate are the running
+publication and access protocol. No predecessor authority repository,
+standalone removal-path route, or compatibility path is retained behind the
+cut.
 
 The implementation is deliberately strict about authority and direction:
 
@@ -19,10 +20,10 @@ The implementation is deliberately strict about authority and direction:
   projection.
 - `PileSender` is the full peer's SQL-permitted close/sign boundary. Its normal
   send path publishes through `WriterLog`.
-- `AccessGate` first accepts a device-signed historical-member proof to
-  return only that member/device pair's current removal path, then accepts a
-  second device-signed current-member proof carrying that path. Both judgments
-  are discarded; neither synchronizes or mutates recipient authority state.
+- `AccessGate` evaluates the positive membership chain once, at admission, to
+  create an exact CLEAR subject row. Later signed requests perform one lookup:
+  UNKNOWN fails closed, CLEAR proceeds, ACTIVE receives only its own rejection
+  path and current tip, and a stale basis receives the current tip for retry.
 - A control head is evaluated once at `/permit`. Its stable-secret HMAC permit
   carries the bounded aggregate removal plan; `/commit` verifies its issue-time
   root, applies that plan, and performs one CAS of the final writer slot.
@@ -34,10 +35,10 @@ The implementation is deliberately strict about authority and direction:
   CAS and retries removal-root contention only a named bounded number of times.
   A crash can leave removal ahead; the next source sync idempotently reapplies
   the plan. It needs no cursor, retry journal, or retained old source head.
-- Removal roots and proof nodes are private authenticated point-read state,
-  never generic `obj/` or pack objects. A slot may record a root hash for audit,
-  but only the self-confined path endpoint can read the private tree, and its
-  witness does not contain neighboring members.
+- Removal roots and proof nodes are private authenticated state, never generic
+  `obj/` or pack objects. The bounded root contains the complete hashed row set
+  so a gate can cache and look up the tree after at most one conditional root
+  read; immutable nodes remain only for authenticated ACTIVE rejection paths.
 - `FullPeer` composes the complete core with identity, scheduling, Bao I/O,
   and disposable SQL; it owns no parallel admission or sync implementation.
 
@@ -54,9 +55,9 @@ authority-publication hook.
 3. `core/writer_tree.py`, `core/writer_head.py`, and
    `core/writer_repository.py`: per-device logs, owner publication, mirroring,
    and optional consumption.
-4. `core/access.py`, `core/removal_path.py`, `core/removal_state.py`, and
-   `core/suppression_tree.py`: discarded access judgments and the recipient's
-   private authenticated removal state.
+4. `core/access.py`, `core/removal_state.py`, `core/removal_tree.py`, and
+   `core/removal_path.py`: the shared lookup gate, recipient-owned judgment
+   state, and the ACTIVE rejection-path codec.
 5. `core/http.py`, `core/http_stdlib.py`: the shared peer gate, then its
    standard-library HTTP server/byte adapter.
 6. `full_peer/pile_sender.py`: stateful-client authorship and closure.
@@ -137,7 +138,7 @@ Iroh is only an encrypted connection and reachability layer. The Rust code
 does not parse HTTP, grants, workspaces, object keys, or facts and never opens
 the bucket. It forwards one byte stream to the loopback
 `core/http_stdlib.py` listener. That listener still invokes the one
-`HttpGate`, whose bearer grant checks and normal GET/PUT/removal-path/mint/head
+`HttpGate`, whose bearer grant checks and normal GET/PUT/mint/head
 operations reach the same object-store, removal-tree, and writer-slot
 interfaces as plain HTTP.
 Endpoint IDs, tickets, ALPN, and connection success confer no repository
@@ -227,7 +228,8 @@ facts command
     -> PileSender closes dependencies and signs one canonical pile
     -> WriterLog verifies the exact closure and appends one Merkle leaf
     -> immutable pile, tree pages, and signed head are established
-    -> a discarded device-signed current-member proof authorizes one device-slot CAS
+    -> a device-signed action passes the recipient's exact subject lookup
+    -> the authorized head advances only that device's slot
     -> RepositoryMirror and FactConsumer repeat validation
     -> disposable SQL projects the accepted durable facts
 ```
@@ -626,7 +628,7 @@ separately, a family may declare current principal/authority scopes whose
 suppression makes the fact unusable as an authority provider without removing
 the fact from validated storage.
 
-`SuppressionTree` maps a known suppression ID to one of:
+`RemovalTree` maps a known suppression ID to one of:
 
 - `CLEAR`: the ID exists and has no effective action at this root;
 - `ACTIVE(action_fid)`: the named immutable action is effective.

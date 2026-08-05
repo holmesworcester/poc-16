@@ -19,6 +19,7 @@ from core.object_store import (
     RetryableStoreError,
     STALE,
     StoreError,
+    UNCHANGED,
     Versioned,
     VersionToken,
     authoritative_key,
@@ -197,6 +198,31 @@ class R2BindingStore:
         except Exception as error:
             raise StoreError(
                 f"R2 versioned read failed for {key}") from error
+
+    async def read_versioned_if_changed(self, key, token):
+        """Use R2Conditional so a warm gate does not download root bytes."""
+        if not isinstance(token, VersionToken):
+            raise TypeError("R2 conditional read token")
+        try:
+            obj = await self.bucket.get(self._key(key), {
+                "onlyIf": {"etagDoesNotMatch": token.value},
+            })
+            if obj is None:
+                return ABSENT
+            if getattr(obj, "body", None) is None:
+                current = self._token(obj)
+                if current != token:
+                    raise StoreError("R2 conditional response token changed")
+                return UNCHANGED
+            limit = MAX_ROOT_BYTES \
+                if key in SINGLETON_CAS_KEYS else MAX_OBJECT_BYTES
+            return Versioned(
+                await self._bounded_bytes(obj, limit), self._token(obj))
+        except (PayloadTooLarge, StoreError):
+            raise
+        except Exception as error:
+            raise StoreError(
+                f"R2 conditional read failed for {key}") from error
 
     async def has(self, key):
         try:

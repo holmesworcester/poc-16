@@ -5,7 +5,12 @@ import asyncio
 import pytest
 
 import facts
-from core.access import AccessGate, ControlHeadRetry
+from core.access import (
+    AccessGate,
+    ControlHeadRetry,
+    LookupActive,
+    LookupRefresh,
+)
 from core.close import (
     decode_signed_pile,
     encode_signed_pile,
@@ -19,7 +24,6 @@ from core.limits import (
     PayloadTooLarge,
 )
 from core.object_store import ABSENT, REMOVAL_ROOT_KEY
-from core.removal_path import ProofRefreshRequired, RemovalDenied
 from core.removal_state import ControlHeadPlan
 from core.store import FsStore
 from core.suppression import scoped_id, suppression_slot
@@ -37,7 +41,6 @@ from core.writer_repository import (
 )
 from facts.auth.head_request import head_request
 from facts.auth.removal import removal
-from facts.auth.removal_path_request import removal_path_request
 from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
@@ -136,21 +139,11 @@ def founder_world():
     return secret, founder, root
 
 
-def historical_proof(secret, writer, root, closure, *, exp=1_000):
-    item = removal_path_request(
-        root.fid, writer, writer, exp, 20)
-    item_signature = signature(secret, writer, item, 20)
-    return signed(
-        secret, writer, root, (*closure, item_signature, item))
-
-
 def exact_head_proof(
-        secret, writer, root, closure, path, head, base=None, *, exp=1_000):
+        secret, writer, root, closure, basis, head, base=None, *, exp=1_000):
     item = head_request(
-        root.fid, writer, writer, base, head, exp, path, 21)
-    item_signature = signature(secret, writer, item, 21)
-    return signed(
-        secret, writer, root, (*closure, item_signature, item))
+        root.fid, writer, writer, base, head, exp, basis, 21)
+    return signed(secret, writer, root, (item,))
 
 
 def self_removal_pile(secret, writer, root, *, ts=30):
@@ -212,13 +205,12 @@ async def issued_terminal(tmp_path, label="terminal"):
     gate = AccessGate(root.fid, store)
     bootstrap = signed(secret, founder, root, (root,))
     assert (await gate.state.bootstrap(bootstrap)).status == "applied"
-    path = await gate.removal_path(
-        historical_proof(secret, founder, root, (root,)), 10)
+    basis = (await gate.state.pin()).root_oid
     action, control = self_removal_pile(secret, founder, root)
     proposed = await establish_control_head(
         tmp_path, store, secret, founder, root, (control,), label)
     proof = exact_head_proof(
-        secret, founder, root, (root,), path, proposed)
+        secret, founder, root, (root,), basis, proposed)
     permit = await gate.issue_head_permit(
         proof, proposed, (control,), 10, PERMIT_SECRET)
     head_gate = OpaqueHeadGate(store, gate.authorize_head)
@@ -253,10 +245,9 @@ def test_self_removal_is_applied_before_one_final_head(tmp_path):
         assert (slot.head, slot.removal_root) == (
             proposed, result.slot.removal_root)
 
-        fresh = await gate.removal_path(
-            historical_proof(secret, founder, root, (root,)), 40)
+        fresh = (await gate.state.pin()).root_oid
         later = establish_opaque_head(store, "later")
-        with pytest.raises(RemovalDenied):
+        with pytest.raises(LookupActive):
             await gate.authorize_head(
                 exact_head_proof(
                     secret, founder, root, (root,), fresh,
@@ -274,8 +265,7 @@ def test_signed_control_tree_requires_permit_and_exact_declared_piles(
         (secret, founder, root, _store, gate, _head_gate,
          proposed, _action, control, permit) = await issued_terminal(
              tmp_path, "declared-controls")
-        path = await gate.removal_path(
-            historical_proof(secret, founder, root, (root,)), 10)
+        path = (await gate.state.pin()).root_oid
         proof = exact_head_proof(
             secret, founder, root, (root,), path, proposed)
 
@@ -335,8 +325,7 @@ def test_removed_writer_cannot_issue_a_new_control_head_permit(tmp_path):
         gate = AccessGate(root.fid, store)
         assert (await gate.state.bootstrap(signed(
             secret, founder, root, (root,)))).status == "applied"
-        historical = historical_proof(secret, founder, root, (root,))
-        stale_path = await gate.removal_path(historical, 10)
+        stale_path = (await gate.state.pin()).root_oid
         proposed = establish_opaque_head(store, "stale proposed")
         proof = exact_head_proof(
             secret, founder, root, (root,), stale_path, proposed)
@@ -346,14 +335,14 @@ def test_removed_writer_cannot_issue_a_new_control_head_permit(tmp_path):
             scoped_id("member", founder),
             suppression_slot(h(b"another admin removed founder")),
         ),))).status == "applied"
-        with pytest.raises(ProofRefreshRequired):
+        with pytest.raises(LookupActive):
             await gate.issue_head_permit(
                 proof, proposed, (control,), 10, PERMIT_SECRET)
 
-        current_path = await gate.removal_path(historical, 10)
+        current_path = (await gate.state.pin()).root_oid
         current_proof = exact_head_proof(
             secret, founder, root, (root,), current_path, proposed)
-        with pytest.raises(RemovalDenied):
+        with pytest.raises(LookupActive):
             await gate.issue_head_permit(
                 current_proof, proposed, (control,), 10, PERMIT_SECRET)
 
@@ -407,8 +396,7 @@ def test_generic_permit_joins_multiple_control_sinks_once(tmp_path):
         gate = AccessGate(root.fid, store)
         assert (await gate.state.bootstrap(signed(
             founder_secret, founder, root, (root,)))).status == "applied"
-        path = await gate.removal_path(historical_proof(
-            founder_secret, founder, root, (root,)), 10)
+        path = (await gate.state.pin()).root_oid
         action = removal(root.fid, founder, member, 300)
         action_signature = signature(
             founder_secret, founder, action, action.ts)
@@ -459,8 +447,7 @@ def test_commit_rejects_a_permit_whose_issue_root_is_no_longer_live(
         gate = AccessGate(root.fid, store)
         assert (await gate.state.bootstrap(signed(
             founder_secret, founder, root, (root,)))).status == "applied"
-        path = await gate.removal_path(historical_proof(
-            founder_secret, founder, root, (root,)), 10)
+        path = (await gate.state.pin()).root_oid
         action = removal(root.fid, founder, member, 300)
         action_signature = signature(
             founder_secret, founder, action, action.ts)
@@ -513,8 +500,7 @@ def test_two_same_base_permits_apply_fail_safe_rows_then_one_head_wins(tmp_path)
         gate = AccessGate(root.fid, store)
         assert (await gate.state.bootstrap(signed(
             secret, founder, root, (root,)))).status == "applied"
-        path = await gate.removal_path(historical_proof(
-            secret, founder, root, (root,)), 10)
+        path = (await gate.state.pin()).root_oid
         heads, permits, actions = [], [], []
         for index, (_member_secret, member, closure) in enumerate(members):
             action = removal(root.fid, founder, member, 400 + index)
@@ -624,12 +610,13 @@ def test_aggregate_control_fact_and_row_bounds_are_exact(tmp_path):
             secret, founder, root, index)[2])
         for index in range(MAX_HEAD_REMOVAL_UPDATES + 1)
     )
-    exact_rows = (root_pile, *membership_piles[:2])
+    # Each admission reserves member, device, and exact subject binding.
+    exact_rows = (root_pile, membership_piles[0])
     assert len(gate.state.plan_control(exact_rows, founder).updates) \
         == MAX_HEAD_REMOVAL_UPDATES
     with pytest.raises(PayloadTooLarge, match="removal updates"):
         gate.state.plan_control(
-            (*exact_rows, membership_piles[2]), founder)
+            (*exact_rows, membership_piles[1]), founder)
 
 
 def test_owner_publisher_reuses_only_the_issued_permit_after_retry(tmp_path):
@@ -662,8 +649,7 @@ def test_owner_publisher_reuses_only_the_issued_permit_after_retry(tmp_path):
         issues, commits = [], []
 
         async def make_proof(base, proposed):
-            path = await access.removal_path(historical_proof(
-                secret, founder, root, (root,)), 10)
+            path = (await access.state.pin()).root_oid
             return exact_head_proof(
                 secret, founder, root, (root,), path, proposed, base)
 

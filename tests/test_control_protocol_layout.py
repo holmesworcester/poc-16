@@ -84,7 +84,7 @@ def test_control_permit_evaluates_once_then_applies_and_cas_final_slot():
         "core/access.py",
         definition("core/access.py", "issue_head_permit", "AccessGate"),
     )
-    assert issue.count("plan_control(") == 1
+    assert issue.count("plan_control_missing(") == 1
     assert issue.count("encode_permit(") == 1
 
     commit = segment(

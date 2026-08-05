@@ -9,18 +9,24 @@ Commands:
       POC16_R2_ACCESS_KEY_ID=... POC16_R2_SECRET_ACCESS_KEY=... \
       python3 -m pytest -q -m live_r2 tests/test_provider_live.py
 
+Scenario 8-11 lookup-gate contention is included in the live R2 selection and
+prints exact operation counts plus projected request cost.
+
 These tests reject endpoint overrides.  Emulator runs can exercise SDK wiring
 elsewhere but are not provider evidence.
 """
+import json
 import os
 import re
 import secrets
 import time
+from dataclasses import replace
 from urllib.parse import urlsplit
 
 import pytest
 
 from adapters.r2 import R2S3Config, R2S3Store
+from bench.removal_contention import run_removal_scenarios
 from adapters.s3 import S3Config, S3Store
 from core.object_store import Applied, OutcomeUnknown
 from peerlog.cloud import MULTIPART_EDGE, CloudCache, CloudQueue
@@ -39,7 +45,7 @@ _RUN_PREFIX_RE = re.compile(
 _S3_ENDPOINT_RE = re.compile(
     r"^s3(?:-fips)?(?:\.dualstack)?"
     r"(?:\.[a-z0-9-]+)?\.amazonaws\.com(?:\.cn)?$")
-_MAX_CLEANUP_KEYS = 128
+_MAX_CLEANUP_KEYS = 4096
 
 
 def _generated_prefix():
@@ -211,7 +217,7 @@ def live_r2_store():
         bucket=os.environ["POC16_R2_BUCKET"],
         prefix=prefix,
         list_page_size=2,
-        max_list_pages=64,
+        max_list_pages=_MAX_CLEANUP_KEYS,
     )
     stores = []
 
@@ -290,3 +296,34 @@ def test_live_r2_peerlog_rounds_and_five_mib_part_copy(live_r2_store):
     assert provider.get("part-copy/destination")[0] is None
     provider.complete_multipart(upload)
     assert provider.get("part-copy/destination")[0] == edge + b"tail"
+
+
+@pytest.mark.live
+@pytest.mark.live_r2
+def test_live_r2_lookup_gate_removal_scenarios_8_to_11(live_r2_store):
+    """Run the bead's removal scenarios through separate direct R2 stores."""
+    print(
+        "lookup-gate scenarios 8-11 projected ceiling: "
+        "<10,000 Class A + <10,000 Class B requests, <$0.05",
+        flush=True,
+    )
+
+    def factory(label):
+        seed = live_r2_store()
+        config = replace(
+            seed.r2_config,
+            prefix=seed.r2_config.prefix + "/" + label,
+        )
+        return R2S3Store(
+            config,
+            read_client=seed._read_client,
+            mutation_client=seed._mutation_client,
+        )
+
+    reports = run_removal_scenarios(
+        factory,
+        pace=lambda: time.sleep(1.05),
+        members=100,
+    )
+    print(json.dumps(reports, indent=2), flush=True)
+    assert all(report["projected_r2_usd"] < 0.05 for report in reports)
