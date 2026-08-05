@@ -124,6 +124,10 @@ class Peer:
             self.mint()
         return self._tip
 
+    def _open(self, request, timeout):
+        """Issue one wire request; subclasses may observe exact I/O scope."""
+        return _DIRECT_OPENER.open(request, timeout=timeout)
+
     def _http(
             self, method, path, data=None, etag=None, auth=True, retry=True,
             require_push=False, require_object_put=False,
@@ -150,7 +154,7 @@ class Peer:
         if etag:
             req.add_header("If-None-Match", etag)
         try:
-            with _DIRECT_OPENER.open(req, timeout=15) as r:
+            with self._open(req, timeout=15) as r:
                 body = read_bounded(
                     r, response_limit, "peer response")
                 return r.status, body, dict(r.headers)
@@ -447,7 +451,7 @@ class Peer:
             method="GET",
             headers=dict(scoped.headers),
         )
-        with _DIRECT_OPENER.open(request, timeout=60) as response:
+        with self._open(request, timeout=60) as response:
             def chunks():
                 while True:
                     chunk = response.read(DIRECT_STREAM_CHUNK_BYTES)
@@ -496,7 +500,7 @@ class Peer:
             method="GET",
             headers=dict(scoped.headers),
         )
-        with _DIRECT_OPENER.open(request, timeout=60) as response:
+        with self._open(request, timeout=60) as response:
             def chunks():
                 while True:
                     chunk = response.read(DIRECT_STREAM_CHUNK_BYTES)

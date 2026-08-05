@@ -9,6 +9,7 @@ and benchmark results remain owned by the invoking user.
 import argparse
 import asyncio
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import json
 import os
@@ -20,7 +21,7 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.request
+import urllib.parse
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -28,22 +29,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import facts
 
 from bench.writer_p2p_cost import MeteredPeer
-from core.limits import (
-    DIRECT_STREAM_CHUNK_BYTES,
-    MAX_DIRECT_OBJECT_BYTES,
-    MAX_OBJECT_BYTES,
-)
-from core.pack_access import (
-    MAX_SCOPED_REQUEST_BYTES,
-    ObjectOpen,
-    confine_object_request,
-    copy_object_get,
-    decode_scoped_request,
-    encode_object_open,
-)
 from core.store import RemoteStore
 from full_peer.node import FullPeer
-from full_peer import walk as walk_module
 
 
 DEFAULT_BANDWIDTH_MBIT = 5
@@ -92,76 +79,39 @@ class NetworkMeteredPeer(MeteredPeer):
         self.events = []
         self._events_lock = threading.Lock()
 
-    def _http(self, method, path, data=None, *args, **kwargs):
+    @contextmanager
+    def _open(self, request, timeout):
+        """Measure only the interval in which a real wire request is open."""
         started = time.perf_counter()
+        response_bytes = 0
+
+        class CountingResponse:
+            def __init__(self, response):
+                self._response = response
+
+            def __getattr__(self, name):
+                return getattr(self._response, name)
+
+            def read(self, *args, **kwargs):
+                nonlocal response_bytes
+                value = self._response.read(*args, **kwargs)
+                response_bytes += len(value)
+                return value
+
         try:
-            response = super()._http(method, path, data, *args, **kwargs)
-            response_bytes = len(response[1])
-            return response
+            with super()._open(request, timeout) as response:
+                yield CountingResponse(response)
         finally:
             stopped = time.perf_counter()
+            parsed = urllib.parse.urlsplit(request.full_url)
             with self._events_lock:
                 self.events.append(RequestEvent(
-                    method,
-                    path,
+                    request.get_method(),
+                    parsed.path,
                     started,
                     stopped,
-                    len(data or b""),
-                    locals().get("response_bytes", 0),
-                ))
-
-    def copy_obj(self, oh, *, response_limit, write):
-        """Instrument the literal streaming GET omitted by control framing."""
-        if response_limit <= MAX_OBJECT_BYTES:
-            return super().copy_obj(
-                oh, response_limit=response_limit, write=write)
-        if type(response_limit) is not int \
-                or not 0 < response_limit <= MAX_DIRECT_OBJECT_BYTES \
-                or not callable(write):
-            raise ValueError("peer object response limit")
-        opened = ObjectOpen("GET", oh, response_limit)
-        _, raw, _ = self._http(
-            "POST", "/obj/open",
-            data=encode_object_open(opened),
-            response_limit=MAX_SCOPED_REQUEST_BYTES,
-        )
-        scoped = confine_object_request(
-            opened,
-            decode_scoped_request(raw),
-            walk_module.now_ms(),
-        )
-        self._confine_direct_origin(scoped)
-        request = urllib.request.Request(
-            scoped.url,
-            method="GET",
-            headers=dict(scoped.headers),
-        )
-        response_bytes = 0
-        started = time.perf_counter()
-        try:
-            with walk_module._DIRECT_OPENER.open(
-                    request, timeout=60) as response:
-                def chunks():
-                    nonlocal response_bytes
-                    while True:
-                        chunk = response.read(DIRECT_STREAM_CHUNK_BYTES)
-                        if not chunk:
-                            return
-                        response_bytes += len(chunk)
-                        yield chunk
-
-                return copy_object_get(
-                    opened,
-                    response.status,
-                    response.headers,
-                    chunks(),
-                    write,
-                )
-        finally:
-            with self._events_lock:
-                self.events.append(RequestEvent(
-                    "GET", "/obj/stream", started, time.perf_counter(),
-                    0, response_bytes,
+                    len(request.data or b""),
+                    response_bytes,
                 ))
 
 
@@ -188,7 +138,7 @@ def _store_sizes(node, workspace):
     }
 
 
-def measure_catchup(node, workspace, url):
+def measure_catchup(node, workspace, url, expected_fids):
     """Pull one production HTTP forest through validation into durable state."""
     peer = NetworkMeteredPeer(node, workspace, url)
     remote = RemoteStore(peer)
@@ -201,6 +151,11 @@ def measure_catchup(node, workspace, url):
         raise ValueError("network catch-up mirror error") from ValueError(
             result.errors[0][1])
     after_facts = set(node.sql(workspace).fact_ids())
+    expected_fids = set(expected_fids)
+    missing = expected_fids - after_facts
+    if missing:
+        raise ValueError(
+            f"network catch-up incomplete: {len(missing)} expected facts missing")
     after_sizes = _store_sizes(node, workspace)
     durable_bytes = sum(
         size for key, size in after_sizes.items()
@@ -238,21 +193,22 @@ def _rate_mbps(byte_count, elapsed_seconds):
 
 
 def final_report(
-        measurement, *, bandwidth_mbit, rtt_ms, line_bytes,
-        line_elapsed_seconds, wire_rx_bytes, minimum_fraction):
+        measurement, *, bandwidth_mbit, rtt_ms, line_wire_rx_bytes,
+        line_elapsed_seconds, catchup_wire_rx_bytes, minimum_fraction):
     """Join independently measured link and verified-catch-up evidence."""
-    line_rate = _rate_mbps(line_bytes, line_elapsed_seconds)
-    wire_rate = _rate_mbps(wire_rx_bytes, measurement.elapsed_seconds)
+    line_rate = _rate_mbps(line_wire_rx_bytes, line_elapsed_seconds)
+    wire_rate = _rate_mbps(
+        catchup_wire_rx_bytes, measurement.elapsed_seconds)
     fraction = wire_rate / line_rate
     value = {
         "topology": "two Linux network namespaces over shaped veth",
         "configured_bandwidth_mbps": bandwidth_mbit,
         "configured_rtt_ms": rtt_ms,
-        "measured_line_bytes": line_bytes,
+        "measured_line_wire_rx_bytes": line_wire_rx_bytes,
         "measured_line_seconds": line_elapsed_seconds,
         "measured_line_rate_mbps": line_rate,
         "catchup_seconds": measurement.elapsed_seconds,
-        "catchup_wire_rx_bytes": wire_rx_bytes,
+        "catchup_wire_rx_bytes": catchup_wire_rx_bytes,
         "catchup_wire_rate_mbps": wire_rate,
         "line_rate_fraction": fraction,
         "minimum_line_rate_fraction": minimum_fraction,
@@ -278,7 +234,7 @@ def _fixture(root, url, piles, text_bytes):
             f"{ordinal:08d}:{text}",
             ts=10_000 + ordinal,
         )
-    return workspace
+    return workspace, tuple(source.sql(workspace).fact_ids())
 
 
 def _run(command, *, check=True, capture_output=True, env=None):
@@ -385,7 +341,7 @@ def _namespace_run(args):
     }
     server = line_server = server_log = None
     try:
-        workspace = _fixture(
+        workspace, expected_fids = _fixture(
             root,
             f"http://{SOURCE_ADDRESS}:{PEER_PORT}",
             args.piles,
@@ -446,21 +402,27 @@ def _namespace_run(args):
         )
         if line_server.stdout.readline().strip() != "READY":
             raise RuntimeError("line-rate server failed")
+        before_line_rx = _counter(target_ns, "rx_bytes")
         line = _run(_as_user_namespace(target_ns, (
             sys.executable, str(Path(__file__).resolve()),
             "line-client", "--host", SOURCE_ADDRESS,
             "--port", str(LINE_PORT), "--bytes", str(args.line_bytes),
         ), environment))
+        after_line_rx = _counter(target_ns, "rx_bytes")
         line_result = json.loads(line.stdout)
         if line_server.wait(10) != 0:
             raise RuntimeError(line_server.stderr.read())
         line_server = None
+
+        expected_path = root / "expected-fids.json"
+        expected_path.write_text(json.dumps(expected_fids))
 
         before_rx = _counter(target_ns, "rx_bytes")
         catchup = _run(_as_user_namespace(target_ns, (
             sys.executable, str(Path(__file__).resolve()),
             "catchup", "--state", str(root / "target"),
             "--workspace", workspace,
+            "--expected-fids", str(expected_path),
             "--url", f"http://{SOURCE_ADDRESS}:{PEER_PORT}",
         ), environment))
         after_rx = _counter(target_ns, "rx_bytes")
@@ -469,9 +431,9 @@ def _namespace_run(args):
             measurement,
             bandwidth_mbit=args.bandwidth_mbit,
             rtt_ms=args.rtt_ms,
-            line_bytes=line_result["bytes"],
+            line_wire_rx_bytes=after_line_rx - before_line_rx,
             line_elapsed_seconds=line_result["elapsed_seconds"],
-            wire_rx_bytes=after_rx - before_rx,
+            catchup_wire_rx_bytes=after_rx - before_rx,
             minimum_fraction=args.minimum_fraction,
         )
         if not report["network_bound"]:
@@ -519,6 +481,7 @@ def _parser():
     catchup.add_argument("--state", required=True)
     catchup.add_argument("--workspace", required=True)
     catchup.add_argument("--url", required=True)
+    catchup.add_argument("--expected-fids", required=True)
     return parser
 
 
@@ -532,7 +495,8 @@ def main(argv=None):
         print(json.dumps(_line_client(args.host, args.port, args.bytes)))
     else:
         measurement = measure_catchup(
-            FullPeer(args.state), args.workspace, args.url)
+            FullPeer(args.state), args.workspace, args.url,
+            json.loads(Path(args.expected_fids).read_text()))
         print(json.dumps(asdict(measurement)))
     return 0
 

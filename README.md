@@ -1136,17 +1136,18 @@ python3 bench/writer_network_bound.py run
 The default run creates two isolated Linux network namespaces over a shaped
 veth link, independently measures that link, then pulls through the production
 HTTP gate into the destination's verified filesystem log. On the 5 Mbit/s,
-20 ms RTT profile, the measured useful line was 4.767 Mbit/s. A 16-pile,
-32-fact catchup received 34,446,953 wire bytes and durably installed 33,589,028
-bytes in 66.592 seconds: 4.138 Mbit/s, or 86.81% of measured line rate against
+20 ms RTT profile, the line probe received 8,593,320 interface bytes in 14.078
+seconds, or 4.883 Mbit/s. A 16-pile, 32-fact catchup received 34,450,121
+interface bytes and durably installed 33,589,326 bytes in 66.627 seconds: 4.136
+Mbit/s, or 84.71% of measured line rate against
 the stated 70% floor. The trace used 41 HTTP requests, 22 literal GETs, 39
-logical read phases, and 39 observed request waves. The harness cleans up its
-namespaces and fails if the rate floor or durable fact checks do not hold.
+logical read phases, and 41 observed request waves. The harness cleans up its
+namespaces and fails if the rate floor or the complete expected source-FID set
+does not hold durably.
 
 This result establishes bandwidth-bound behavior on the constrained-link
-profile, not saturation of faster links. The same 16-pile shape reached 58.7%
-of an independently measured 18.95 Mbit/s line; fresh authenticated streaming
-connections remain visible overhead at that rate.
+profile, not saturation of faster links. Fresh authenticated streaming
+connections remain visible overhead as configured bandwidth rises.
 
 These are local `MemoryCloud` execution measurements. Projected times using the
 decision-record 90 ms RTT and 2.5 MB/s link are models, not real-link evidence.

@@ -3,6 +3,8 @@ from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
 import threading
 
+import pytest
+
 import facts
 
 from bench.writer_network_bound import (
@@ -74,7 +76,8 @@ def test_real_socket_catchup_is_counted_only_after_durable_validation(tmp_path):
 
     before = set(target.sql(workspace).fact_ids())
     with serve(source) as url:
-        measured = measure_catchup(target, workspace, url)
+        expected = set(source.sql(workspace).fact_ids())
+        measured = measure_catchup(target, workspace, url, expected)
     after = set(target.sql(workspace).fact_ids())
 
     assert measured.facts == len(after - before) == 8
@@ -83,9 +86,27 @@ def test_real_socket_catchup_is_counted_only_after_durable_validation(tmp_path):
     assert measured.logical_gets > 0
     assert measured.http_gets > 0
     assert measured.http_requests >= measured.logical_gets
-    assert measured.request_waves > 0
+    # This client is synchronous. Authentication requests occur before the
+    # request they authorize, so every actual wire request is its own wave.
+    assert measured.request_waves == measured.http_requests
     assert measured.elapsed_seconds > 0
     assert any("/obj" in path for path, _count in measured.request_breakdown)
+
+
+def test_real_socket_catchup_rejects_an_incomplete_expected_fixture(tmp_path):
+    source = FullPeer(str(tmp_path / "source"))
+    source.peer_address = "http://127.0.0.1:1"
+    workspace = facts.auth.workspace.create(source, "source", ts=1)
+    link = facts.auth.user_invite.make(source, workspace)
+    target = FullPeer(str(tmp_path / "target"))
+    facts.auth.user.accept(target, link, "target")
+    facts.content.message.post(
+        source, workspace, "general", "complete transfer", ts=100)
+    expected = set(source.sql(workspace).fact_ids()) | {"0" * 64}
+
+    with serve(source) as url, pytest.raises(
+            ValueError, match="1 expected facts missing"):
+        measure_catchup(target, workspace, url, expected)
 
 
 def test_request_waves_group_only_observed_overlap():
@@ -107,12 +128,32 @@ def test_network_bound_verdict_uses_independent_measured_line_rate():
         measured,
         bandwidth_mbit=10,
         rtt_ms=20,
-        line_bytes=10_000_000,
+        line_wire_rx_bytes=10_000_000,
         line_elapsed_seconds=10,
-        wire_rx_bytes=8_000_000,
+        catchup_wire_rx_bytes=8_000_000,
         minimum_fraction=DEFAULT_RATE_FRACTION,
     )
     assert report["measured_line_rate_mbps"] == 8.0
     assert report["catchup_wire_rate_mbps"] == 8.0
     assert report["line_rate_fraction"] == 1.0
     assert report["network_bound"] is True
+
+
+def test_network_bound_verdict_compares_interface_bytes_for_both_transfers():
+    measured = CatchupMeasurement(
+        8.0, 100, 50, 5_200_000, 12, 9, 10, 12, 1_000, 5_200_000,
+        (("GET /heads", 1),),
+    )
+    report = final_report(
+        measured,
+        bandwidth_mbit=10,
+        rtt_ms=20,
+        line_wire_rx_bytes=10_500_000,
+        line_elapsed_seconds=10,
+        catchup_wire_rx_bytes=5_500_000,
+        minimum_fraction=DEFAULT_RATE_FRACTION,
+    )
+    assert report["measured_line_rate_mbps"] == 8.4
+    assert report["catchup_wire_rate_mbps"] == 5.5
+    assert report["line_rate_fraction"] < DEFAULT_RATE_FRACTION
+    assert report["network_bound"] is False

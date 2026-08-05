@@ -1052,10 +1052,13 @@ format. Signed closed piles remain only the ephemeral gate-proof boundary.
 The real-link performance gate uses two isolated Linux network stacks over a
 kernel-shaped veth link, the production FullPeer HTTP gate/client, and the
 destination filesystem store. It measures the useful TCP line rate separately
-and times through durable semantic admission, never adding modeled RTT to an
-in-memory execution. The checked constrained-link profile is 5 Mbit/s and 20
-ms RTT with a stated 70% line-rate floor. Sixteen two-MiB message piles produce
-a roughly 32 MiB authenticated catchup while keeping per-object setup visible.
+and compares receiver-interface bytes for both the line probe and catchup while
+timing through durable semantic admission, never adding modeled RTT to an
+in-memory execution. The gate also requires every source fixture FID to be
+durable at the destination. The checked constrained-link profile is 5 Mbit/s
+and 20 ms RTT with a stated 70% line-rate floor. Sixteen two-MiB message piles
+produce a roughly 32 MiB authenticated catchup while keeping per-object setup
+visible.
 
 ## 10. Object-store contract
 
