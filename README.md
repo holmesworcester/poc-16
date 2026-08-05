@@ -1127,6 +1127,27 @@ is 0.9% above the store-model 1.1–1.3x prediction because every distinct targe
 still carries an exact inclusion path; it remains far below the old
 256-fact-pile 2.2–2.65x regime.
 
+Real FullPeer catchup is also measured without an RTT model:
+
+```sh
+python3 bench/writer_network_bound.py run
+```
+
+The default run creates two isolated Linux network namespaces over a shaped
+veth link, independently measures that link, then pulls through the production
+HTTP gate into the destination's verified filesystem log. On the 5 Mbit/s,
+20 ms RTT profile, the measured useful line was 4.767 Mbit/s. A 16-pile,
+32-fact catchup received 34,446,953 wire bytes and durably installed 33,589,028
+bytes in 66.592 seconds: 4.138 Mbit/s, or 86.81% of measured line rate against
+the stated 70% floor. The trace used 41 HTTP requests, 22 literal GETs, 39
+logical read phases, and 39 observed request waves. The harness cleans up its
+namespaces and fails if the rate floor or durable fact checks do not hold.
+
+This result establishes bandwidth-bound behavior on the constrained-link
+profile, not saturation of faster links. The same 16-pile shape reached 58.7%
+of an independently measured 18.95 Mbit/s line; fresh authenticated streaming
+connections remain visible overhead at that rate.
+
 These are local `MemoryCloud` execution measurements. Projected times using the
 decision-record 90 ms RTT and 2.5 MB/s link are models, not real-link evidence.
 The corresponding projections for equal-fanout 10k/100k/1M were

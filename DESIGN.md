@@ -1049,6 +1049,14 @@ intervals. Repeated sync is the propagation mechanism. There is no combined cano
 shared cloud content index, cloud treap, per-fact session, or stored closed-pile
 format. Signed closed piles remain only the ephemeral gate-proof boundary.
 
+The real-link performance gate uses two isolated Linux network stacks over a
+kernel-shaped veth link, the production FullPeer HTTP gate/client, and the
+destination filesystem store. It measures the useful TCP line rate separately
+and times through durable semantic admission, never adding modeled RTT to an
+in-memory execution. The checked constrained-link profile is 5 Mbit/s and 20
+ms RTT with a stated 70% line-rate floor. Sixteen two-MiB message piles produce
+a roughly 32 MiB authenticated catchup while keeping per-object setup visible.
+
 ## 10. Object-store contract
 
 The portable store contract becomes:
