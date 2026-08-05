@@ -144,6 +144,7 @@ class FullPeerNotifications:
         self._status_lock = threading.Lock()
         self._activity = threading.Condition()
         self._active_turns = 0
+        self._rebootstrap_requests = 0
         self._rebootstrapping = False
         self._wake = threading.Event()
         self._stopping = threading.Event()
@@ -210,6 +211,9 @@ class FullPeerNotifications:
         if mode != REBOOTSTRAP_CURRENT:
             return asyncio.run(self._bootstrap(workspace, mode))
         with self._activity:
+            self._rebootstrap_requests += 1
+            while self._rebootstrapping:
+                self._activity.wait()
             self._rebootstrapping = True
             while self._active_turns:
                 self._activity.wait()
@@ -218,6 +222,7 @@ class FullPeerNotifications:
         finally:
             with self._activity:
                 self._rebootstrapping = False
+                self._rebootstrap_requests -= 1
                 self._activity.notify_all()
 
     async def _run_once(self):
@@ -243,7 +248,7 @@ class FullPeerNotifications:
     def run_once(self):
         """Run one bounded discovery page for every configured workspace."""
         with self._activity:
-            while self._rebootstrapping:
+            while self._rebootstrap_requests:
                 self._activity.wait()
             self._active_turns += 1
         try:

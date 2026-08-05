@@ -188,6 +188,61 @@ def test_current_rebootstrap_waits_for_an_inflight_local_delivery(tmp_path):
     assert service.run_once()[0].status == "idle"
 
 
+def test_concurrent_current_rebootstraps_are_exclusive_and_fence_scans(
+        tmp_path, monkeypatch):
+    node, workspace, _provider, service = _world(tmp_path)
+    original = service._bootstrap
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    release_first = threading.Event()
+    calls_lock = threading.Lock()
+    calls = 0
+
+    async def observed_bootstrap(selected, mode):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            ordinal = calls
+        if ordinal == 1:
+            first_entered.set()
+            assert release_first.wait(5)
+        else:
+            second_entered.set()
+        return await original(selected, mode)
+
+    monkeypatch.setattr(service, "_bootstrap", observed_bootstrap)
+    resets = []
+    scans = []
+    first = threading.Thread(target=lambda: resets.append(
+        service.bootstrap(workspace, REBOOTSTRAP_CURRENT)))
+    second = threading.Thread(target=lambda: resets.append(
+        service.bootstrap(workspace, REBOOTSTRAP_CURRENT)))
+    scan = threading.Thread(target=lambda: scans.extend(service.run_once()))
+
+    first.start()
+    assert first_entered.wait(5)
+    second.start()
+    scan.start()
+    second.join(.1)
+    scan.join(.1)
+    assert second.is_alive()
+    assert scan.is_alive()
+    assert not second_entered.is_set()
+
+    release_first.set()
+    first.join(5)
+    second.join(5)
+    scan.join(5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert not scan.is_alive()
+    assert second_entered.is_set()
+    assert len(resets) == 2
+    assert resets[0] == resets[1]
+    assert scans[0].status == "idle"
+
+
 def test_completion_kicks_drain_staged_events_without_cadence(tmp_path):
     node, workspace, provider, service = _world(tmp_path)
     service.cadence = 3600
