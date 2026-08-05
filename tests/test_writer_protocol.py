@@ -1,5 +1,6 @@
 """Canonical signed-pile, writer-head, and per-device tree contract."""
 import json
+import tracemalloc
 
 import pytest
 
@@ -9,6 +10,7 @@ from core.close import (
     KernelRejected,
     SIGNED_PILE_FORMAT,
     SIGNED_PILE_SIGNATURE_DOMAIN,
+    check_pile_bounds,
     decode_signed_pile,
     encode_signed_pile,
     make_signed_pile,
@@ -24,6 +26,7 @@ from core.limits import (
     MAX_SEMANTIC_PILE_BYTES,
     MAX_WRITER_PACK_BYTES,
     MIN_HOSTED_MEMORY_BYTES,
+    PayloadTooLarge,
     evaluator_peak_bound,
     evaluator_pile_byte_bound,
 )
@@ -137,6 +140,59 @@ def test_canonical_pile_exact_bound_reaches_semantics_and_one_over_does_not(
         evaluator.evaluate(exact, writer=public)
     with pytest.raises(InvalidPile, match="pile too large"):
         evaluator.evaluate(one_over, writer=public)
+
+
+def test_pile_scanner_enforces_exact_fact_count_under_hostile_json_shapes():
+    exact = b'{"decoy":"\\\"facts\\\":[0,0]","facts":[' \
+        + b'0,' * (MAX_PILE_FACTS - 1) + b'0]}'
+    check_pile_bounds(exact)
+
+    one_over = b'{"decoy":[{"facts":[]}],"facts":[' \
+        + b'0,' * MAX_PILE_FACTS + b'0]}'
+    with pytest.raises(PayloadTooLarge, match="too many facts"):
+        check_pile_bounds(one_over)
+
+    # A noncanonical escaped root key must not bypass the pre-decode count.
+    escaped_key = b'{"fa\\u0063ts":[' \
+        + b'0,' * MAX_PILE_FACTS + b'0]}'
+    with pytest.raises(PayloadTooLarge, match="too many facts"):
+        check_pile_bounds(escaped_key)
+
+
+def test_pile_scanner_bounds_nesting_and_json_values_before_decode(
+        monkeypatch):
+    from core import close as close_module
+
+    decoded = False
+
+    def forbidden_decode(*_args, **_kwargs):
+        nonlocal decoded
+        decoded = True
+        raise AssertionError("untrusted graph was decoded")
+
+    monkeypatch.setattr(close_module, "decode_json", forbidden_decode)
+    hostile = b'[' * (MAX_PILE_JSON_VALUES + 1)
+    with pytest.raises(PayloadTooLarge, match="too many JSON values"):
+        check_pile_bounds(hostile)
+    assert not decoded
+
+
+def test_pile_scanner_streaming_memory_is_bounded_for_deep_input():
+    depth = MAX_PILE_JSON_VALUES - 4
+    hostile = b'{"facts":[' + b'[' * depth + b'0' \
+        + b']' * depth + b']}'
+
+    tracemalloc.start()
+    try:
+        check_pile_bounds(hostile)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    # The scanner retains only its bounded delimiter stack, never a decoded
+    # object graph. This ceiling is deliberately far above the ~110 KiB
+    # observed stack so ordinary allocator variation cannot make it flaky.
+    assert peak < 2 * 1024 * 1024
 
 
 def test_unsigned_predecessor_pile_has_no_decode_path():
