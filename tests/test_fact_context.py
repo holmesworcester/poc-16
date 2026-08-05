@@ -216,10 +216,12 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
                 edges = resolve_edges(fact, shuffled)
                 depth = None if edges is None else shuffled.depth(
                     tuple(edge.fid for edge in edges))
-                if edges is None or depth is None \
-                        or not accepts(fact, edges, shuffled):
+                if edges is None or depth is None:
                     retained.append(source)
                     continue
+                assert accepts(fact, edges, shuffled, strict=True), (
+                    f"seed={seed:#x} rejected={fact.fid}"
+                )
                 shuffled.admit(fact, depth, edges)
                 progressed.append(fact.fid)
             assert progressed, (

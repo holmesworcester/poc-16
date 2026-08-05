@@ -10,7 +10,7 @@ from core.close import (
     encode_signed_pile,
     make_signed_pile,
 )
-from core.crypto import h, keypair
+from core.crypto import h, load_sk
 from core.limits import (
     MAX_SEMANTIC_PILE_BYTES,
     PayloadTooLarge,
@@ -83,7 +83,7 @@ def _assert_total_canonical_codec(label, raw, decode, encode, seed):
     for ordinal, mutant in enumerate(_mutants(raw, seed)):
         try:
             value = decode(mutant)
-        except (TypeError, ValueError):
+        except ValueError:
             continue
         assert encode(value) == mutant, (
             f"{label} accepted noncanonical bytes: "
@@ -93,7 +93,8 @@ def _assert_total_canonical_codec(label, raw, decode, encode, seed):
 
 @pytest.mark.parametrize("seed", FUZZ_SEEDS)
 def test_seeded_authenticated_wire_codecs_are_total_and_canonical(seed):
-    secret, device = keypair()
+    secret = load_sk(f"{seed:064x}")
+    device = secret.verify_key.encode().hex()
     root = workspace_fact(secret, device, "alice", 1)
     workspace = root.fid
     store = h(b"protocol-fuzz-store")
