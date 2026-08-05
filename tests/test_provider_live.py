@@ -586,6 +586,9 @@ def test_live_r2_queue_clobber_scenarios_3_4_5_7(live_r2_store):
     assert not churn_thread.is_alive()
     assert not churn_errors
     assert churn_state.logs[churn_log.writer].coverage() == ((0, 8),)
+    unchanged = reader.sync(
+        churn_state, churn_cache, ts_window=(0, 10_000))
+    assert not unchanged.changed
     assert changed > 0 and reader_provider.not_modified_responses > 0
     assert reader_provider.range_gets > 0
 
