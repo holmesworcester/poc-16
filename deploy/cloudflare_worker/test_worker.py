@@ -1392,6 +1392,16 @@ def test_worker_budget_bindings_match_runtime_and_core_ceilings():
         <= config["limits"]["subrequests"]
 
 
+def test_smoke_config_uses_plan_defaults_instead_of_paid_worker_limits(
+        tmp_path, monkeypatch):
+    smoke_environment(tmp_path, monkeypatch)
+    config = manage.generated_config(smoke=True)
+
+    assert "limits" not in config
+    assert config["workers_dev"] is True
+    assert config["routes"] == []
+
+
 @pytest.mark.parametrize("field,value", [
     ("CF_WORKSPACE", "not-a-workspace"),
     ("CF_R2_BUCKET", ""),
@@ -1531,7 +1541,25 @@ def test_deploy_and_remove_subprocesses_have_control_plane_deadlines(
         manage.CONTROL_TIMEOUT_SECONDS,
         manage.CONTROL_TIMEOUT_SECONDS,
     ]
-    assert calls[0][0][0:2] == ("deploy", "--strict")
+    assert calls[0][0][0:3] == (
+        "deploy", "--no-experimental-provision", "--strict")
+    assert calls[1][0][0:3] == (
+        "delete", "--no-experimental-provision", config["name"])
+
+
+def test_delete_accepts_authoritative_absence_after_wrangler_failure(
+        monkeypatch):
+    config = deployment_config()
+    monkeypatch.setattr(manage, "_write_config", lambda candidate: None)
+
+    def applied_then_failed(*arguments, **options):
+        raise subprocess.CalledProcessError(1, arguments)
+
+    monkeypatch.setattr(manage, "_pywrangler", applied_then_failed)
+    monkeypatch.setattr(
+        manage, "_worker_settings", lambda candidate: manage._ABSENT)
+
+    assert manage._delete(config) is None
 
 
 @pytest.mark.parametrize("observed", (None, "someone-else", manage._ABSENT))
@@ -1710,6 +1738,89 @@ def test_smoke_cleans_exact_unique_worker_after_possibly_applied_deploy(
     assert config["workers_dev"] is True
     assert config["routes"] == []
     assert options == {"force": True, "timeout": 60}
+
+
+def test_smoke_uses_an_explicit_edge_accepted_client_identity(
+        tmp_path, monkeypatch):
+    smoke_environment(tmp_path, monkeypatch)
+    requests = []
+    deployed = SimpleNamespace(
+        stdout="https://poc16-smoke-example.workers.dev\n", stderr="")
+    monkeypatch.setattr(
+        manage, "_worker_settings", lambda config: manage._ABSENT)
+    monkeypatch.setattr(manage, "_deploy", lambda *args, **kwargs: deployed)
+    monkeypatch.setattr(manage, "_require_owned", lambda config: None)
+    monkeypatch.setattr(manage, "_delete", lambda *args, **kwargs: None)
+
+    class MintResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({"cap": "sync-v1/owner"}).encode()
+
+    def mint(request, timeout):
+        requests.append((request, timeout))
+        return MintResponse()
+
+    monkeypatch.setattr(manage, "urlopen", mint)
+
+    manage.smoke()
+
+    request, timeout = requests[0]
+    assert request.get_header("User-agent") == "poc-16-live-smoke/1"
+    assert request.get_header("Content-type") == "application/json"
+    assert timeout == 30
+
+
+@pytest.mark.parametrize("status", sorted(manage.SMOKE_ACTIVATION_STATUSES))
+def test_smoke_retries_only_transient_workers_dev_activation_statuses(
+        tmp_path, monkeypatch, status):
+    smoke_environment(tmp_path, monkeypatch)
+    deployed = SimpleNamespace(
+        stdout="https://poc16-smoke-example.workers.dev\n", stderr="")
+    monkeypatch.setattr(
+        manage, "_worker_settings", lambda config: manage._ABSENT)
+    monkeypatch.setattr(manage, "_deploy", lambda *args, **kwargs: deployed)
+    monkeypatch.setattr(manage, "_require_owned", lambda config: None)
+    monkeypatch.setattr(manage, "_delete", lambda *args, **kwargs: None)
+    sleeps = []
+    monkeypatch.setattr(manage.time, "sleep", sleeps.append)
+
+    class MintResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"cap":"sync-v1/owner"}'
+
+    attempts = iter((
+        HTTPError(
+            "https://worker.example", status, "not ready", {}, None),
+        MintResponse(),
+    ))
+
+    def activating(*_args, **_kwargs):
+        outcome = next(attempts)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(manage, "urlopen", activating)
+
+    manage.smoke()
+
+    assert sleeps == [manage.SMOKE_ACTIVATION_POLL_SECONDS]
 
 
 def test_smoke_does_not_delete_when_absence_preflight_fails(

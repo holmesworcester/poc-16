@@ -54,6 +54,9 @@ OWNER = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 OWNER_BINDING = "POC16_DEPLOYMENT_OWNER"
 API_RESPONSE_BYTES = 64 * 1024
 CONTROL_TIMEOUT_SECONDS = 120
+SMOKE_ACTIVATION_TIMEOUT_SECONDS = 30
+SMOKE_ACTIVATION_POLL_SECONDS = 0.5
+SMOKE_ACTIVATION_STATUSES = frozenset({404, 500, 502, 503})
 EDGE_SECRET_BYTES = 32
 PERMIT_SECRET_BYTES = 32
 DEFAULT_PACK_TTL_SECONDS = MAX_SCOPED_TTL_MS // 1000
@@ -251,6 +254,11 @@ def generated_config(environment=os.environ, *, smoke=False):
         config["name"] = f"poc16-smoke-{os.urandom(16).hex()}"
         config["workers_dev"] = True
         config["routes"] = []
+        # Cloudflare's Free plan rejects an explicit Worker limits object,
+        # including the production subrequest ceiling, before the smoke
+        # Worker can be uploaded.  The ephemeral smoke exercises only one
+        # mint request, so the plan defaults are sufficient here.
+        config.pop("limits", None)
     else:
         route = environment.get("CF_ROUTE")
         if not route:
@@ -409,6 +417,7 @@ def _deploy(
         pending.flush()
         return _pywrangler(
             "deploy",
+            "--no-experimental-provision",
             "--strict",
             "--config", str(GENERATED),
             "--secrets-file", pending.name,
@@ -512,15 +521,24 @@ def _delete(
         timeout=CONTROL_TIMEOUT_SECONDS):
     _write_config(config)
     arguments = [
-        "delete", config["name"], "--config", str(GENERATED),
+        "delete", "--no-experimental-provision", config["name"],
+        "--config", str(GENERATED),
     ]
     if force:
         arguments.append("--force")
-    _pywrangler(
-        *arguments,
-        env=os.environ,
-        timeout=timeout,
-    )
+    try:
+        _pywrangler(
+            *arguments,
+            env=os.environ,
+            timeout=timeout,
+        )
+    except subprocess.CalledProcessError:
+        # Wrangler can report a failure after Cloudflare has already applied
+        # the delete (for example, while inspecting unrelated provisionable
+        # resources).  Authoritative absence is successful cleanup.
+        if _worker_settings(config) is _ABSENT:
+            return
+        raise
 
 
 def deploy():
@@ -567,13 +585,28 @@ def smoke():
             f"{match.group(0)}/mint?ws={workspace}",
             data=request_body,
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                # Cloudflare's edge rejects urllib's default fingerprint with
+                # error 1010 before the request reaches a workers.dev route.
+                "User-Agent": "poc-16-live-smoke/1",
+            },
         )
-        with urlopen(request, timeout=30) as response:
-            value = json.loads(response.read())
-            if response.status != 200 \
-                    or value.get("cap") != "sync-v1/owner":
-                raise RuntimeError("live mint smoke failed")
+        deadline = time.monotonic() + SMOKE_ACTIVATION_TIMEOUT_SECONDS
+        while True:
+            try:
+                with urlopen(request, timeout=30) as response:
+                    value = json.loads(response.read())
+                    if response.status != 200 \
+                            or value.get("cap") != "sync-v1/owner":
+                        raise RuntimeError("live mint smoke failed")
+                break
+            except HTTPError as error:
+                if error.code not in SMOKE_ACTIVATION_STATUSES \
+                        or time.monotonic() >= deadline:
+                    raise
+                error.close()
+                time.sleep(SMOKE_ACTIVATION_POLL_SECONDS)
     except Exception as error:
         primary = error
     cleanup = None
