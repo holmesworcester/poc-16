@@ -929,6 +929,72 @@ suppression action must match a selector explicitly declared by the target
 family. The rules above are therefore facts-and-offers policy executed by the
 same simple handlers, not a second administrative deletion subsystem.
 
+### 7.7 The lookup gate
+
+Steady-state authorization is one lookup, and the same gate function runs at
+the hosted worker and at every full peer. A request is bound to a device
+signature; the recipient derives the subject id from that signature and reads
+`h(sid)` from its own pinned removal tree. The ACI row answers everything at
+once: UNKNOWN was never admitted and fails closed, CLEAR proceeds, ACTIVE is
+removed and may retrieve exactly its own path. A proof whose basis is older
+than the recipient's pin receives `proof_refresh_required` together with the
+recipient's current tip.
+
+Admission is the one moment the positive chain is presented: mint evaluates
+the carriable invite evidence once, and its judgment mints the subject's
+CLEAR row. After that, no request re-presents or re-verifies the chain to a
+recipient that holds the tree. The governing principle: a recipient's
+persistent judgment state is exactly the non-carriable claims. Positive
+existential claims — admission chains — are self-authenticating and travel
+with their subject, so they are evaluated once to create state. Negative
+universal claims — the absence of a removal — can only be folded from the
+control record, so they are the state.
+
+Carried non-removal credentials (an exclusion proof, or an inclusion proof of
+a CLEAR row, against a known tip) are deliberately not used on the gate path.
+The gate necessarily holds the tree — the permit turn above is where tips
+come from — and for a tree-holder, verifying a carried proof is a lookup plus
+redundant sibling checks. Worse, every control change moves the tip and
+invalidates every outstanding carried proof at once: honoring a tip window
+would delay removal enforcement by exactly that window, while refusing one
+generates a refresh round per subject per change. Tip-anchored inclusion
+proofs remain the recorded option for a future stateless edge verifier, with
+that enforcement-window trade stated. Tips otherwise serve as deterministic
+cache keys: identical control coverage yields identical tips at every holder,
+so equal tips short-circuit whole subjects.
+
+The weak tier is scoped to own path plus tip, permanently. Historical
+membership is an unexpirable credential — old device signatures never stop
+verifying — so whatever this tier serves, it serves every past member
+forever. It therefore returns nothing but the requester's own path (their
+exclusion, or the removal fact that ended their membership) and the current
+tip, both computed by the recipient from its own tree; raw control
+subsequences are never served on this tier. That is sufficient for a subject
+of uncertain standing to learn its status and why, refresh, retry, or seek
+readmission — its own admission chain already lives in its own log — and it
+is the cycle breaker: proving present standing requires reading removal
+state, so removal state must be readable on historical standing alone.
+
+The lookup must stay zero-to-one store reads. The judgment tree is stored
+fetchable-whole and cached against the pin's entity tag, revalidated with one
+conditional read; a per-request walk of sequential node reads is forbidden on
+the request path. Steady state is one signature verification, one memory
+lookup, and a conditional read that usually returns not-modified.
+
+Row sources differ by capability and nothing else. A full peer parses control
+subsequences from the logs it consumes — the head's control root makes those
+slices extractable and verifiable without content — and folds its own rows.
+The hosted store deliberately parses nothing, so its rows arrive as the
+bounded canonical plan inside the permit turn above. Both apply control
+effects before exposing the transition they authorize.
+
+Status: the hosted half of this section — strong and weak requests, the
+private tree, permits, pins — is the running implementation. The peer-side
+gate instance, the derived tip index, and the peer-served weak tier land with
+`poc-16-6j4.37`. Echoing tips relaxes this section's root-withholding to
+pairwise disclosure once that lands; the population-privacy floor becomes
+hashed subject ids plus own-path-only weak reads.
+
 ## 8. Suppression and deterministic union
 
 Facts retain explicit suppression selectors: SELF, one named parent, one named
