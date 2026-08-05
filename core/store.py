@@ -231,8 +231,12 @@ class FsStore:
         self._reconcile_read(key)
         return os.path.exists(self._p(key))
 
-    @staticmethod
-    def _ambiguous_readback(operation, namespace_error, readback_error):
+    def _ambiguous_readback(
+            self, operation, key, namespace_error, readback_error):
+        # The namespace mutation may have applied even though neither its
+        # response nor the immediate readback completed.  Do not let a later
+        # exact read treat the containing directory as already durable.
+        self._uncertain_keys.add(key)
         unknown = OutcomeUnknown(
             f"filesystem {operation} outcome unknown")
         unknown.add_note(
@@ -277,7 +281,7 @@ class FsStore:
                     applied = self._path_value(p, len(b)) == b
                 except OSError as readback_error:
                     self._ambiguous_readback(
-                        "replacement", error, readback_error)
+                        "replacement", key, error, readback_error)
                 if applied:
                     try:
                         self._namespace_barrier(directory, key, "replacement")
@@ -322,7 +326,7 @@ class FsStore:
                     applied = self._path_value(p, len(b)) == b
                 except OSError as readback_error:
                     self._ambiguous_readback(
-                        "create", error, readback_error)
+                        "create", key, error, readback_error)
                 if applied:
                     try:
                         self._namespace_barrier(directory, key, "create")

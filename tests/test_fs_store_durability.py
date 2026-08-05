@@ -384,25 +384,55 @@ def test_failed_namespace_mutation_and_readback_is_typed_unknown(
     if operation == "create":
         value = b"ambiguous create with failed readback"
         key = _immutable(value)
-        monkeypatch.setattr(
-            "core.store.os.link",
-            lambda *_args: (_ for _ in ()).throw(primary))
+        mutate = os.link
+
+        def applied_then_lost(source, target):
+            mutate(source, target)
+            raise primary
+
+        monkeypatch.setattr("core.store.os.link", applied_then_lost)
         invoke = lambda: store.put_if_absent(key, value)
     else:
+        key = "removal"
         value = b"ambiguous replacement with failed readback"
-        monkeypatch.setattr(
-            "core.store.os.replace",
-            lambda *_args: (_ for _ in ()).throw(primary))
-        invoke = lambda: store.cas("removal", ABSENT, value)
-    monkeypatch.setattr(
-        store, "_path_value",
-        lambda *_args: (_ for _ in ()).throw(secondary))
+        mutate = os.replace
+
+        def applied_then_lost(source, target):
+            mutate(source, target)
+            raise primary
+
+        monkeypatch.setattr("core.store.os.replace", applied_then_lost)
+        invoke = lambda: store.cas(key, ABSENT, value)
+    path_value = store._path_value
+    failed = False
+
+    def failed_once(*args):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise secondary
+        return path_value(*args)
+
+    monkeypatch.setattr(store, "_path_value", failed_once)
 
     with pytest.raises(OutcomeUnknown) as raised:
         invoke()
     assert raised.value.__cause__ is primary
     assert any("readback also failed" in note
                for note in raised.value.__notes__)
+    assert key in store._uncertain_keys
+
+    barriers = []
+    fsync = store._fsync_directory
+
+    def observed(directory):
+        barriers.append(directory)
+        fsync(directory)
+
+    monkeypatch.setattr(store, "_fsync_directory", observed)
+    assert store.get_bounded(key, len(value)) == value
+    assert barriers == [os.path.dirname(store._p(key))]
+    assert key not in store._uncertain_keys
 
 
 @pytest.mark.parametrize("phase", ("mkdir", "parent-fsync"))
