@@ -1,6 +1,7 @@
 """Canonical signed-pile, writer-head, and per-device tree contract."""
 import json
-import tracemalloc
+import subprocess
+import sys
 
 import pytest
 
@@ -158,6 +159,11 @@ def test_pile_scanner_enforces_exact_fact_count_under_hostile_json_shapes():
     with pytest.raises(PayloadTooLarge, match="too many facts"):
         check_pile_bounds(escaped_key)
 
+    spaced = b' \n { "facts" : [' \
+        + b'0,' * MAX_PILE_FACTS + b'0 ] } '
+    with pytest.raises(PayloadTooLarge, match="too many facts"):
+        check_pile_bounds(spaced)
+
 
 def test_pile_scanner_bounds_nesting_and_json_values_before_decode(
         monkeypatch):
@@ -177,22 +183,30 @@ def test_pile_scanner_bounds_nesting_and_json_values_before_decode(
     assert not decoded
 
 
-@pytest.mark.parametrize("hostile", (
-    b'{"facts":['
-    + b'[' * (MAX_PILE_JSON_VALUES - 4)
-    + b'0'
-    + b']' * (MAX_PILE_JSON_VALUES - 4)
-    + b']}',
-    b'{"' + b'x' * (3 * 1024 * 1024) + b'":0}',
-))
-def test_pile_scanner_streaming_memory_is_bounded_for_hostile_input(hostile):
-    tracemalloc.start()
-    try:
-        check_pile_bounds(hostile)
-        _current, peak = tracemalloc.get_traced_memory()
-    finally:
-        tracemalloc.stop()
+@pytest.mark.parametrize("shape", ("deep", "long-key"))
+def test_pile_scanner_streaming_memory_is_bounded_for_hostile_input(shape):
+    program = """
+import sys
+import tracemalloc
+from core.close import check_pile_bounds
+from core.limits import MAX_PILE_JSON_VALUES
 
+if sys.argv[1] == "deep":
+    depth = MAX_PILE_JSON_VALUES - 4
+    hostile = b'{"facts":[' + b'[' * depth + b'0' + b']' * depth + b']}'
+else:
+    hostile = b'{"' + b'x' * (3 * 1024 * 1024) + b'":0}'
+tracemalloc.start()
+check_pile_bounds(hostile)
+print(tracemalloc.get_traced_memory()[1])
+"""
+    measured = subprocess.run(
+        [sys.executable, "-c", program, shape],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    peak = int(measured.stdout)
     # The scanner retains only its bounded delimiter stack, never a decoded
     # object graph or an attacker-sized root-key slice. This ceiling is
     # deliberately far above the ~110 KiB observed stack so ordinary
