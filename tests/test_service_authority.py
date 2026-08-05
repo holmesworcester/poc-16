@@ -8,6 +8,7 @@ from core.access import AccessGate, LookupActive
 from core.close import encode_signed_pile, make_signed_pile
 from core.crypto import keypair
 from core.object_store import SyncStoreAdapter
+from core.removal_path import decode as decode_removal_path
 from infrastructure.authority import (
     CapabilityReconciler,
     InstalledCapability,
@@ -376,13 +377,20 @@ def test_target_leave_revokes_and_fresh_binding_rejoins(tmp_path):
         ))
     assert run(target.state.apply_control(
         control, world["service"])).status == "applied"
-    with pytest.raises(LookupActive):
+    with pytest.raises(LookupActive) as denied:
         run(authorize_service(
             target, operations,
             target_proof(world, admission=False),
             operations_proof(world, admission=False),
             100,
         ))
+    disclosed = {
+        sid for sid, _proof in decode_removal_path(
+            denied.value.path).proofs
+    }
+    assert facts.principal_sid(
+        "member", world["binding"].body["administrator"]) not in disclosed
+    assert "fact:" + world["binding"].fid in disclosed
     assert run(reconciler.reconcile(())).revoked == (credential,)
     assert not adapter.accepts(credential.handle)
 
