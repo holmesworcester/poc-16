@@ -57,6 +57,7 @@ class FsStore:
     def __init__(self, root):
         self.root = root
         self._durable_directories = set()
+        self._observed_directories = set()
         self._uncertain_keys = set()
         self._makedirs(root)
         self._cas_lock = os.path.join(root, ".cas.lock")
@@ -115,11 +116,25 @@ class FsStore:
             raise OutcomeUnknown(
                 f"filesystem {operation} outcome unknown") from error
         self._uncertain_keys.discard(key)
+        self._observed_directories.add(os.path.abspath(directory))
 
-    def _reconcile_read(self, key):
-        if key in self._uncertain_keys:
+    def _reconcile_read(self, key, *, force=False):
+        directory = os.path.dirname(self._p(key))
+        if not os.path.isdir(directory):
+            return
+        if force or key in self._uncertain_keys \
+                or os.path.abspath(directory) not in self._observed_directories:
             self._namespace_barrier(
-                os.path.dirname(self._p(key)), key, "read reconciliation")
+                directory, key, "read reconciliation")
+
+    @staticmethod
+    def _discard_temp(path):
+        try:
+            os.remove(path)
+        except OSError:
+            # The final namespace never names this inode. Cleanup failure must
+            # neither mask the typed operation result nor corrupt another key.
+            pass
 
     @staticmethod
     def _path_value(path, maximum):
@@ -191,6 +206,7 @@ class FsStore:
         because replacement is serialized by ``_cas_lock``. Provider
         implementations return their own conditional-write token instead.
         """
+        self._reconcile_read(key, force=True)
         limit = MAX_ROOT_BYTES \
             if key in SINGLETON_CAS_KEYS else MAX_OBJECT_BYTES
         value = self.get_bounded(key, limit)
@@ -225,17 +241,11 @@ class FsStore:
                 self._fsync_file(f.fileno())
             return tmp
         except OSError as error:
-            try:
-                os.remove(tmp)
-            except FileNotFoundError:
-                pass
+            self._discard_temp(tmp)
             raise RetryableStoreError(
                 "filesystem temporary write did not commit") from error
         except BaseException:
-            try:
-                os.remove(tmp)
-            except FileNotFoundError:
-                pass
+            self._discard_temp(tmp)
             raise
 
     def _replace(self, key, b):
@@ -266,10 +276,7 @@ class FsStore:
                 raise OutcomeUnknown(
                     "filesystem replacement outcome unknown") from error
         except BaseException:
-            try:
-                os.remove(tmp)
-            except FileNotFoundError:
-                pass
+            self._discard_temp(tmp)
             raise
 
     def put(self, key, b):
@@ -310,10 +317,7 @@ class FsStore:
                     "filesystem create outcome unknown") from error
             return CREATED
         finally:
-            try:
-                os.remove(tmp)
-            except FileNotFoundError:
-                pass
+            self._discard_temp(tmp)
 
     def cas(self, key, token, b):
         if not mutable_key(key):

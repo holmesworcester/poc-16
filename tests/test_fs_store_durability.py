@@ -199,10 +199,18 @@ def test_cas_failure_after_linearization_is_unknown_and_reconciles_new(
 
         monkeypatch.setattr("core.store.os.replace", applied_then_lost)
     elif phase == "directory-fsync":
+        fsync = store._fsync_directory
+        calls = 0
+
+        def fail_replacement_barrier(directory):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise InjectedCrash("directory fsync")
+            fsync(directory)
+
         monkeypatch.setattr(
-            store, "_fsync_directory",
-            lambda _directory: (_ for _ in ()).throw(
-                InjectedCrash("directory fsync")))
+            store, "_fsync_directory", fail_replacement_barrier)
     else:
         monkeypatch.setattr(
             store, "_after_durable_write",
@@ -270,11 +278,12 @@ def test_same_store_reread_completes_failed_directory_barrier(
         invoke = lambda: store.cas(key, ABSENT, value)
     fsync = store._fsync_directory
     calls = 0
+    failure_call = 1 if operation == "create" else 2
 
     def fail_once(directory):
         nonlocal calls
         calls += 1
-        if calls == 1:
+        if calls == failure_call:
             raise InjectedCrash("first directory barrier")
         fsync(directory)
 
@@ -285,5 +294,40 @@ def test_same_store_reread_completes_failed_directory_barrier(
     # A caller may reconcile an unknown result only after this read has
     # successfully retried the containing-directory durability barrier.
     assert store.get_bounded(key, len(value)) == value
-    assert calls == 2
+    assert calls == failure_call + 1
     assert key not in store._uncertain_keys
+
+
+def test_fresh_store_first_read_persists_the_containing_directory(
+        tmp_path, monkeypatch):
+    store = FsStore(str(tmp_path))
+    assert isinstance(store.cas("removal", ABSENT, b"visible"), Applied)
+    reopened = FsStore(str(tmp_path))
+    barriers = []
+    fsync = reopened._fsync_directory
+
+    def observed(directory):
+        barriers.append(directory)
+        fsync(directory)
+
+    monkeypatch.setattr(reopened, "_fsync_directory", observed)
+    assert reopened.get_bounded("removal", 7) == b"visible"
+    assert barriers == [str(tmp_path)]
+
+
+def test_temp_cleanup_failure_never_masks_typed_precommit_failure(
+        tmp_path, monkeypatch):
+    store = FsStore(str(tmp_path))
+    value = b"cleanup preserves primary error"
+    key = _immutable(value)
+    monkeypatch.setattr(
+        "core.store.os.link",
+        lambda *_args: (_ for _ in ()).throw(
+            InjectedCrash("link did not apply")))
+    monkeypatch.setattr(
+        "core.store.os.remove",
+        lambda *_args: (_ for _ in ()).throw(
+            InjectedCrash("temp cleanup")))
+
+    with pytest.raises(RetryableStoreError, match="create did not commit"):
+        store.put_if_absent(key, value)
