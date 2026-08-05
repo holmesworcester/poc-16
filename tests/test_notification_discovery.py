@@ -8,7 +8,7 @@ import facts
 from adapters.s3 import S3Config, S3Store
 from core.crypto import h, keypair
 from core.fact import canon, encode
-from core.limits import MAX_FACT_BYTES, PAGE_BATCH
+from core.limits import PAGE_BATCH
 from core.object_store import OutcomeUnknown
 from core.store import FsStore
 from core.writer_head import (
@@ -33,11 +33,13 @@ from notifications.discovery import (
     BOOTSTRAP_CURRENT,
     Cursor,
     CursorNotInitialized,
+    CursorRebootstrapRequired,
     MAX_SCAN_PILES_PER_TURN,
     NotificationDiscovery,
     NotificationState,
     PENDING_CURRENT,
     PENDING_NONCURRENT,
+    REBOOTSTRAP_CURRENT,
     Pending,
     Scan,
     decode_cursor,
@@ -802,7 +804,8 @@ def test_rebootstrap_generation_makes_old_delivery_noncurrent(tmp_path):
     assert asyncio.run(old.state.complete(h(old_raw))) == PENDING_NONCURRENT
 
 
-def test_decode_only_multi_event_pending_finishes_during_cutover(tmp_path):
+def test_pre_cut_multi_event_pending_requires_explicit_current_rebootstrap(
+        tmp_path):
     node, workspace = _world(tmp_path)
     store = FsStore(str(tmp_path / "cursor"))
     carrier = MemoryCarrier([])
@@ -830,10 +833,8 @@ def test_decode_only_multi_event_pending_finishes_during_cutover(tmp_path):
             "owner": current.owner,
             "workspace": current.workspace,
         })
-        reference = decode_hint(raw)
-        assert reference.legacy is True
-        with pytest.raises(ValueError, match="decode-only"):
-            encode_hint(reference)
+        with pytest.raises(ValueError, match="notification hint"):
+            decode_hint(raw)
         oid = await discovery._ensure_object(raw, MAX_HINT_BYTES)
         seen = await discovery._map_update("seen", cursor.seen, rows)
         desired = replace(
@@ -847,18 +848,27 @@ def test_decode_only_multi_event_pending_finishes_during_cutover(tmp_path):
     legacy_raw = asyncio.run(install_legacy_pending())
     carrier.payloads.clear()
 
-    assert asyncio.run(discovery.run_once()).status == "republished"
-    assert carrier.payloads == [legacy_raw]
-    reference = decode_hint(legacy_raw)
-    raws = tuple(
-        asyncio.run(discovery.state.get_bounded(
-            "obj/" + event.oid, MAX_FACT_BYTES))
-        for event in reference.events
-    )
-    assert set(materialize_hint(reference, raws).facts) == expected
-    assert asyncio.run(_complete(discovery, legacy_raw)) == PENDING_NONCURRENT
-    assert asyncio.run(discovery.run_once()).status == "advanced"
-    assert asyncio.run(discovery.run_once()).status == "idle"
+    with pytest.raises(
+            CursorRebootstrapRequired, match="rebootstrap current"):
+        asyncio.run(discovery.run_once())
+    assert carrier.payloads == []
+
+    recovery = NotificationDiscovery(
+        node.store(workspace), store, workspace, carrier,
+        owner=OWNER, generation_factory=lambda: "f" * 64)
+    cursor = asyncio.run(recovery.rebootstrap_current())
+
+    assert cursor.bootstrap == REBOOTSTRAP_CURRENT
+    assert cursor.generation == "f" * 64
+    assert cursor.pending is None
+    assert cursor.scan is None
+    assert cursor.seen["count"] == len(expected)
+    assert asyncio.run(recovery.state.pending(h(legacy_raw))) \
+        == PENDING_NONCURRENT
+    assert asyncio.run(recovery.run_once()).status == "idle"
+    # A scheduled rebootstrap mode remains idempotent until the operator seals
+    # it, so a second schedule cannot repeatedly discard newly arriving work.
+    assert asyncio.run(recovery.rebootstrap_current()) == cursor
 
 
 def test_hint_and_cursor_codecs_are_canonical_and_reject_old_shape():

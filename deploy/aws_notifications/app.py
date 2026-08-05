@@ -23,6 +23,7 @@ from notifications.forest import current_repository
 from notifications.discovery import (
     BOOTSTRAP_BACKFILL,
     BOOTSTRAP_CURRENT,
+    REBOOTSTRAP_CURRENT,
     NotificationDiscovery,
     NotificationState,
 )
@@ -177,12 +178,14 @@ async def scan_once(**dependencies):
 
 
 async def bootstrap_once(mode, **dependencies):
-    """Explicitly initialize absent discovery state in one selected mode."""
+    """Initialize or explicitly replace discovery state in one selected mode."""
     discovery = _discovery(**dependencies)
     if mode == BOOTSTRAP_CURRENT:
         return await discovery.bootstrap_current()
     if mode == BOOTSTRAP_BACKFILL:
         return await discovery.bootstrap_backfill()
+    if mode == REBOOTSTRAP_CURRENT:
+        return await discovery.rebootstrap_current()
     raise ValueError("notification bootstrap mode")
 
 
@@ -201,7 +204,8 @@ def _scan_event(event, workspace):
             and event.get("schema") == BOOTSTRAP_SCHEMA \
             and event.get("workspace") == workspace \
             and event.get("mode") in {
-                BOOTSTRAP_CURRENT, BOOTSTRAP_BACKFILL}:
+                BOOTSTRAP_CURRENT, BOOTSTRAP_BACKFILL,
+                REBOOTSTRAP_CURRENT}:
         return event["mode"]
     raise ValueError("notification scanner invocation")
 

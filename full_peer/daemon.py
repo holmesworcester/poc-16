@@ -208,7 +208,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         if len(argv) != 2:
             raise ValueError(
                 "usage: peer.notifications.bootstrap "
-                "<workspace> <current|backfill>")
+                "<workspace> <current|backfill|rebootstrap-current>")
         if self.notifications is None:
             raise ValueError("notifications are disabled")
         workspace = facts.workspace_for(self.node, argv[0])

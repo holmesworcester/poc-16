@@ -302,8 +302,10 @@ event per durable pending body. This keeps current-authority matching and
 delivery budgets independent for each event even when one head spans many
 piles. A successful completion sends a best-effort private scanner wake so the
 next staged event can become pending immediately; the ordinary cadence repairs
-a lost wake. Decode-only support lets a pending multi-event v1 body finish
-during this hard cut, but scanners never create another one.
+a lost wake. There is no reader for pre-cut multi-event hint bytes. A retained
+pending body in that shape raises `CursorRebootstrapRequired` before provider
+work. With delivery disabled, explicit `rebootstrap-current` recovery CASes a
+fresh generation and acknowledges all currently valid triggers.
 
 Bootstrap is explicit: normal launch validates all current writer heads and
 marks their existing triggers seen, while a deliberate backfill starts with
@@ -473,6 +475,9 @@ python3 -m full_peer --node http://127.0.0.1:7101 \
 Repeating the same mode is harmless. A conflicting mode, absent state during
 scanning, or a cursor owned by another deployment fails closed. The periodic
 scanner runs after bootstrap; `peer.notifications.wake` is only a latency hint.
+Use `peer.notifications.bootstrap WORKSPACE rebootstrap-current` only to
+replace fail-closed pre-cut progress while delivery is disabled. It skips all
+triggers visible at the replacement root and remains idempotent on retries.
 
 Endpoint registration still needs the mobile integration to obtain permission
 and a current Firebase Installation ID, seal that FID with
@@ -523,6 +528,8 @@ python3 -m deploy.cloudflare_notifications.manage provision
 python3 -m deploy.cloudflare_notifications.manage build
 python3 -m deploy.cloudflare_notifications.manage deploy
 python3 -m deploy.cloudflare_notifications.manage bootstrap-current
+# For explicit hard-cut recovery instead of first initialization:
+python3 -m deploy.cloudflare_notifications.manage rebootstrap-current
 # Wait for one successful scheduled scanner invocation, then seal the mode.
 python3 -m deploy.cloudflare_notifications.manage seal-bootstrap
 python3 -m deploy.cloudflare_notifications.manage verify
@@ -539,7 +546,10 @@ then fails instead of guessing whether to skip or replay history.
 `bootstrap-current` temporarily schedules initialization even while delivery
 is disabled and skips existing triggers. Use `bootstrap-backfill` instead only
 when replaying existing triggers is deliberate. Both operations are idempotent
-for the chosen mode. After the Cloudflare scheduled invocation succeeds,
+for the chosen mode. `rebootstrap-current` replaces retained progress with a
+fresh generation and skips the current trigger set; it is the only recovery
+for a cursor whose pending hint bytes the hard-cut codec rejects. After the
+Cloudflare scheduled invocation succeeds,
 `seal-bootstrap` restores `none`; `verify` rejects a Worker still carrying a
 bootstrap mode. The control tool cannot read the private R2 binding, so the
 successful scheduled invocation—not merely local config generation—is the
@@ -1014,6 +1024,11 @@ python3 -m deploy.aws_notifications.manage bootstrap --current \
   --stack-name poc16-notifications \
   --deployment-id DEPLOYMENT --region REGION
 ```
+
+For fail-closed pre-cut pending bytes, keep production disabled and substitute
+`--rebootstrap-current`. The operation replaces progress with a fresh
+generation and acknowledges the current trigger set; it does not decode or
+deliver the retired body.
 
 Direct smoke is an explicit operator path and is permitted only while
 production is disabled. The Lambda has no public route; AWS IAM is invocation

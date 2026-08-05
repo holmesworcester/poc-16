@@ -8,6 +8,7 @@ from core.shape import valid_fid
 from notifications.discovery import (
     BOOTSTRAP_BACKFILL,
     BOOTSTRAP_CURRENT,
+    REBOOTSTRAP_CURRENT,
     NotificationDiscovery,
     NotificationState,
 )
@@ -38,7 +39,9 @@ class Settings:
         bootstrap = text(env, "NOTIFICATION_BOOTSTRAP_MODE")
         if not valid_fid(workspace) or not valid_fid(identity):
             raise ValueError("notification scanner identity bindings")
-        if bootstrap not in {"none", BOOTSTRAP_CURRENT, BOOTSTRAP_BACKFILL}:
+        if bootstrap not in {
+                "none", BOOTSTRAP_CURRENT, BOOTSTRAP_BACKFILL,
+                REBOOTSTRAP_CURRENT}:
             raise ValueError("NOTIFICATION_BOOTSTRAP_MODE binding")
         canonical = getattr(env, "CANONICAL_READER")
         state = getattr(env, "NOTIFICATION_STATE")
@@ -87,6 +90,9 @@ async def scan(env):
     if settings.bootstrap == BOOTSTRAP_BACKFILL:
         await discovery.bootstrap_backfill()
         return "bootstrapped-backfill"
+    if settings.bootstrap == REBOOTSTRAP_CURRENT:
+        await discovery.rebootstrap_current()
+        return "rebootstrapped-current"
     if not settings.enabled:
         return "disabled"
     return (await discovery.run_once()).status

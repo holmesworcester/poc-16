@@ -1775,6 +1775,9 @@ def parser():
     bootstrap_mode.add_argument(
         "--backfill", dest="bootstrap_mode", action="store_const",
         const="backfill")
+    bootstrap_mode.add_argument(
+        "--rebootstrap-current", dest="bootstrap_mode",
+        action="store_const", const="rebootstrap-current")
     launch_command = commands.add_parser("launch-binding")
     _identity_arguments(launch_command)
     smoke_command = commands.add_parser("direct-smoke")

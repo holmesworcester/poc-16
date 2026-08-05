@@ -219,6 +219,14 @@ def test_notification_bootstrap_control_is_explicit_and_wakes(tmp_path):
     assert handler.notifications.calls == [(workspace, "current")]
     assert handler.notifications.kicks == 1
 
+    assert _request(handler, "peer.notifications.bootstrap", [
+        workspace[:8], "rebootstrap-current",
+    ]) == (200, {
+        "workspace": workspace, "mode": "rebootstrap-current"})
+    assert handler.notifications.calls[-1] \
+        == (workspace, "rebootstrap-current")
+    assert handler.notifications.kicks == 2
+
     disabled = _handler(node)
     assert _request(disabled, "peer.notifications.bootstrap", [
         workspace, "backfill",

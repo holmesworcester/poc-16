@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 from core.crypto import h
 from core.fact import canon
-from core.limits import MAX_PILE_FACTS, decode_json
+from core.limits import decode_json
 from core.shape import valid_fid
 
 from .carrier import MAX_CARRIER_BYTES
@@ -19,7 +19,6 @@ MAX_HINT_BYTES = MAX_CARRIER_BYTES
 # event and prevents a large multi-pile writer suffix from creating a pending
 # item that can never complete.
 MAX_HINT_EVENTS = 1
-LEGACY_MAX_HINT_EVENTS = MAX_PILE_FACTS
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -41,7 +40,6 @@ class NotificationHint:
     base_head: str | None
     head: str
     events: tuple[EventRef, ...]
-    legacy: bool = False
 
     def __post_init__(self):
         if not all(valid_fid(value) for value in (
@@ -50,11 +48,7 @@ class NotificationHint:
                 or self.base_head is not None \
                 and not valid_fid(self.base_head) \
                 or not isinstance(self.events, tuple) \
-                or not isinstance(self.legacy, bool) \
-                or not 1 <= len(self.events) <= (
-                    LEGACY_MAX_HINT_EVENTS if self.legacy
-                    else MAX_HINT_EVENTS) \
-                or self.legacy and len(self.events) <= MAX_HINT_EVENTS \
+                or not 1 <= len(self.events) <= MAX_HINT_EVENTS \
                 or tuple(sorted(set(self.events))) != self.events:
             raise ValueError("notification hint")
 
@@ -79,8 +73,8 @@ def _body(hint):
 
 
 def encode_hint(hint):
-    if not isinstance(hint, NotificationHint) or hint.legacy:
-        raise ValueError("notification hint is decode-only")
+    if not isinstance(hint, NotificationHint):
+        raise TypeError("notification hint")
     raw = canon(_body(hint))
     if len(raw) > MAX_HINT_BYTES:
         raise ValueError("notification hint too large")
@@ -100,11 +94,10 @@ def decode_hint(raw):
         hint = NotificationHint(
             value.get("workspace"), value.get("owner"),
             value.get("generation"), value.get("device"),
-            value.get("base_head"), value.get("head"), events,
-            len(events) > MAX_HINT_EVENTS)
+            value.get("base_head"), value.get("head"), events)
     except (TypeError, ValueError) as error:
         raise ValueError("notification hint shape") from error
-    if canon(_body(hint)) != raw:
+    if encode_hint(hint) != raw:
         raise ValueError("notification hint identity")
     return hint
 
@@ -123,7 +116,6 @@ def materialize_hint(hint, raw_events):
 
 __all__ = (
     "EventRef",
-    "LEGACY_MAX_HINT_EVENTS",
     "MAX_HINT_BYTES",
     "MAX_HINT_EVENTS",
     "NotificationHint",

@@ -22,7 +22,7 @@ from full_peer.node import FullPeer
 from full_peer.notifications import FullPeerNotifications
 from full_peer.sync import sync
 from notifications.delivery import PushAccepted, PushRetryable, seal_target
-from notifications.discovery import decode_cursor
+from notifications.discovery import REBOOTSTRAP_CURRENT, decode_cursor
 from tests.util import all_fids, closed_subset, deliver
 
 
@@ -128,6 +128,26 @@ def test_cursor_owner_binds_firebase_project_not_provider_instance(tmp_path):
     assert changed.owner != service.owner
     with pytest.raises(ValueError, match="bootstrap conflict"):
         changed.bootstrap(workspace, "current")
+
+
+def test_explicit_current_rebootstrap_is_idempotent_and_fences_old_work(
+        tmp_path):
+    node, workspace, provider, service = _world(tmp_path)
+    skipped = message.post(
+        node, workspace, "general", "pre-cut pending", ts=4)
+
+    first = service.bootstrap(workspace, REBOOTSTRAP_CURRENT)
+    second = service.bootstrap(workspace, REBOOTSTRAP_CURRENT)
+
+    assert first == second
+    assert first["mode"] == REBOOTSTRAP_CURRENT
+    assert service.run_once()[0].status == "idle"
+    assert provider.requests == []
+    delivered = message.post(node, workspace, "general", "after reset", ts=5)
+    assert service.run_once()[0].status == "published"
+    payload = provider.requests[0].payload.decode()
+    assert skipped not in payload
+    assert delivered in payload
 
 
 def test_completion_kicks_drain_staged_events_without_cadence(tmp_path):

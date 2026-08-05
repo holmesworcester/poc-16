@@ -80,8 +80,10 @@ CONTROL_TIMEOUT_SECONDS = 120
 BOOTSTRAP_NONE = "none"
 BOOTSTRAP_CURRENT = "current"
 BOOTSTRAP_BACKFILL = "backfill"
+REBOOTSTRAP_CURRENT = "rebootstrap-current"
 BOOTSTRAP_MODES = {
     BOOTSTRAP_NONE, BOOTSTRAP_CURRENT, BOOTSTRAP_BACKFILL,
+    REBOOTSTRAP_CURRENT,
 }
 
 FID = re.compile(r"^[0-9a-f]{64}$")
@@ -2058,6 +2060,11 @@ def bootstrap_backfill():
     _deploy_scanner_mode(BOOTSTRAP_BACKFILL)
 
 
+def rebootstrap_current():
+    """Replace retained pre-cut progress and acknowledge current heads."""
+    _deploy_scanner_mode(REBOOTSTRAP_CURRENT)
+
+
 def seal_bootstrap():
     """Return an initialized scanner to its ordinary fail-closed mode."""
     _deploy_scanner_mode(BOOTSTRAP_NONE)
@@ -2208,6 +2215,7 @@ Commands:
   disable    stop Queue/Cron traffic without uploading another version
   bootstrap-current   acknowledge current writer heads on the next schedule
   bootstrap-backfill  start from empty writer checkpoints on the next schedule
+  rebootstrap-current replace pre-cut progress and acknowledge current heads
   seal-bootstrap      disable initialization after observing its completion
   verify     verify ownership and print queue status/required alarms
   redrive    safely move one bounded DLQ batch to the primary queue
@@ -2235,6 +2243,7 @@ def main(argv):
         "disable": disable,
         "bootstrap-current": bootstrap_current,
         "bootstrap-backfill": bootstrap_backfill,
+        "rebootstrap-current": rebootstrap_current,
         "seal-bootstrap": seal_bootstrap,
         "verify": verify,
         "redrive": redrive,

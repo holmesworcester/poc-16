@@ -648,8 +648,9 @@ def test_scanner_requires_explicit_bootstrap_before_first_fair_run(tmp_path):
     assert asyncio.run(app.scan_once(**dependencies)).status == "idle"
 
 
+@pytest.mark.parametrize("mode", ("backfill", "rebootstrap-current"))
 def test_scanner_handler_accepts_only_explicit_bootstrap_event(
-        monkeypatch):
+        monkeypatch, mode):
     workspace = "a" * 64
     calls = []
 
@@ -661,17 +662,17 @@ def test_scanner_handler_accepts_only_explicit_bootstrap_event(
     monkeypatch.setattr(app, "bootstrap_once", initialize)
 
     response = app.scanner_handler({
-        "mode": "backfill",
+        "mode": mode,
         "schema": "poc16-notification-bootstrap-v1",
         "workspace": workspace,
     }, None)
 
     assert response == {
-        "mode": "backfill",
+        "mode": mode,
         "schema": "poc16-notification-bootstrap-result-v1",
         "status": "initialized",
     }
-    assert calls == [("backfill", {"workspace": workspace})]
+    assert calls == [(mode, {"workspace": workspace})]
 
 
 def test_delivery_wake_invokes_exact_scanner_version_asynchronously(

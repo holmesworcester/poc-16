@@ -829,6 +829,31 @@ def test_disabled_scanner_runs_only_explicit_bootstrap(tmp_path):
     assert queue.bodies == []
 
 
+def test_explicit_rebootstrap_current_is_idempotent_and_skips_retained_work(
+        tmp_path):
+    node, workspace, _secret = _world(tmp_path)
+    canonical, state, queue = R2Bucket(), R2Bucket(), Queue()
+    _copy_repository(
+        node, workspace, canonical, f"workspaces/{workspace}")
+    env = _scanner_env(
+        workspace, CanonicalReadService(
+            workspace, canonical, enabled="0"), state, queue, enabled="0")
+    assert run(_bootstrap(env, "current")) == "bootstrapped-current"
+
+    message.post(node, workspace, "general", "pre-cut pending", ts=4)
+    _copy_repository(
+        node, workspace, canonical, f"workspaces/{workspace}")
+    env.NOTIFICATION_BOOTSTRAP_MODE = "rebootstrap-current"
+    try:
+        assert run(scanner.scan(env)) == "rebootstrapped-current"
+        assert run(scanner.scan(env)) == "rebootstrapped-current"
+    finally:
+        env.NOTIFICATION_BOOTSTRAP_MODE = "none"
+
+    assert run(scanner.scan(env)) == "disabled"
+    assert queue.bodies == []
+
+
 def test_bootstrap_generation_blocks_paused_muted_worker_aba(tmp_path):
     (node, workspace, secret, _event, canonical, state, queue,
      canonical_reader, state_service) = _published_world(tmp_path)
@@ -1625,6 +1650,7 @@ def test_main_fences_every_staging_command_before_its_function(tmp_path,
         "disable": "disable",
         "bootstrap-current": "bootstrap_current",
         "bootstrap-backfill": "bootstrap_backfill",
+        "rebootstrap-current": "rebootstrap_current",
         "seal-bootstrap": "seal_bootstrap",
         "verify": "verify",
         "remove": "remove",

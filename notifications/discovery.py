@@ -79,6 +79,7 @@ MAX_SCAN_PILES_PER_TURN = 1
 SCAN_PHASES = frozenset(("base", "suffix", "emit", "complete"))
 BOOTSTRAP_CURRENT = "current"
 BOOTSTRAP_BACKFILL = "backfill"
+REBOOTSTRAP_CURRENT = "rebootstrap-current"
 PENDING_CURRENT = "current"
 PENDING_NONCURRENT = "noncurrent"
 PENDING_RETRY = "retry"
@@ -100,6 +101,10 @@ def built_descriptor(value):
 
 class CursorNotInitialized(RuntimeError):
     """Discovery requires a completed explicit current/backfill bootstrap."""
+
+
+class CursorRebootstrapRequired(RuntimeError):
+    """Retained pending bytes have no reader in the current hard-cut build."""
 
 
 def _descriptor(value):
@@ -182,7 +187,8 @@ class Cursor:
         if not valid_fid(self.workspace) or not valid_fid(self.owner) \
                 or not valid_fid(self.generation) \
                 or self.bootstrap not in {
-                    BOOTSTRAP_CURRENT, BOOTSTRAP_BACKFILL} \
+                    BOOTSTRAP_CURRENT, BOOTSTRAP_BACKFILL,
+                    REBOOTSTRAP_CURRENT} \
                 or not isinstance(self.initialized, bool) \
                 or self.scan is not None and not isinstance(self.scan, Scan) \
                 or self.pending is not None and (
@@ -589,7 +595,7 @@ class NotificationDiscovery:
 
         heads = cursor.heads
         seen = cursor.seen
-        if mode == BOOTSTRAP_CURRENT:
+        if mode in {BOOTSTRAP_CURRENT, REBOOTSTRAP_CURRENT}:
             state = _CollectState()
             result = await RepositoryMirror(
                 self.workspace, MemoryStore(),
@@ -620,6 +626,32 @@ class NotificationDiscovery:
 
     async def bootstrap_backfill(self):
         return await self._bootstrap(BOOTSTRAP_BACKFILL)
+
+    async def rebootstrap_current(self):
+        """Explicitly replace retained progress, then acknowledge current state.
+
+        Operators invoke this only with delivery disabled.  The fresh random
+        generation fences every old carrier body, and current bootstrap marks
+        all presently valid triggers seen instead of replaying pre-cut work.
+        A crash after the reset CAS leaves an ordinary resumable, uninitialized
+        current bootstrap.
+        """
+        cursor, token = await self._read_cursor(initialized=False)
+        if cursor.bootstrap == REBOOTSTRAP_CURRENT:
+            return await self._bootstrap(REBOOTSTRAP_CURRENT)
+        if not cursor.initialized:
+            raise CursorNotInitialized(
+                "notification rebootstrap source is not initialized")
+        generation = self.generation_factory()
+        if not valid_fid(generation) or generation == cursor.generation:
+            raise ValueError("notification rebootstrap generation")
+        reset = Cursor(
+            self.workspace, self.owner, generation,
+            REBOOTSTRAP_CURRENT, False,
+            empty_descriptor(), empty_descriptor(), empty_descriptor())
+        if await self._cas_exact(token, reset) is None:
+            raise OSError("notification rebootstrap raced")
+        return await self._bootstrap(REBOOTSTRAP_CURRENT)
 
     async def _candidate(self, cursor):
         """Inspect at most one directory page and return durable progress."""
@@ -802,7 +834,12 @@ class NotificationDiscovery:
             MAX_HINT_BYTES)
         if not isinstance(raw, bytes) or h(raw) != cursor.pending.oid:
             raise ValueError("notification pending body")
-        reference = decode_hint(raw)
+        try:
+            reference = decode_hint(raw)
+        except ValueError as error:
+            raise CursorRebootstrapRequired(
+                "disable delivery and rebootstrap current notification state"
+            ) from error
         base = (await self._map_points(
             "heads", cursor.heads, (cursor.scan.device,))
         )[cursor.scan.device]
@@ -963,12 +1000,14 @@ __all__ = (
     "BOOTSTRAP_CURRENT",
     "Cursor",
     "CursorNotInitialized",
+    "CursorRebootstrapRequired",
     "DiscoveryResult",
     "NotificationDiscovery",
     "NotificationState",
     "PENDING_CURRENT",
     "PENDING_NONCURRENT",
     "PENDING_RETRY",
+    "REBOOTSTRAP_CURRENT",
     "Pending",
     "Scan",
     "decode_cursor",

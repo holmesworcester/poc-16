@@ -23,7 +23,11 @@ from notifications.carrier import (
     CarrierError,
     delivery_disposition,
 )
-from notifications.discovery import NotificationDiscovery, NotificationState
+from notifications.discovery import (
+    REBOOTSTRAP_CURRENT,
+    NotificationDiscovery,
+    NotificationState,
+)
 from notifications.delivery import delivery_domain_id
 from notifications.forest import current_repository
 from notifications.worker import NotificationWorker, handle_carrier_delivery
@@ -186,6 +190,8 @@ class FullPeerNotifications:
             cursor = await discovery.bootstrap_current()
         elif mode == "backfill":
             cursor = await discovery.bootstrap_backfill()
+        elif mode == REBOOTSTRAP_CURRENT:
+            cursor = await discovery.rebootstrap_current()
         else:
             raise ValueError("notification bootstrap mode")
         return {
