@@ -436,7 +436,7 @@ def measure_annex(*, facts, ref_stride=8, body_bytes=160):
     segment = slot.segments[0]
     publications = queue._read_segment(segment)
     baseline = _encode_segment(tuple(
-        Publication(publication.main, (), publication.handoff_targets)
+        Publication(publication.main, ())
         for publication in publications), segment.kind)
     annex_bytes = segment.size - len(baseline)
     return AnnexScale(

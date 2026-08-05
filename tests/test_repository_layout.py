@@ -257,13 +257,13 @@ def test_http_has_one_route_table_and_only_private_removal_control():
         and item.value.startswith("/")
     }
     assert {
-        "/ctl", "/head/", "/heads", "/invite/", "/layout/", "/mint",
+        "/ctl", "/head/", "/heads", "/layout/", "/mint",
         "/mirror/", "/obj", "/obj/", "/obj/open", "/pack/open",
         "/readyz", "/removal/bootstrap",
     } <= routes
     assert {
-        "/authority", "/page", "/page/", "/pile/", "/removal/advance",
-        "/removal/apply", "/root",
+        "/authority", "/invite/", "/page", "/page/", "/pile/",
+        "/removal/advance", "/removal/apply", "/root",
     }.isdisjoint(routes)
 
     # Adapters compose HttpGate; they do not grow a second peer route table.

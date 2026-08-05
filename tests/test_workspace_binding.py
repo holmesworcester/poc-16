@@ -25,6 +25,15 @@ from facts.auth.user_invite import user_invite
 from facts.content.message import message
 
 
+def inline_invite_link(workspace, encrypted=b"encrypted", peer="offline"):
+    return base64.urlsafe_b64encode(canon({
+        "b": base64.b64encode(encrypted).decode(),
+        "p": peer,
+        "s": "01" * 32,
+        "ws": workspace,
+    })).decode()
+
+
 def two_workspaces(tmp_path):
     node = FullPeer(str(tmp_path / "node"))
     first = facts.auth.workspace.create(node, "first", ts=1)
@@ -161,23 +170,7 @@ def test_invite_bootstrap_is_workspace_complete_before_keyring_mutation(
         "isk": invite_secret.encode().hex(),
         "ws": expected,
     })
-    link = base64.urlsafe_b64encode(canon({
-        "p": "https://invite.invalid",
-        "ws": expected,
-        "s": "01" * 32,
-    })).decode()
-
-    class Response:
-        headers = {}
-
-        def read(self, maximum):
-            assert maximum == MAX_INVITE_BYTES + 1
-            return b"encrypted"
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(user_family, "_open_invite", lambda _url: Response())
+    link = inline_invite_link(expected)
     monkeypatch.setattr(
         user_family, "box_decrypt",
         lambda *_args, **_kwargs: blob)
@@ -233,23 +226,7 @@ def test_invite_redemption_selects_current_form_but_retains_source_fid(
         "isk": invite_secret.encode().hex(),
         "ws": workspace,
     })
-    link = base64.urlsafe_b64encode(canon({
-        "p": "https://invite.invalid",
-        "ws": workspace,
-        "s": "01" * 32,
-    })).decode()
-
-    class Response:
-        headers = {}
-
-        @staticmethod
-        def read(maximum):
-            assert maximum == MAX_INVITE_BYTES + 1
-            return b"encrypted"
-
-        @staticmethod
-        def close():
-            pass
+    link = inline_invite_link(workspace)
 
     class SelectedInvite(RuntimeError):
         pass
@@ -260,7 +237,6 @@ def test_invite_redemption_selects_current_form_but_retains_source_fid(
         observed.append(invitation)
         raise SelectedInvite
 
-    monkeypatch.setattr(user_family, "_open_invite", lambda _url: Response())
     monkeypatch.setattr(
         user_family, "box_decrypt", lambda *_args, **_kwargs: blob)
     monkeypatch.setattr(user_family, "user", select)
@@ -276,71 +252,34 @@ def test_invite_redemption_selects_current_form_but_retains_source_fid(
     assert node.workspaces() == []
 
 
-@pytest.mark.parametrize("declared", [True, False])
-def test_invite_redemption_bounds_and_closes_untrusted_http_body(
-        tmp_path, monkeypatch, declared):
-    node = FullPeer(str(tmp_path / "joiner"))
-    workspace = "0" * 64
-    link = base64.urlsafe_b64encode(canon({
-        "p": "https://invite.invalid",
-        "ws": workspace,
-        "s": "01" * 32,
-    })).decode()
-
-    class Response:
-        headers = {
-            "Content-Length": "9",
-        } if declared else {}
-
-        def __init__(self):
-            self.reads = []
-            self.closed = False
-
-        def read(self, maximum):
-            self.reads.append(maximum)
-            return b"x" * maximum
-
-        def close(self):
-            self.closed = True
-
-    response = Response()
-    monkeypatch.setattr(user_family, "MAX_INVITE_BYTES", 8)
-    monkeypatch.setattr(user_family, "_open_invite", lambda _url: response)
-
-    with pytest.raises(PayloadTooLarge, match="invite response"):
-        user_family.accept(node, link, "new member")
-
-    assert response.reads == ([] if declared else [9])
-    assert response.closed is True
-
-
-def test_exact_bound_invite_response_reaches_crypto_and_still_closes(
+def test_invite_redemption_bounds_inline_ciphertext_before_crypto(
         tmp_path, monkeypatch):
     node = FullPeer(str(tmp_path / "joiner"))
     workspace = "0" * 64
-    link = base64.urlsafe_b64encode(canon({
-        "p": "https://invite.invalid",
-        "ws": workspace,
-        "s": "01" * 32,
-    })).decode()
-
-    class Response:
-        headers = {"Content-Length": "8"}
-
-        def __init__(self):
-            self.closed = False
-
-        @staticmethod
-        def read(maximum):
-            assert maximum == 9
-            return b"x" * 8
-
-        def close(self):
-            self.closed = True
-
-    response = Response()
+    link = inline_invite_link(workspace, b"x" * 9)
     monkeypatch.setattr(user_family, "MAX_INVITE_BYTES", 8)
-    monkeypatch.setattr(user_family, "_open_invite", lambda _url: response)
+    monkeypatch.setattr(
+        user_family, "box_decrypt",
+        lambda *_args: pytest.fail("oversize ciphertext reached crypto"),
+    )
+
+    with pytest.raises(PayloadTooLarge, match="invite too large"):
+        user_family.accept(node, link, "new member")
+
+
+def test_invite_redemption_bounds_outer_link_before_base64(
+        tmp_path, monkeypatch):
+    node = FullPeer(str(tmp_path / "joiner"))
+    monkeypatch.setattr(user_family, "MAX_INVITE_LINK_BYTES", 8)
+    with pytest.raises(PayloadTooLarge, match="invite link too large"):
+        user_family.accept(node, "a" * 9, "new member")
+
+def test_exact_bound_inline_invite_reaches_crypto(
+        tmp_path, monkeypatch):
+    node = FullPeer(str(tmp_path / "joiner"))
+    workspace = "0" * 64
+    link = inline_invite_link(workspace, b"x" * 8)
+    monkeypatch.setattr(user_family, "MAX_INVITE_BYTES", 8)
 
     def decrypt(_key, encrypted):
         assert encrypted == b"x" * 8
@@ -349,10 +288,9 @@ def test_exact_bound_invite_response_reaches_crypto_and_still_closes(
     monkeypatch.setattr(user_family, "box_decrypt", decrypt)
     with pytest.raises(ValueError, match="invite workspace"):
         user_family.accept(node, link, "new member")
-    assert response.closed is True
 
 
-def test_invite_creation_checks_encrypted_size_before_store(
+def test_invite_creation_checks_encrypted_size_without_store(
         tmp_path, monkeypatch):
     node = FullPeer(str(tmp_path / "inviter"))
     workspace = facts.auth.workspace.create(node, "inviter", ts=1)
@@ -363,11 +301,11 @@ def test_invite_creation_checks_encrypted_size_before_store(
         lambda _key, _raw: b"x" * 8,
     )
 
-    user_invite_family.make(node, workspace)
+    link = user_invite_family.make(node, workspace)
     store = node.store(workspace)
-    invite_keys = store.list("invite/")
-    assert len(invite_keys) == 1
-    assert store.get(invite_keys[0]) == b"x" * 8
+    artifact = json.loads(base64.urlsafe_b64decode(link))
+    assert base64.b64decode(artifact["b"], validate=True) == b"x" * 8
+    assert store.list("invite/") == []
 
     monkeypatch.setattr(
         user_invite_family, "box_encrypt",
@@ -375,7 +313,7 @@ def test_invite_creation_checks_encrypted_size_before_store(
     )
     with pytest.raises(PayloadTooLarge, match="invite too large"):
         user_invite_family.make(node, workspace)
-    assert store.list("invite/") == invite_keys
+    assert store.list("invite/") == []
 
 
 def test_incompatible_projection_is_deleted_instead_of_migrated(tmp_path):

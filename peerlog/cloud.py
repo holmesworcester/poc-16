@@ -54,9 +54,8 @@ SEGMENT_MAGIC = b"P16Q1\x00"
 FOOTER_MAGIC = b"P16F"
 SLOT_FORMAT = "poc16-cloud-writer-slot-v1"
 DIRECTORY_FORMAT = "poc16-cloud-directory-v1"
-PUBLICATION_MAGIC = b"P16P1\x00"
+PUBLICATION_MAGIC = b"P16P2\x00"
 FOOTER_FORMAT = "poc16-cloud-footer-v1"
-HANDOFF_FAMILIES = frozenset({"invite", "device"})
 
 
 @dataclass
@@ -288,23 +287,11 @@ class Slot:
 class Publication:
     main: Run
     carries: tuple[Run, ...] = ()
-    handoff_targets: tuple[bytes, ...] = ()
-
-
-@dataclass(frozen=True)
-class HandoffTicket:
-    workspace: bytes
-    writer: bytes
-    lo: int
-    hi: int
-    key: str
-    recipient: bytes
 
 
 @dataclass(frozen=True)
 class PublicationReceipt:
     segment: Segment
-    handoffs: tuple[HandoffTicket, ...]
 
 
 @dataclass
@@ -538,8 +525,7 @@ def decode_slot(raw):
 
 def _publication_bytes(publication):
     main = encode_run(publication.main)
-    if len(publication.carries) > CLOUD_ANNEX_MAX_RUNS \
-            or len(publication.handoff_targets) > 256:
+    if len(publication.carries) > CLOUD_ANNEX_MAX_RUNS:
         raise ValueError("cloud publication count")
     raw = bytearray(PUBLICATION_MAGIC)
     raw.extend(struct.pack(">I", len(main)))
@@ -549,11 +535,6 @@ def _publication_bytes(publication):
         encoded = encode_run(carried)
         raw.extend(struct.pack(">I", len(encoded)))
         raw.extend(encoded)
-    raw.extend(struct.pack(">H", len(publication.handoff_targets)))
-    for target in publication.handoff_targets:
-        if not isinstance(target, bytes) or len(target) != 32:
-            raise ValueError("cloud handoff target")
-        raw.extend(target)
     result = bytes(raw)
     if len(result) > CLOUD_PUBLICATION_MAX_BYTES:
         raise ValueError("cloud publication too large")
@@ -582,16 +563,12 @@ def _decode_publication(raw):
         for _item in range(carry_count):
             size = struct.unpack(">I", take(4))[0]
             carries.append(decode_run(take(size)))
-        target_count = struct.unpack(">H", take(2))[0]
-        targets = tuple(take(32) for _item in range(target_count))
         if cursor != len(raw):
             raise ValueError
-        result = Publication(main, tuple(carries), targets)
+        result = Publication(main, tuple(carries))
     except (TypeError, ValueError, UnicodeError, struct.error) as error:
         raise ValueError("cloud publication") from error
-    if any(len(item) != 32 for item in result.handoff_targets) \
-            or len(set(result.handoff_targets)) != len(result.handoff_targets) \
-            or _publication_bytes(result) != raw:
+    if _publication_bytes(result) != raw:
         raise ValueError("cloud publication")
     return result
 
@@ -759,7 +736,7 @@ class CloudQueue:
         return {writer: slot.hi
                 for writer, slot in _decode_directory(raw, self.workspace).items()}
 
-    def publish(self, log, lo=None, hi=None, *, carries=(), handoff_targets=(),
+    def publish(self, log, lo=None, hi=None, *, carries=(),
                 holdings=None, announce=False):
         """Create one immutable micro publication and CAS only its owner slot.
 
@@ -770,7 +747,6 @@ class CloudQueue:
         if not isinstance(log, WriterLog) or log._secret is None:
             raise ValueError("cloud publish requires owner log")
         carries = tuple(carries)
-        handoff_targets = tuple(handoff_targets)
         with self._lock:
             slot, token = self._slot_versioned(log.writer)
             expected = 0 if slot is None else slot.hi
@@ -792,17 +768,10 @@ class CloudQueue:
                         retry_key, retry_lo, hi, len(incumbent), 1, "micro")
                     if len(stored) == 1 \
                             and stored[0].main == retry_run \
-                            and stored[0].handoff_targets == handoff_targets \
                             and retry_descriptor == slot.segments[-1]:
                         if announce:
                             self.repair_directory()
-                        return PublicationReceipt(
-                            retry_descriptor,
-                            tuple(HandoffTicket(
-                                self.workspace, log.writer, retry_lo, hi,
-                                retry_key, target)
-                                for target in handoff_targets),
-                        )
+                        return PublicationReceipt(retry_descriptor)
             if slot is not None and sum(
                     item.kind == "micro" for item in slot.segments) \
                     >= MICRO_TAIL:
@@ -817,11 +786,10 @@ class CloudQueue:
                 raise ValueError("cloud writer sequence")
             run = prove_run(log, lo, hi)
             publication = self._close_publication(
-                Publication(run, carries, handoff_targets), holdings)
+                Publication(run, carries), holdings)
             main_facts = decode_slice(run.facts, run.hi - run.lo)
             needs_heads = any(
-                fact.refs and (
-                    is_control(fact) or fact.family in HANDOFF_FAMILIES)
+                fact.refs and is_control(fact)
                 for fact in main_facts)
             self._validate_publication(
                 publication, self.visible_heads() if needs_heads else {})
@@ -847,11 +815,7 @@ class CloudQueue:
                 raise ValueError("stale cloud writer slot")
             if announce:
                 self.repair_directory()
-            tickets = tuple(
-                HandoffTicket(self.workspace, log.writer, lo, hi, key, target)
-                for target in handoff_targets
-            )
-            return PublicationReceipt(descriptor, tickets)
+            return PublicationReceipt(descriptor)
 
     def readmit_orphan(self, writer, lo, hi, *, announce=False):
         """Validate and install one micro created before a crashed slot CAS.
@@ -882,12 +846,7 @@ class CloudQueue:
             if slot is not None and slot.segments \
                     and slot.segments[-1] == descriptor \
                     and slot.head == encode_head(run.head):
-                return PublicationReceipt(
-                    descriptor,
-                    tuple(HandoffTicket(
-                        self.workspace, writer, lo, hi, key, target)
-                        for target in publication.handoff_targets),
-                )
+                return PublicationReceipt(descriptor)
             if expected != lo:
                 raise ValueError("stale cloud orphan")
             self._validate_publication(publication, self.visible_heads())
@@ -899,12 +858,7 @@ class CloudQueue:
                 raise ValueError("stale cloud orphan")
             if announce:
                 self.repair_directory()
-            return PublicationReceipt(
-                descriptor,
-                tuple(HandoffTicket(
-                    self.workspace, writer, lo, hi, key, target)
-                    for target in publication.handoff_targets),
-            )
+            return PublicationReceipt(descriptor)
 
     def _close_publication(self, publication, holdings):
         """Carry the exact transitive cross-writer closure once per micro.
@@ -973,15 +927,11 @@ class CloudQueue:
         carries = tuple(encoded[raw] for raw in sorted(encoded))
         if len(carries) > CLOUD_ANNEX_MAX_RUNS:
             raise ValueError("cloud annex run count")
-        return Publication(
-            publication.main, carries, publication.handoff_targets)
+        return Publication(publication.main, carries)
 
     def _validate_publication(self, publication, visible):
         main_facts = decode_slice(
             publication.main.facts, publication.main.hi - publication.main.lo)
-        handoff = any(fact.family in HANDOFF_FAMILIES for fact in main_facts)
-        if handoff != bool(publication.handoff_targets):
-            raise ValueError("handoff facts require explicit out-of-band targets")
         carried = {}
         carried_facts = []
         for run in publication.carries:
@@ -1005,7 +955,7 @@ class CloudQueue:
                     raise ValueError(
                         "Rule-2/cross-writer reference lacks adjacent annex")
         for fact in main_facts:
-            if not (is_control(fact) or fact.family in HANDOFF_FAMILIES):
+            if not is_control(fact):
                 continue
             for ref in fact.refs:
                 if visible.get(ref.writer, 0) > ref.seq:
@@ -1476,25 +1426,6 @@ class CloudQueue:
         cache.interactive_ready = report.interactive_ready
         return report
 
-    def redeem_handoff(self, ticket, recipient, state):
-        """Consume an explicitly delivered handoff capability out of band."""
-        if not isinstance(ticket, HandoffTicket) \
-                or ticket.workspace != self.workspace \
-                or ticket.recipient != recipient:
-            raise ValueError("handoff ticket")
-        raw, _tag = self.store.get(ticket.key)
-        if raw is None:
-            raise ValueError("missing handoff segment")
-        for publication in _decode_segment(raw):
-            run = publication.main
-            if run.writer == ticket.writer and run.lo == ticket.lo \
-                    and run.hi == ticket.hi \
-                    and recipient in publication.handoff_targets:
-                ingest_batch(state, (*publication.carries, run))
-                return run
-        raise ValueError("handoff publication")
-
-
 def _covered(coverage, lo, hi):
     return any(start <= lo and hi <= stop for start, stop in coverage)
 
@@ -1536,7 +1467,7 @@ __all__ = (
     "CLOUD_PUBLICATION_MAX_BYTES",
     "CloudClosureLimits", "CloudDemand", "CloudMicroFork",
     "CloudMetrics", "CloudObjectStore", "CloudQueue", "CloudSyncReport",
-    "EPOCH_CAP", "FOOTER_READ", "HANDOFF_FAMILIES", "HandoffTicket",
+    "EPOCH_CAP", "FOOTER_READ",
     "MICRO_TAIL", "MULTIPART_EDGE", "MaintenanceRequired", "MemoryCloud",
     "MicroForkEvidence",
     "PartCopyUnavailable",

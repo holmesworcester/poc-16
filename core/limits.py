@@ -61,6 +61,13 @@ MAX_REMOVAL_ROOT_BYTES = MAX_ROOT_BYTES
 MAX_REMOVAL_PROOF_BYTES = 32 * 1024
 
 MAX_INVITE_BYTES = MAX_PAGE_BATCH_BYTES
+# A bearer invite embeds one base64-encoded encrypted invite inside a
+# canonical JSON artifact, which is itself base64url-encoded for transport.
+# Bound both layers before decoding so a pasted link cannot become an
+# unbounded allocation.  The small fixed allowances cover field names,
+# workspace/peer identifiers, and encoding padding.
+MAX_INVITE_ARTIFACT_BYTES = 6 * MIB
+MAX_INVITE_LINK_BYTES = 8 * MIB
 # Facts and authenticated-map pages use the ordinary buffered object path.
 # Large signed piles share the ``obj/`` address space but require the direct
 # streaming data plane and therefore must not widen this semantic-object bound.

@@ -190,8 +190,11 @@ below the stored target head is fetchable; one above it is a pending interval,
 not a failed-GET event. Validity-critical control refs cite visible targets or
 carry exact proof material inline beside the citing fact (Rule 2); render refs
 arriving over P2P may remain pending, while cloud publication rejects a missing
-cross-writer annex. Handoff facts are explicitly parked and require a separate
-decision before the cloud phase closes.
+cross-writer annex. Handoff uses a separate bounded carry: the invite artifact
+contains the signed closure, and the
+beneficiary first publishes those unchanged facts in its own writer log. The
+cloud has no recipient-addressed handoff object or redemption operation; after
+homing, invite and device facts follow ordinary Rule-2 closure.
 
 Bao descriptors and slices are ordinary facts. Large pile and pack bodies use
 the streaming/direct-object path and must not widen buffered semantic-object

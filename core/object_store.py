@@ -56,15 +56,14 @@ SINGLETON_CAS_KEYS = frozenset((
 # S3 and R2 both cap one complete object key at 1,024 bytes. A configured
 # prefix must leave room for every logical namespace the shared store may
 # address, not merely the ingress key that happened to be longest before
-# public invitations were included in this inventory.
+# writer layouts were included in this inventory.
 MAX_PROVIDER_KEY_BYTES = 1024
-MAX_INVITE_ID_BYTES = 256
 MAX_LOGICAL_KEY_BYTES = max(
     len(OPERATIONAL_CURSOR_KEY),
     len("obj/") + 64,
     len(REMOVAL_NODE_PREFIX) + 64,
     len("heads/") + 64 + 1 + 64,
-    len("invite/") + MAX_INVITE_ID_BYTES,
+    len("layouts/") + 64 + 1 + 64 + 1 + 16,
 )
 MAX_STORE_PREFIX_BYTES = (
     MAX_PROVIDER_KEY_BYTES - 1 - MAX_LOGICAL_KEY_BYTES)

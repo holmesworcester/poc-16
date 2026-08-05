@@ -9,7 +9,12 @@ import os
 
 from core.crypto import box_encrypt, kdf, keypair
 from core.fact import Fact, Need, canon
-from core.limits import MAX_INVITE_BYTES, PayloadTooLarge
+from core.limits import (
+    MAX_INVITE_ARTIFACT_BYTES,
+    MAX_INVITE_BYTES,
+    MAX_INVITE_LINK_BYTES,
+    PayloadTooLarge,
+)
 from .._commands import offer_source
 from .._policy import FamilyPolicy
 from . import signature
@@ -54,7 +59,7 @@ DURABLE = True
 
 # COMMANDS
 def make(node, workspace):
-    """Publish a closed invite blob without adding the invitation to the set."""
+    """Return a bearer artifact carrying the complete signed invite closure."""
     peer = node.advertised_peer()
     seed = os.urandom(32)
     invite_sk, invite_pk = keypair()
@@ -74,11 +79,19 @@ def make(node, workspace):
     encrypted = box_encrypt(kdf(seed, "key"), blob)
     if len(encrypted) > MAX_INVITE_BYTES:
         raise PayloadTooLarge("invite too large")
-    node.store(workspace).put(
-        "invite/" + kdf(seed, "id").hex(), encrypted)
-    return base64.urlsafe_b64encode(
-        canon({"p": peer, "ws": workspace, "s": seed.hex()})).decode()
+    artifact = canon({
+        "b": base64.b64encode(encrypted).decode(),
+        "p": peer,
+        "s": seed.hex(),
+        "ws": workspace,
+    })
+    if len(artifact) > MAX_INVITE_ARTIFACT_BYTES:
+        raise PayloadTooLarge("invite artifact too large")
+    link = base64.urlsafe_b64encode(artifact).decode()
+    if len(link) > MAX_INVITE_LINK_BYTES:
+        raise PayloadTooLarge("invite link too large")
+    return link
 
 
-# QUERIES — none; invite ids deliberately cannot be listed.
+# QUERIES — none; the store never receives a recipient-addressed artifact.
 CLI = {"auth.user_invite.create": make}

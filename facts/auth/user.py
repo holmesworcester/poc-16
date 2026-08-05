@@ -1,12 +1,16 @@
 """facts/auth/user.py — invite redemption and workspace membership."""
 import base64
-import json
 
 from core.close import decode_signed_pile
 from core.crypto import box_decrypt, kdf, load_sk, sign, verify
 from core.fact import Fact, Need, workspace_of
-from core.http_body import read_bounded
-from core.limits import MAX_INVITE_BYTES
+from core.limits import (
+    MAX_INVITE_ARTIFACT_BYTES,
+    MAX_INVITE_BYTES,
+    MAX_INVITE_LINK_BYTES,
+    PayloadTooLarge,
+    decode_json,
+)
 from core.suppression import scoped_id
 from .._policy import FamilyPolicy, SidOffer, author_selectors
 from . import signature, user_invite
@@ -65,37 +69,56 @@ DURABLE = True
 
 
 # COMMANDS — accepting a workspace establishes its local keyring anchor.
-def _open_invite(url):
-    """Open the full-peer-only invite URL without polluting edge imports."""
-    import urllib.request
-
-    return urllib.request.urlopen(url, timeout=15)
-
-
 def accept(node, link, name):
-    """Redeem a self-contained invite and commit the authored join locally."""
+    """Accept an inline invite and home its signed closure in this writer."""
     from facts import semantic_evaluation
     from core.kernel import drain
 
-    link_data = json.loads(base64.urlsafe_b64decode(link))
+    if not isinstance(link, str):
+        raise ValueError("invite link")
+    try:
+        encoded = link.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError("invite link") from error
+    if len(encoded) > MAX_INVITE_LINK_BYTES:
+        raise PayloadTooLarge("invite link too large")
+    try:
+        artifact = base64.b64decode(encoded, altchars=b"-_", validate=True)
+    except (ValueError, TypeError) as error:
+        raise ValueError("invite link") from error
+    if base64.urlsafe_b64encode(artifact) != encoded:
+        raise ValueError("invite link")
+    link_data = decode_json(
+        artifact, MAX_INVITE_ARTIFACT_BYTES, "invite artifact")
     if not isinstance(link_data, dict):
         raise ValueError("invite link")
-    if set(link_data) != {"p", "ws", "s"}:
+    if set(link_data) != {"b", "p", "s", "ws"}:
         raise ValueError("invite link")
     peer = link_data["p"]
     workspace = link_data["ws"]
-    seed = bytes.fromhex(link_data["s"])
+    if not all(
+            isinstance(link_data[name], str)
+            for name in ("b", "s", "ws")):
+        raise ValueError("invite link")
+    try:
+        seed = bytes.fromhex(link_data["s"])
+        encrypted = base64.b64decode(link_data["b"], validate=True)
+    except (ValueError, TypeError) as error:
+        raise ValueError("invite link") from error
+    if len(seed) != 32:
+        raise ValueError("invite link")
+    if link_data["s"] != seed.hex() \
+            or link_data["b"] != base64.b64encode(encrypted).decode():
+        raise ValueError("invite link")
+    if len(encrypted) > MAX_INVITE_BYTES:
+        raise PayloadTooLarge("invite too large")
     retained = False
     try:
-        url = node.resolve_peer(workspace, peer)
-        response = _open_invite(
-            f"{url}/invite/{kdf(seed, 'id').hex()}?ws={workspace}")
-        try:
-            encrypted = read_bounded(
-                response, MAX_INVITE_BYTES, "invite response")
-        finally:
-            response.close()
-        blob = json.loads(box_decrypt(kdf(seed, "key"), encrypted))
+        blob = decode_json(
+            box_decrypt(kdf(seed, "key"), encrypted),
+            MAX_INVITE_BYTES,
+            "invite plaintext",
+        )
         if not isinstance(blob, dict) or set(blob) != {"pile", "isk", "ws"} \
                 or blob.get("ws") != workspace:
             raise ValueError("invite workspace")

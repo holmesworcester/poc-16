@@ -771,6 +771,17 @@ only the authenticated permit fields and performs no fact-family dispatch.
 
 ### 7.1 Admission creates the exact subject row once
 
+The initial handoff is entirely out of band. The bounded encrypted QR/link
+artifact carries the invitation facts together with their signature facts and
+peer reachability. It is never uploaded as a recipient-addressed cloud object,
+and acceptance performs no author or cloud read. The beneficiary validates the
+closed pile, then first publishes those exact bytes in its own writer log along
+with its countersigned membership. Signatures identify authorship while the
+writer log identifies residence; stable fact IDs deduplicate a later author
+publication. From that point invite/device facts are ordinary control families
+under Rule 2. The gate-facing mint proof may carry the same facts ephemerally,
+unchanged, but no handoff ticket or redemption state exists.
+
 An UNKNOWN subject may present one device-signed mint request closed over its
 positive workspace admission and device-ownership chain. `AccessGate`
 evaluates that carriable chain once and joins CLEAR rows for the exact member,

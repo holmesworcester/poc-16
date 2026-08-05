@@ -415,7 +415,7 @@ def test_folded_segment_inherits_deterministic_cross_writer_annex():
     assert {(run.writer, run.lo) for run in annex} == {
         (target.writer, seq) for seq in range(4)}
     baseline = _encode_segment(tuple(
-        Publication(publication.main, (), publication.handoff_targets)
+        Publication(publication.main, ())
         for publication in publications), "ladder")
     annex_ratio = segment.size / len(baseline)
     assert 1.05 < annex_ratio < 1.30
@@ -672,27 +672,24 @@ def test_consumer_rejects_writer_that_bypasses_annex_check(family):
     assert not state.logs
 
 
-def test_handoff_is_explicit_out_of_band_ticket_not_ambient_discovery():
+def test_handoff_facts_cannot_enter_cloud_without_ordinary_closed_carry():
     store = MemoryCloud()
     cloud = CloudQueue(store, h("handoff"))
     authority = owned("authority", 1)
     inviter = WriterLog.owned()
-    recipient = h("recipient device")
     inviter.append(Fact(
         "invite", 3_000, (Ref(authority.writer, 0),), b"sealed invitation"))
 
-    with pytest.raises(ValueError, match="handoff"):
-        cloud.publish(inviter, carries=(carry(authority, 0),))
-    receipt = cloud.publish(
-        inviter, carries=(carry(authority, 0),),
-        handoff_targets=(recipient,))
-    assert len(receipt.handoffs) == 1
-
-    state = PeerState()
-    with pytest.raises(ValueError, match="handoff ticket"):
-        cloud.redeem_handoff(receipt.handoffs[0], h("wrong"), state)
-    cloud.redeem_handoff(receipt.handoffs[0], recipient, state)
-    assert set(state.logs) == {authority.writer, inviter.writer}
+    with pytest.raises(ValueError, match="Rule-2"):
+        cloud.publish(inviter)
+    # Nothing is written for a failed publication, and the store has no
+    # recipient-addressed retrieval primitive. Once the complete ordinary
+    # Rule-2 carry is available, the homed fact publishes like any control.
+    assert store._objects == {}
+    receipt = cloud.publish(inviter, carries=(carry(authority, 0),))
+    assert receipt.segment.kind == "micro"
+    assert all("handoff" not in key and "recipient" not in key
+               for key in store._objects)
 
 
 def test_micro_tail_folds_to_binary_ladder_and_footer_is_suffix_readable():

@@ -5,7 +5,7 @@ Layout: removal (the private authenticated access projection), cursor
 independently closed writer piles — immutable),
 heads/<workspace>/<device> and layouts/<workspace>/<device>/<window>
 (independent CAS registers),
-and invite/<id> (public reads).
+and private control state.
 
 Large signed-pile and pack/<hash> bodies use the direct streaming data plane.
 The namespace rules here still protect them from unconditional replacement or

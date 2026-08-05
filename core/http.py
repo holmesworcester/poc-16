@@ -20,7 +20,6 @@ from .access import (
 from .crypto import h, seal_to
 from .grants import check_token, make_token
 from .limits import (
-    MAX_INVITE_BYTES,
     MAX_CONTROL_PILE_BYTES,
     MAX_HEAD_CONTROL_BYTES,
     MAX_HEAD_CONTROL_PILES,
@@ -36,13 +35,7 @@ from .limits import (
     PayloadTooLarge,
     decode_json,
 )
-from .object_store import (
-    ABSENT,
-    MAX_INVITE_ID_BYTES,
-    StoreError,
-    Versioned,
-    mutable_key,
-)
+from .object_store import ABSENT, StoreError, Versioned, mutable_key
 from .pack_access import (
     MAX_OBJECT_OPEN_BYTES,
     MAX_PACK_OPEN_BYTES,
@@ -63,8 +56,6 @@ from .writer_head import (
 )
 
 OID_RE = re.compile(r"^[0-9a-f]{64}$")
-INVITE_RE = re.compile(
-    rf"^[a-z0-9._-]{{1,{MAX_INVITE_ID_BYTES}}}$")
 HEAD_CONTROL_FRAME_MAGIC = b"poc16-head-control-v1\0"
 HEAD_CONTROL_FRAME_WORD_BYTES = 4
 MAX_HEAD_CONTROL_REQUEST_BYTES = (
@@ -921,24 +912,6 @@ class HttpGate:
                 return await self._advance_head(
                     parts[1], body, trusted_now)
             return Response(404)
-        if path.startswith("/invite/") and method == "GET":
-            invite = path.removeprefix("/invite/")
-            if not INVITE_RE.fullmatch(invite):
-                return Response(404)
-            try:
-                raw = await self._get(
-                    "invite/" + invite, MAX_INVITE_BYTES)
-            except PayloadTooLarge:
-                return Response(413)
-            except Exception:
-                return Response(503)
-            if raw is None:
-                return Response(404)
-            return Response(
-                200, raw, {
-                    "Cache-Control": "no-store",
-                    "Content-Type": "application/octet-stream",
-                })
         if path == "/pack/open":
             if method != "POST":
                 return Response(405)

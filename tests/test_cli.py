@@ -225,21 +225,16 @@ def test_notification_bootstrap_control_is_explicit_and_wakes(tmp_path):
     ])[0] == 400
 
 
-def test_join_commits_locally_then_kicks_the_only_network_reconciler(
+def test_join_homes_invite_with_author_permanently_offline_then_kicks_sync(
         tmp_path, monkeypatch):
     inviter = FullPeer(str(tmp_path / "inviter"))
     inviter.peer_address = "https://inviter.invalid"
     workspace = facts.auth.workspace.create(inviter, "alice")
     link = facts.auth.user_invite.make(inviter, workspace)
-    store = inviter.store(workspace)
-    invite_key, = store.list("invite/")
-    encrypted = store.get(invite_key)
-    response = io.BytesIO(encrypted)
-    response.headers = {"Content-Length": str(len(encrypted))}
+    assert inviter.store(workspace).list("invite/") == []
     monkeypatch.setattr(
-        facts.auth.user,
-        "_open_invite",
-        lambda *_args, **_kwargs: response,
+        "urllib.request.urlopen",
+        lambda *_args, **_kwargs: pytest.fail("join attempted a network read"),
     )
     joiner = FullPeer(str(tmp_path / "joiner"))
     handler = _handler(joiner)
@@ -248,6 +243,8 @@ def test_join_commits_locally_then_kicks_the_only_network_reconciler(
         handler, "auth.user.join", [link, "bob"],
     ) == (200, workspace)
     assert handler.syncer.kicks == 1
+    assert joiner.local_writer_binding(workspace).device \
+        == joiner.identity(workspace)[1]
     assert any(
         member["name"] == "bob"
         for member in facts.auth.user.members(joiner, workspace)

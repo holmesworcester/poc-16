@@ -19,7 +19,7 @@ Parameters:
   StorePrefix:
     Type: String
     MinLength: 1
-    MaxLength: 760
+    MaxLength: 869
     AllowedPattern: '^[a-z0-9:_-][a-z0-9:._-]*(?:/[a-z0-9:_-][a-z0-9:._-]*)*$'
   ExpectedBucketOwner:
     Type: String
@@ -98,7 +98,6 @@ Resources:
                       - !Sub "${StorePrefix}/removal"
                       - !Sub "${StorePrefix}/removal-node/*"
                       - !Sub "${StorePrefix}/obj/*"
-                      - !Sub "${StorePrefix}/invite/*"
                       - !Sub "${StorePrefix}/heads/${WorkspaceId}/*"
                   NumericLessThanEquals:
                     s3:max-keys: !Ref HeadPageKeys
@@ -129,10 +128,6 @@ Resources:
                 Resource:
                   - !Sub
                     - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/obj/*"
-                    - Bucket: !Ref BucketName
-                      Prefix: !Ref StorePrefix
-                  - !Sub
-                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/invite/*"
                     - Bucket: !Ref BucketName
                       Prefix: !Ref StorePrefix
               - Sid: ReadImmutablePacksByScopedRequest

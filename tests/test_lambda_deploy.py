@@ -61,7 +61,6 @@ from core.http import (
     Response,
 )
 from core.object_store import (
-    MAX_INVITE_ID_BYTES,
     MAX_LOGICAL_KEY_BYTES,
     MAX_PROVIDER_KEY_BYTES,
     REMOVAL_ROOT_KEY,
@@ -847,7 +846,7 @@ def test_lambda_template_bounds_direct_immutable_writes_to_obj_and_pack():
     assert '${StorePrefix}/heads/${WorkspaceId}/*' in template
     assert '${StorePrefix}/root' not in template
     assert '${StorePrefix}/obj/*' in template
-    assert '${StorePrefix}/invite/*' in template
+    assert '${StorePrefix}/invite/*' not in template
     assert template.count('${Prefix}/obj/*') == 2
     assert template.count('${Prefix}/removal"') == 2
     assert template.count('${Prefix}/removal-node/*') == 2
@@ -923,10 +922,10 @@ def test_cloudformation_bucket_and_prefix_constraints_refine_s3_config():
         with pytest.raises(ValueError):
             S3Config(bucket="test-bucket", prefix=prefix)
 
-    # The longest public key is invite/<256 bytes>; this is exactly the
-    # provider's physical-key ceiling at the accepted prefix maximum.
+    # The longest protocol key is one fixed-window writer layout; this is
+    # exactly the provider's physical-key ceiling at the prefix maximum.
     assert MAX_LOGICAL_KEY_BYTES \
-        == len("invite/") + MAX_INVITE_ID_BYTES
+        == len("layouts/") + 64 + 1 + 64 + 1 + 16
     assert MAX_STORE_PREFIX_LENGTH + 1 + MAX_LOGICAL_KEY_BYTES \
         == MAX_PROVIDER_KEY_BYTES
 
@@ -943,13 +942,13 @@ def test_list_permission_is_limited_to_gateway_read_namespaces():
     assert f"AllowedValues: [{PAGE_BATCH}]" in parameter
     assert "Action: s3:ListBucket" in block
     assert '"arn:${AWS::Partition}:s3:::${BucketName}"' in block
-    assert block.count("!Sub") == 6
+    assert block.count("!Sub") == 5
     assert '${StorePrefix}/authority' not in block
     assert '${StorePrefix}/removal' in block
     assert '${StorePrefix}/removal-node/*' in block
     assert '${StorePrefix}/heads/${WorkspaceId}/*' in block
     assert '${StorePrefix}/obj/*' in block
-    assert '${StorePrefix}/invite/*' in block
+    assert '${StorePrefix}/invite/*' not in block
     assert '${StorePrefix}/*' not in block
     assert "s3:max-keys: !Ref HeadPageKeys" in block
 

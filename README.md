@@ -166,13 +166,19 @@ SIGINT and SIGTERM stop and reap every child. Add `--iroh-loopback` only for
 a single-machine test; normal mode enables Iroh's production reachability
 preset.
 
-An invite created by this daemon carries a bounded out-of-band peer record:
+An invite created by this daemon is a bounded encrypted bearer artifact. It
+carries the complete signed invite closure plus an out-of-band peer record:
 
 ```json
 {"kind":"iroh","endpoint":"ENDPOINT_ID","ticket":"TICKET"}
 ```
 
-It never carries the private peer-data URL. The joiner stores that record in
+The invite is not uploaded to the object store and accepting it performs no
+network fetch, so the author can go permanently offline immediately after
+sharing the QR/link. The joiner validates the self-authenticating closure and
+first publishes those unchanged authored facts in the joiner's own writer log;
+fact IDs deduplicate them if the author publishes later. It never carries the
+private peer-data URL. The joiner stores that record in
 its full-peer keyring, registers a supervised outbound forwarder, and gives
 only the resulting `http://127.0.0.1:...` URL to the existing sync HTTP
 client. On restart it registers durable peers before scheduling and recreates
@@ -723,6 +729,9 @@ dependency pump still closes citing roots that arrived over P2P without a cloud
 annex. A create-before-slot crash is recoverable: an exact retry finishes the
 slot; a divergent retry returns typed `CloudMicroFork` hashes and
 `readmit_orphan()` can validate and install the already-created branch.
+Invite/device handoff facts have no separate cloud ticket or recipient object:
+once homed in the beneficiary's writer log, they are ordinary control facts and
+must satisfy the same Rule-2 adjacent-closure rule as every other control fact.
 
 ## Hosted owner publication
 

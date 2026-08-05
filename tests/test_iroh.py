@@ -593,6 +593,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
         assert status == 200
         link = json.loads(body)
         invite = json.loads(base64.urlsafe_b64decode(link))
+        assert set(invite) == {"b", "p", "s", "ws"}
         assert invite["p"] == {
             "kind": "iroh",
             "endpoint": ready["endpoint_id"],
@@ -600,13 +601,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
         }
         assert "u" not in invite
         after_invite = repository_bytes(state, workspace)
-        assert {
-            key: value for key, value in after_invite.items()
-            if not key.startswith("invite/")
-        } == baseline
-        assert len([
-            key for key in after_invite if key.startswith("invite/")
-        ]) == 1
+        assert after_invite == baseline
 
         for forwarder in children[1:]:
             stop(forwarder)

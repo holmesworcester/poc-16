@@ -1015,8 +1015,8 @@ def test_runtime_rejects_route_oversize_before_r2_arraybuffer(
         ), environment)),
     ]
 
-    assert [result.status for result in results] == [413, 413, 413]
-    assert len(oversized.objects) == len(results)
+    assert [result.status for result in results] == [401, 413, 413]
+    assert len(oversized.objects) == 2
     assert all(obj.array_calls == 0 for obj in oversized.objects)
 
     oversized_root = run(runtime.handle(Request(
@@ -1024,7 +1024,7 @@ def test_runtime_rejects_route_oversize_before_r2_arraybuffer(
         mint_body,
     ), environment))
     assert oversized_root.status == 503
-    assert len(oversized.objects) == len(results) + 1
+    assert len(oversized.objects) == 3
     assert all(obj.array_calls == 0 for obj in oversized.objects)
 
     prefix = environment.STORE_PREFIX
