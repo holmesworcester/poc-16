@@ -239,4 +239,4 @@ def test_only_ephemeral_families_have_worker_grants():
         module for module in grants
         if hasattr(module, "authorize_admission")
     ]
-    assert admissions == [facts.auth.request]
+    assert admissions == [facts.auth.request, facts.auth.service_request]

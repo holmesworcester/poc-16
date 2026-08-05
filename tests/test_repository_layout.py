@@ -14,7 +14,8 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 ROOT_DOCS = {"AGENTS.md", "DESIGN.md", "README.md"}
 SOURCE_ROOTS = (
-    "core", "full_peer", "facts", "notifications", "adapters", "deploy")
+    "core", "full_peer", "facts", "infrastructure", "notifications",
+    "adapters", "deploy")
 EXCLUDED_PARTS = {
     "__pycache__", ".pytest_cache", ".wrangler", "build", "generated",
     "node_modules", "python_modules",

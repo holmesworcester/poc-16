@@ -16,6 +16,9 @@ from full_peer.node import FullPeer
 
 
 EXPECTED = {
+    "auth.service.bind",
+    "auth.service.leave",
+    "auth.service.list",
     "auth.push_endpoint.list",
     "auth.push_endpoint.register",
     "auth.push_endpoint.remove",
@@ -78,7 +81,8 @@ def test_ephemeral_proof_constructors_are_family_owned_and_purpose_keyed():
         for purpose, command in getattr(module, "PROOF_COMMANDS", {}).items()
     }
     assert facts.PROOF_COMMANDS == declared
-    assert set(facts.PROOF_COMMANDS) == {"sync"}
+    assert set(facts.PROOF_COMMANDS) == {
+        "service", "service-binding", "sync"}
     assert all(
         command.__module__.startswith("facts.")
         for command in facts.PROOF_COMMANDS.values()

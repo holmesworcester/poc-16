@@ -42,8 +42,11 @@ def project_control(f, fact_of):
         from facts import family_for
 
         family = family_for(target_fact.t)
-        return family is not None and family.DURABLE \
-            and family.POLICY.control_fact
+        if family is None or not family.DURABLE \
+                or not family.POLICY.control_fact:
+            return False
+        refine = getattr(family, "project_control", None)
+        return refine is None or refine(target_fact, fact_of)
     except (IndexError, TypeError, ValueError):
         return False
 

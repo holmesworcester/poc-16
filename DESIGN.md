@@ -854,10 +854,25 @@ connection material only. A separate HMAC user database, provider-admin
 identity, API-token membership system, or persisted cloud account table must
 not appear beside the fact proof universe.
 
-Provider-community membership and service withdrawal can later be expressed
-as another ordinary workspace and another lookup-gate condition. It is not
-implemented by trusting an Iroh identity or by adding a special provider ACL
-to core.
+Provider-community membership and service withdrawal are expressed as another
+ordinary workspace and another lookup-gate condition. A service accepts normal
+invitations into an operations community and a target community. A target admin
+publishes an exact `service_binding` naming that principal, the operations
+anchor, provider class, and bounded capability. The service's ephemeral target
+request pins that exact binding; its operations request proves the same device
+and owner live at the independently pinned operations root. The shared
+`authorize_service` conjunction returns a grant only after both `AccessGate`
+decisions agree. Local and hosted deployments execute this same code.
+
+Deleting the binding withdraws the target half. Removing the service member
+from either workspace withdraws that community half; terminal member removal
+requires a fresh principal and invitations to rejoin. A provider controller
+may inventory, revoke, and ensure external effects from the resulting grant,
+but has no pile-ingest, root-derivation, object-publication, or writer-slot CAS
+surface. Reconciliation revokes absent or fingerprint-mismatched credentials
+before replacement and is idempotent once provider inventory matches desired
+DAG authority. Iroh identity and provider-local ACL databases are never inputs
+to either judgment.
 
 ### 7.6 Removal and deletion semantics
 

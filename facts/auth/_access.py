@@ -45,7 +45,7 @@ def needs(fact):
     return actor_needs(fact, device, owner)
 
 
-def claim(valid, stream, writer):
+def claim(valid, stream, writer, *, extra_roles=()):
     """Bind the outer writer to one direct member and optional owned device."""
     body = valid.fact.body
     device, owner = body.get("device"), body.get("owner")
@@ -54,6 +54,7 @@ def claim(valid, stream, writer):
     expected = {"author", "member"}
     if device != owner:
         expected.add("device")
+    expected.update(extra_roles)
     edges = {edge.role: edge.fid for edge in valid.edges}
     if set(edges) != expected:
         return None

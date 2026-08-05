@@ -22,7 +22,7 @@ from .._identity import actor_needs
 from ..auth import signature
 
 TAG = "delete"
-POLICY = _policy.FamilyPolicy()
+POLICY = _policy.FamilyPolicy(control_fact=True)
 
 
 # SHAPE
@@ -90,6 +90,19 @@ def validate(f, ctx):
         return is_deletion(f) and f == delete(
             f.ws, pk, target_key, mode, f.ts, owner, actor)
     except (KeyError, IndexError, TypeError, ValueError):
+        return False
+
+
+def project_control(fact, fact_of):
+    """Retain an exact deletion only when its target is authority state."""
+    try:
+        target = fact_of(fact.refs()[0][1])
+        import facts
+
+        family = None if target is None else facts.family_for(target.t)
+        return family is not None and family.DURABLE \
+            and family.POLICY.control_fact
+    except (IndexError, TypeError, ValueError):
         return False
 
 

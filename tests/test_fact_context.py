@@ -5,7 +5,7 @@ import random
 import facts
 
 from .util import signed_pile_facts
-from core.crypto import load_sk
+from core.crypto import h, load_sk
 from core.fact import Fact, encode
 from core.fact_index import index_rows
 from core.kernel import MemoryContext, accepts, resolve_edges
@@ -124,6 +124,14 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
     )
     facts.content.notification_preference.set_global(
         node, workspace, "all", ts=node.now_ms())
+    binding = facts.auth.service_binding.bind(
+        node,
+        workspace,
+        node.pk,
+        h(b"operations community"),
+        "aws",
+        "workspace-role",
+    )
 
     message = facts.content.message.post(
         node, workspace, "general", "context contract", ts=node.now_ms())
@@ -138,6 +146,16 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
     ephemeral = facts.auth.request.payload(
         node, workspace, "sync", request_ts + 10_000, request_ts,
         basis="", admission=True)
+    service_ts = node.now_ms()
+    service_ephemeral = facts.auth.service_request.payload(
+        node,
+        workspace,
+        "service-binding",
+        service_ts + 10_000,
+        service_ts,
+        binding=binding,
+        admission=True,
+    )
     head_ts = node.now_ms()
     head = facts.auth.head_request.head_request(
         workspace,
@@ -158,6 +176,9 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
     )
     corpus, seen = list(durable), {fact.fid for fact in durable}
     corpus.extend(fact for fact in ephemeral if fact.fid not in seen)
+    seen.update(fact.fid for fact in corpus)
+    corpus.extend(
+        fact for fact in service_ephemeral if fact.fid not in seen)
     seen.update(fact.fid for fact in corpus)
     corpus.extend((head_signature, head))
     assert {fact.t for fact in corpus} == set(facts.FAMILIES)
@@ -186,6 +207,8 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
         "notification_preference": (0, 2, 1, 0, 8),
         "push_endpoint": (0, 1, 3, 0, 11),
         "req": (0, 0, 0, 0, 4),
+        "service_binding": (0, 1, 2, 0, 9),
+        "service_req": (0, 0, 1, 0, 6),
         "signature": (0, 1, 0, 0, 5),
         "user": (1, 1, 1, 0, 8),
         "user_invite": (0, 1, 0, 0, 5),

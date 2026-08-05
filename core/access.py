@@ -93,7 +93,7 @@ class AccessGate:
         pin = await self._pin()
         if pin is None:
             return LookupJudgment("unknown", None, None)
-        key = pin.root_oid, identity.device, identity.owner
+        key = pin.root_oid, identity.device, identity.owner, identity.scopes
         cached = self._lookup_cache.get(key)
         if cached is not None:
             status, path = cached

@@ -9,7 +9,7 @@ from ._proof import historical_owner, identity_closure
 
 TAG = "req"
 POLICY = FamilyPolicy()
-PURPOSES = frozenset({"sync"})
+PURPOSES = frozenset({"service", "sync"})
 
 
 # SHAPE

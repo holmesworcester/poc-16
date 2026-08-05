@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 import facts
-from core.crypto import keypair
+from core.crypto import h, keypair
 from core.fact import Fact
 from full_peer.node import FullPeer
 from core.suppression import (
@@ -299,6 +299,15 @@ def test_admin_deletes_every_registered_direct_delete_family(tmp_path):
     )
     setting = facts.content.notification_preference.set_global(
         node, workspace, "all", ts=23)
+    node.bind_identity(workspace, founder)
+    service = facts.auth.service_binding.bind(
+        node,
+        workspace,
+        bob,
+        h(b"operations community"),
+        "aws",
+        "workspace-role",
+    )
     direct = {
         tag
         for tag, family in facts.FAMILIES.items()
@@ -312,16 +321,17 @@ def test_admin_deletes_every_registered_direct_delete_family(tmp_path):
         "file_bao": descriptor,
         "notification_preference": setting,
         "push_endpoint": endpoint,
+        "service_binding": service,
     }
     assert set(targets) == direct
 
-    node.bind_identity(workspace, founder)
     for ts, tag in enumerate(
             (
                 "msg",
                 "file_bao",
                 "notification_preference",
                 "push_endpoint",
+                "service_binding",
             ),
             start=30):
         target = targets[tag]

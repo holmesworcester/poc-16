@@ -18,6 +18,7 @@ from .limits import (
     MAX_HEAD_CONTROL_FACTS,
     MAX_HEAD_CONTROL_PILES,
     MAX_HEAD_REMOVAL_UPDATES,
+    MAX_REMOVAL_PATH_SCOPES,
     MAX_REMOVAL_UPDATES,
     MAX_SUPPRESSION_ID_BYTES,
     PayloadTooLarge,
@@ -275,13 +276,13 @@ class RecipientRemovalState:
         try:
             updates = checked_updates(
                 ((sid, suppression_slot()) for sid in scopes),
-                MAX_REMOVAL_UPDATES,
+                MAX_REMOVAL_PATH_SCOPES,
             )
         except (TypeError, ValueError):
             return await self._result("rejected")
         if not updates:
             return await self._result("rejected")
-        return await self._apply(updates, MAX_REMOVAL_UPDATES)
+        return await self._apply(updates, MAX_REMOVAL_PATH_SCOPES)
 
     async def apply_control(self, raw_signed_pile, writer):
         """Join one exact writer-signed control sink, then discard it."""

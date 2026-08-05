@@ -15,6 +15,7 @@ prints exact operation counts plus projected request cost.
 These tests reject endpoint overrides.  Emulator runs can exercise SDK wiring
 elsewhere but are not provider evidence.
 """
+import asyncio
 import json
 import os
 import re
@@ -29,6 +30,11 @@ from adapters.r2 import R2S3Config, R2S3Store
 from bench.removal_contention import run_removal_scenarios
 from adapters.s3 import S3Config, S3Store
 from core.object_store import Applied, OutcomeUnknown
+from infrastructure.authority import (
+    CapabilityReconciler,
+    InstalledCapability,
+    ServiceGrant,
+)
 from peerlog.cloud import MULTIPART_EDGE, CloudCache, CloudQueue
 from peerlog.cloud_s3 import S3Cloud
 from peerlog.fact import Fact
@@ -46,6 +52,71 @@ _S3_ENDPOINT_RE = re.compile(
     r"^s3(?:-fips)?(?:\.dualstack)?"
     r"(?:\.[a-z0-9-]+)?\.amazonaws\.com(?:\.cn)?$")
 _MAX_CLEANUP_KEYS = 4096
+
+
+class _LiveObjectCapabilities:
+    """Disposable provider objects exercising the reconciler control plane."""
+
+    def __init__(self, store):
+        self.store = store
+
+    @staticmethod
+    def _key(binding):
+        return "service-capability/" + binding
+
+    @staticmethod
+    def _body(binding, fingerprint):
+        return json.dumps(
+            {"binding": binding, "fingerprint": fingerprint},
+            sort_keys=True, separators=(",", ":"),
+        ).encode("ascii")
+
+    def inventory(self):
+        rows = []
+        for key in self.store.list("service-capability"):
+            raw = self.store.get_bounded(key, 256)
+            value = json.loads(raw)
+            rows.append(InstalledCapability(
+                value["binding"], value["fingerprint"], key))
+        return tuple(rows)
+
+    def ensure(self, grant):
+        key = self._key(grant.binding)
+        body = self._body(grant.binding, grant.fingerprint)
+        self.store.put_if_absent(key, body)
+        if self.store.get_bounded(key, 256) != body:
+            raise RuntimeError("provider capability collision")
+        return InstalledCapability(
+            grant.binding, grant.fingerprint, key)
+
+    def revoke(self, installed):
+        key = self._key(installed.binding)
+        expected = self._body(
+            installed.binding, installed.fingerprint)
+        if self.store.get_bounded(key, 256) != expected:
+            raise RuntimeError("provider capability changed before revoke")
+        self.store.delete(key)
+
+
+def _exercise_live_capability_reconciliation(store, provider):
+    grant = ServiceGrant(
+        "1" * 64,
+        "2" * 64,
+        "3" * 64,
+        "3" * 64,
+        "4" * 64,
+        provider,
+        "live-conformance-prefix",
+    )
+    reconciler = CapabilityReconciler(_LiveObjectCapabilities(store))
+    first = asyncio.run(reconciler.reconcile((grant,)))
+    assert len(first.ensured) == 1
+    assert asyncio.run(reconciler.reconcile((grant,))).ensured == ()
+    handle = first.ensured[0].handle
+    assert store.get_bounded(handle, 256) is not None
+    removed = asyncio.run(reconciler.reconcile(()))
+    assert removed.revoked == first.ensured
+    assert store.get_bounded(handle, 256) is None
 
 
 def _generated_prefix():
@@ -248,6 +319,7 @@ def test_live_s3_direct_api_conformance(live_s3_store):
     exercise_sync_store(live_s3_store, run)
     _prove_recovery_after_discarded_response(
         live_s3_store(), run, lambda: None)
+    _exercise_live_capability_reconciliation(live_s3_store(), "aws")
 
 
 @pytest.mark.live
@@ -262,6 +334,8 @@ def test_live_r2_direct_api_conformance(live_r2_store):
         time.sleep(1.05)
 
     exercise_sync_store(live_r2_store, run, pace=pace)
+    _exercise_live_capability_reconciliation(
+        live_r2_store(), "cloudflare")
     _prove_recovery_after_discarded_response(
         live_r2_store(), run, pace)
 

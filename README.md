@@ -24,6 +24,12 @@ The implementation is deliberately strict about authority and direction:
   create an exact CLEAR subject row. Later signed requests perform one lookup:
   UNKNOWN fails closed, CLEAR proceeds, ACTIVE receives only its own rejection
   path and current tip, and a stale basis receives the current tip for retry.
+- Infrastructure uses that same gate twice rather than acquiring a hidden
+  provider identity. An operations workspace proves the service principal is
+  live; a target workspace pins an admin-approved `service_binding` to that
+  exact principal, provider, and bounded capability. `authorize_service`
+  requires both independently pinned decisions before returning an external
+  grant.
 - A control head is evaluated once at `/permit`. Its stable-secret HMAC permit
   carries the bounded aggregate removal plan; `/commit` verifies its issue-time
   root, applies that plan, and performs one CAS of the final writer slot.
@@ -679,6 +685,25 @@ action. An admin may delete every directly deletable fact. An owner may
 delete facts owned by the same durable member principal, including facts
 written by any of that member's devices. These are ordinary family checks,
 not special cases in `FullPeer`.
+
+Authority-targeted deletion is projected into the control subsequence while
+ordinary content deletion is not. This lets a service owner or target admin
+withdraw one exact binding through the usual delete family without turning
+content removal into hosted access authority.
+
+Infrastructure lifecycle is likewise ordinary fact history. The service is
+invited into both the operations and target workspaces with `user_invite` and
+`user`; a target admin publishes `service_binding`; and the service presents a
+short-lived `service_req` plus an ordinary operations `service` request. Either
+workspace can end the relationship: deleting the binding ends the target half,
+and member removal ends either community half. Terminal member removal requires
+a rotated principal and fresh invitations for rejoin. `CapabilityReconciler`
+compares exact grant fingerprints, revokes stale provider credentials before
+creating replacements, and is idempotent after convergence. The deterministic
+suite exercises local and awaited/hosted gates, leave, removal, rotation,
+revocation failure, and retry. The opt-in direct S3 and R2 conformance commands
+at the top of `tests/test_provider_live.py` also realize, observe, and revoke a
+disposable provider capability inside their unique cleanup prefixes.
 
 Removal does not retroactively revoke validated storage. Once removal has
 propagated, peers stop granting that principal new sharing authority. Facts

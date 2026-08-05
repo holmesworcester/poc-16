@@ -22,7 +22,7 @@ MODULES = auth.MODULES + content.MODULES
 # Bump for any change in family extraction, policy, or query interpretation
 # that must rebuild the disposable full-peer projection.  Canonical fact
 # bytes and writer trees are never migrated; current code replays them.
-APP_VERSION = 4
+APP_VERSION = 5
 
 
 def _principal_namespaces(modules):
@@ -271,6 +271,7 @@ def has_control_action_sink(judgment, stream):
     content or another sink.
     """
     valids, _current_stream = semantic_evaluation(judgment, stream)
+    selected = {fact.fid for fact in control_projection(stream)}
     dependencies = {
         edge.fid
         for valid in valids
@@ -278,6 +279,7 @@ def has_control_action_sink(judgment, stream):
     }
     return any(
         valid.fact.fid not in dependencies
+        and valid.fact.fid in selected
         and (family := family_for(valid.fact.t)) is not None
         and family.DURABLE
         and family.POLICY.control_fact

@@ -8,6 +8,8 @@ from . import (
     push_endpoint,
     removal,
     request,
+    service_binding,
+    service_request,
     signature,
     user,
     user_invite,
@@ -27,4 +29,6 @@ MODULES = (
     push_endpoint,
     removal,
     request,
+    service_binding,
+    service_request,
 )

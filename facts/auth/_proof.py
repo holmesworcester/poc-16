@@ -50,10 +50,12 @@ def identity_closure(
     }
 
     def candidates(need):
+        source = facts.explicit_provider(request, need.role)
         matches = {
             fact.fid: fact
             for fact in supplied.values()
             if _offers(fact, need.name, need.a0, need.a1)
+            and (source is None or fact.fid == source)
         }
         matches.update({
             fact.fid: fact
@@ -61,6 +63,7 @@ def identity_closure(
                 workspace, need.name, need.a0, need.a1,
                 include_suppressed=True)
             if _offers(fact, need.name, need.a0, need.a1)
+            and (source is None or fact.fid == source)
         })
         return tuple(sorted(
             matches.values(), key=lambda fact: (fact.key, fact.fid)))

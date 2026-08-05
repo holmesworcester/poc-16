@@ -7,8 +7,8 @@ from tools import preflight
 EXPECTED_CHECKS = (
     ("Python syntax", (
         "python3", "-m", "compileall", "-q",
-        "core", "full_peer", "facts", "notifications", "adapters", "deploy",
-        "bench", "tests", "tools",
+        "core", "full_peer", "facts", "infrastructure", "notifications",
+        "adapters", "deploy", "bench", "tests", "tools",
     )),
     ("Repository authority layout", (
         "python3", "-m", "pytest", "-q", "tests/test_repository_layout.py",
