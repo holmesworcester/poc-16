@@ -27,6 +27,7 @@ from core.limits import (
     MAX_SEMANTIC_PILE_BYTES,
     MAX_WRITER_PACK_BYTES,
     MIN_HOSTED_MEMORY_BYTES,
+    InvalidEncoding,
     PayloadTooLarge,
     evaluator_peak_bound,
     evaluator_pile_byte_bound,
@@ -179,6 +180,27 @@ def test_pile_scanner_bounds_nesting_and_json_values_before_decode(
     monkeypatch.setattr(close_module, "decode_json", forbidden_decode)
     hostile = b'[' * (MAX_PILE_JSON_VALUES + 1)
     with pytest.raises(PayloadTooLarge, match="too many JSON values"):
+        check_pile_bounds(hostile)
+    assert not decoded
+
+
+@pytest.mark.parametrize("encoding", ("utf-8-sig", "utf-16", "utf-32"))
+def test_pile_scanner_rejects_autodetected_json_encodings_before_decode(
+        monkeypatch, encoding):
+    from core import close as close_module
+
+    decoded = False
+
+    def forbidden_decode(*_args, **_kwargs):
+        nonlocal decoded
+        decoded = True
+        raise AssertionError("alternate encoding reached JSON decode")
+
+    monkeypatch.setattr(close_module, "decode_json", forbidden_decode)
+    hostile = json.dumps({
+        "facts": [0] * (MAX_PILE_FACTS + 1),
+    }, separators=(",", ":")).encode(encoding)
+    with pytest.raises(InvalidEncoding, match="JSON encoding"):
         check_pile_bounds(hostile)
     assert not decoded
 

@@ -52,6 +52,12 @@ def check_pile_bounds(raw):
         raise InvalidEncoding("pile bytes")
     if len(raw) > MAX_SEMANTIC_PILE_BYTES:
         raise PayloadTooLarge("pile too large")
+    if any(byte >= 0x80 or byte < 0x20 and byte not in _JSON_SPACE
+           for byte in raw):
+        # canon() emits ASCII JSON (non-ASCII text is escaped). Reject BOMs,
+        # UTF-16/32 NULs, and raw controls before Python's bytes decoder can
+        # auto-detect another encoding and allocate an uncounted object graph.
+        raise InvalidEncoding("pile JSON encoding")
     values = _scan_json_values(raw)
     facts = _scan_root_facts(raw)
     if evaluator_peak_bound(len(raw), values, facts) \
