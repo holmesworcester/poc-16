@@ -1,6 +1,6 @@
 """Crash, bootstrap, and race coverage for per-writer notification cursors."""
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 
@@ -8,6 +8,7 @@ import facts
 from adapters.s3 import S3Config, S3Store
 from core.crypto import h, keypair
 from core.fact import canon, encode
+from core.limits import PAGE_BATCH
 from core.object_store import OutcomeUnknown
 from core.store import FsStore
 from core.writer_head import (
@@ -32,6 +33,7 @@ from notifications.discovery import (
     BOOTSTRAP_CURRENT,
     Cursor,
     CursorNotInitialized,
+    MAX_SCAN_PILES_PER_TURN,
     NotificationDiscovery,
     NotificationState,
     PENDING_CURRENT,
@@ -281,6 +283,15 @@ async def _drain(discovery, maximum=100):
     raise AssertionError("notification discovery did not become idle")
 
 
+async def _until(discovery, statuses, maximum=100):
+    """Advance bounded continuation turns without completing a publication."""
+    for _ in range(maximum):
+        result = await discovery.run_once()
+        if result.status in statuses:
+            return result
+    raise AssertionError(f"notification discovery did not reach {statuses}")
+
+
 def test_run_requires_explicit_bootstrap(tmp_path):
     node, workspace = _world(tmp_path)
     discovery = _discovery(
@@ -430,8 +441,8 @@ def test_carrier_failure_and_dropped_wake_republish_exact_body(tmp_path):
     event = message.post(node, workspace, "general", "retry", ts=3)
 
     with pytest.raises(RuntimeError, match="carrier unavailable"):
-        asyncio.run(_discovery(
-            node, workspace, store, RejectCarrier()).run_once())
+        asyncio.run(_until(_discovery(
+            node, workspace, store, RejectCarrier()), {"published"}))
     pending = _cursor(store).pending
     raw = store.get("obj/" + pending.oid)
     assert decode_hint(raw).facts == (event,)
@@ -452,8 +463,8 @@ def test_concurrent_scanners_republish_one_pending_body(tmp_path):
     asyncio.run(discovery.bootstrap_current())
     event = message.post(node, workspace, "general", "race", ts=3)
     with pytest.raises(RuntimeError):
-        asyncio.run(_discovery(
-            node, workspace, store, RejectCarrier()).run_once())
+        asyncio.run(_until(_discovery(
+            node, workspace, store, RejectCarrier()), {"published"}))
 
     carrier = BarrierCarrier()
 
@@ -486,7 +497,7 @@ def test_crash_after_mirror_before_cursor_cas_replays_unacked_head(tmp_path):
 
     carrier = MemoryCarrier([])
     retry = _discovery(node, workspace, base, carrier)
-    assert asyncio.run(retry.run_once()).status == "published"
+    assert asyncio.run(_until(retry, {"published"})).status == "published"
     assert decode_hint(carrier.payloads[0]).facts == (event,)
 
 
@@ -497,7 +508,7 @@ def test_completion_unknown_and_concurrent_completion_are_safe(tmp_path):
     discovery = _discovery(node, workspace, fault, MemoryCarrier([]))
     asyncio.run(discovery.bootstrap_current())
     message.post(node, workspace, "general", "accepted", ts=3)
-    asyncio.run(discovery.run_once())
+    asyncio.run(_until(discovery, {"published"}))
     raw = base.get("obj/" + _cursor(base).pending.oid)
     fault.unknown = True
 
@@ -517,7 +528,7 @@ def test_scan_stays_on_exact_head_when_writer_advances_mid_page(tmp_path):
     second = message.post(node, workspace, "general", "second", ts=11)
     pinned = _slot(node, workspace).head
 
-    assert asyncio.run(discovery.run_once()).status == "published"
+    assert asyncio.run(_until(discovery, {"published"})).status == "published"
     first_body = carrier.payloads[-1]
     assert decode_hint(first_body).head == pinned
     asyncio.run(_complete(discovery, first_body))
@@ -640,7 +651,7 @@ def test_scan_retry_replays_exact_slot_recorded_removal_root(tmp_path):
 
     carrier = MemoryCarrier([])
     retry = _discovery(node, workspace, base, carrier)
-    assert asyncio.run(retry.run_once()).status == "published"
+    assert asyncio.run(_until(retry, {"published"})).status == "published"
     reference = decode_hint(carrier.payloads[0])
     assert reference.head == pinned.head
     assert reference.facts == (event,)
@@ -656,13 +667,102 @@ def test_actual_async_stores_preserve_writer_cursor_protocol(tmp_path):
         generation_factory=lambda: GENERATION)
     asyncio.run(discovery.bootstrap_current())
     message.post(node, workspace, "general", "async", ts=3)
-    asyncio.run(discovery.run_once())
+    asyncio.run(_until(discovery, {"published"}))
 
     assert _cursor(state).pending is not None
     assert {name for name, _key in repository.calls} >= {
         "copy", "get", "list", "read"}
     assert {name for name, _key in state.calls} >= {
         "get", "read", "create", "cas"}
+
+
+def test_directory_continuation_opens_only_one_bounded_page_per_turn(
+        tmp_path):
+    repository_base = FsStore(str(tmp_path / "repository"))
+    rows = []
+    for ordinal in range(PAGE_BATCH + 17):
+        device = h(f"device:{ordinal:04d}".encode())
+        head = h(f"head:{ordinal:04d}".encode())
+        removal_root = h(f"removal:{ordinal:04d}".encode())
+        key = head_slot_key("a" * 64, device)
+        repository_base._replace(
+            key,
+            encode_slot(HeadSlot(
+                "a" * 64, device, head, removal_root)),
+        )
+        rows.append((device, head))
+    repository = AwaitedStore(repository_base)
+    state = FsStore(str(tmp_path / "cursor"))
+    discovery = NotificationDiscovery(
+        repository, state, "a" * 64, MemoryCarrier([]),
+        owner=OWNER, generation_factory=lambda: GENERATION)
+    asyncio.run(discovery.bootstrap_backfill())
+
+    async def mark_rejected():
+        cursor, token = await discovery.state._read()
+        rejected = await discovery._map_update(
+            "rejected", cursor.rejected, tuple(rows))
+        assert await discovery._cas_exact(
+            token, replace(cursor, rejected=rejected)) is not None
+
+    asyncio.run(mark_rejected())
+    repository.calls.clear()
+
+    first = asyncio.run(discovery.run_once())
+    first_calls = tuple(repository.calls)
+    repository.calls.clear()
+    second = asyncio.run(discovery.run_once())
+    second_calls = tuple(repository.calls)
+
+    assert first.status == "continued"
+    assert sum(name == "list" for name, _key in first_calls) == 1
+    assert sum(name == "read" for name, _key in first_calls) == PAGE_BATCH
+    assert second.status == "idle"
+    assert sum(name == "list" for name, _key in second_calls) == 1
+    assert sum(name == "read" for name, _key in second_calls) == 17
+    assert _cursor(state).directory_after is None
+
+
+def test_large_writer_suffix_persists_one_pile_continuation_per_turn(
+        tmp_path):
+    node, workspace = _world(tmp_path)
+    repository = AwaitedStore(node.store(workspace))
+    state = FsStore(str(tmp_path / "cursor"))
+    carrier = MemoryCarrier([])
+    discovery = NotificationDiscovery(
+        repository, state, workspace, carrier, owner=OWNER,
+        generation_factory=lambda: GENERATION)
+    asyncio.run(discovery.bootstrap_current())
+    expected = {
+        message.post(node, workspace, "general", f"event {ordinal}", ts=10 + ordinal)
+        for ordinal in range(5)
+    }
+    observed_sequences = []
+    statuses = []
+
+    for _ in range(100):
+        repository.calls.clear()
+        result = asyncio.run(discovery.run_once())
+        statuses.append(result.status)
+        assert sum(
+            name == "copy" for name, _key in repository.calls
+        ) <= MAX_SCAN_PILES_PER_TURN
+        cursor = _cursor(state)
+        if cursor.scan is not None:
+            observed_sequences.append(cursor.scan.sequence)
+        if result.status in {"published", "republished"}:
+            asyncio.run(_complete(discovery, carrier.payloads[-1]))
+        if result.status == "idle":
+            break
+    else:
+        raise AssertionError("bounded writer scan did not complete")
+
+    found = {
+        fid for raw in carrier.payloads for fid in decode_hint(raw).facts}
+    assert found == expected
+    assert statuses.count("published") == len(expected)
+    assert max(observed_sequences) >= len(expected)
+    assert observed_sequences == sorted(observed_sequences)
 
 
 def test_rebootstrap_generation_makes_old_delivery_noncurrent(tmp_path):
@@ -672,7 +772,7 @@ def test_rebootstrap_generation_makes_old_delivery_noncurrent(tmp_path):
     old = _discovery(node, workspace, store, carrier)
     asyncio.run(old.bootstrap_current())
     event = message.post(node, workspace, "general", "old wake", ts=3)
-    assert asyncio.run(old.run_once()).status == "published"
+    assert asyncio.run(_until(old, {"published"})).status == "published"
     old_raw = carrier.payloads[-1]
     old_reference = decode_hint(old_raw)
     assert old_reference.facts == (event,)
@@ -684,7 +784,7 @@ def test_rebootstrap_generation_makes_old_delivery_noncurrent(tmp_path):
         node.store(workspace), store, workspace, fresh_carrier,
         owner=OWNER, generation_factory=lambda: "f" * 64)
     asyncio.run(fresh.bootstrap_backfill())
-    assert asyncio.run(fresh.run_once()).status == "published"
+    assert asyncio.run(_until(fresh, {"published"})).status == "published"
     new_raw, = fresh_carrier.payloads
     new_reference = decode_hint(new_raw)
     assert new_reference.head == old_reference.head
@@ -717,16 +817,32 @@ def test_hint_and_cursor_codecs_are_canonical_and_reject_old_shape():
             None, "e" * 64, events + (EventRef("f" * 64, "f" * 64),))
 
     empty = empty_descriptor()
+    controls = {"root": h(b"controls"), "count": 1, "depth": 1}
     cursor = Cursor(
         "a" * 64, "b" * 64, "c" * 64, BOOTSTRAP_BACKFILL,
         True, empty, empty, empty,
-        Scan("d" * 64, "e" * 64, "f" * 64))
+        Scan(
+            "d" * 64, "e" * 64, "f" * 64,
+            "suffix", leaf_key(1), 1, controls),
+        None, "opaque-next-page")
     encoded_cursor = encode_cursor(cursor)
+    assert b'"format":"notification-writer-cursor-v2"' \
+        in encoded_cursor
+    assert b'"directory_after":"opaque-next-page"' in encoded_cursor
+    assert b'"phase":"suffix"' in encoded_cursor
+    assert b'"sequence":1' in encoded_cursor
+    assert b'"controls"' in encoded_cursor
     assert b'"removal_root"' in encoded_cursor
     assert b'"authority_root"' not in encoded_cursor
     assert decode_cursor(encoded_cursor) == cursor
     with pytest.raises(ValueError, match="cursor shape"):
+        decode_cursor(encoded_cursor.replace(
+            b"notification-writer-cursor-v2",
+            b"notification-writer-cursor-v1"))
+    with pytest.raises(ValueError, match="cursor shape"):
         decode_cursor(canon({"format": "notification-cursor-v3"}))
+    with pytest.raises(ValueError, match="notification cursor"):
+        replace(cursor, directory_after="")
 
     changed = {"root": h(b"map"), "count": 1, "depth": 1}
     with pytest.raises(ValueError, match="pending successor"):

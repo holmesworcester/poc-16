@@ -117,6 +117,14 @@ class CountingState:
         self.calls.append(("complete", args))
 
 
+async def _scan_until_published(discovery, maximum=100):
+    for _ in range(maximum):
+        result = await discovery.run_once()
+        if result.status == "published":
+            return result
+    raise AssertionError("notification scanner did not publish")
+
+
 def _world(tmp_path, provider=None):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
@@ -264,7 +272,8 @@ def test_rebootstrap_generation_prevents_paused_muted_worker_aba(tmp_path):
         node.store(workspace), store, workspace, old_carrier,
         owner=OWNER, generation_factory=lambda: GENERATION)
     asyncio.run(old_scanner.bootstrap_backfill())
-    assert asyncio.run(old_scanner.run_once()).status == "published"
+    assert asyncio.run(_scan_until_published(old_scanner)).status \
+        == "published"
     old_body, = old_carrier.payloads
     paused = PausingComplete(old_scanner.state)
 
@@ -281,7 +290,8 @@ def test_rebootstrap_generation_prevents_paused_muted_worker_aba(tmp_path):
             node.store(workspace), store, workspace, fresh_carrier,
             owner=OWNER, generation_factory=lambda: "f" * 64)
         await fresh_scanner.bootstrap_backfill()
-        assert (await fresh_scanner.run_once()).status == "published"
+        assert (await _scan_until_published(fresh_scanner)).status \
+            == "published"
         new_body, = fresh_carrier.payloads
         old_reference, new_reference = map(
             decode_hint, (old_body, new_body))

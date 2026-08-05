@@ -279,14 +279,18 @@ is `none`.
 
 `NotificationDiscovery` has a separate operational object store and CAS
 cursor. It lists the per-device head directory, pins one exact signed head,
-and uses the shared `RepositoryMirror` and `FactConsumer` to validate its new
-closed piles from that writer's acknowledged head. It then selects facts whose
-family declares a `notification_trigger` hook. The cursor keeps authenticated
-maps of acknowledged head OID by writer, already-emitted trigger FID, and exact
-rejected head OID by writer. Repeated closure dependencies therefore do not
-repeat notifications, and one malformed writer head is quarantined without
-being acknowledged or blocking other writers. Discovery does not consult
-SQLite, ingress, or a workspace-wide content root.
+and uses the same signed-head, append-only tree, control-declaration, and
+`FactConsumer` validation as ordinary mirroring. A v2 cursor durably pages both
+the writer directory and each pinned head: one turn opens at most one
+`PAGE_BATCH` directory/history page and validates at most one independently
+closed suffix pile. It then selects facts whose family declares a
+`notification_trigger` hook. The cursor keeps authenticated maps of
+acknowledged head OID by writer, already-emitted trigger FID, exact rejected
+head OID by writer, and controls observed during the current scan. Repeated
+closure dependencies therefore do not repeat notifications, and one malformed
+writer head is quarantined without being acknowledged or blocking other
+writers. Discovery does not consult SQLite, ingress, or a workspace-wide
+content root.
 
 Bootstrap is explicit: normal launch validates all current writer heads and
 marks their existing triggers seen, while a deliberate backfill starts with

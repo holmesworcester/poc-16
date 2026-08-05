@@ -1260,11 +1260,15 @@ non-carriable removal judgments, while the positive admission chain travels in
 each closure.
 
 Historical junk from a since-removed writer is bounded rather than trusted:
-directory reads are paged by `PAGE_BATCH`, one unknown writer head is scanned
-per discovery invocation, the ordinary head/tree/pile/fact ceilings apply, and
+each invocation opens at most one `PAGE_BATCH` directory page and persists its
+opaque provider continuation. One exact unknown head remains pinned across
+turns. Its cursor first checks at most one `PAGE_BATCH` authenticated-history
+page, then validates at most one independently closed suffix pile per turn and
+records the exact phase, leaf continuation, sequence, and observed-control map
+before proceeding. The ordinary head/tree/pile/fact ceilings still apply, and
 an invalid `(device, head)` is retained in the rejected map until that device
-advertises a different head. Removal therefore cannot turn one stale writer
-into an unbounded scan loop.
+advertises a different head. Removal therefore cannot turn either a directory
+page or one stale writer suffix into an unbounded invocation.
 
 The slot's recorded removal root remains pinned with the scan so a retry judges
 the same historical head. It does not decide present delivery eligibility.

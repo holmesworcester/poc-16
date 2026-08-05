@@ -215,7 +215,7 @@ def test_control_observer_escape_hatch_is_confined_to_non_authority_roles():
                 found[str(relative)] = count
     assert found == {
         "full_peer/sync.py": 1,
-        "notifications/discovery.py": 2,
+        "notifications/discovery.py": 1,
         "notifications/forest.py": 1,
     }
     node = text("full_peer/node.py")

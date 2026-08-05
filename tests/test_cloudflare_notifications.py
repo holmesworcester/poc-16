@@ -462,6 +462,15 @@ async def _scan_idle(env, maximum=100):
     raise AssertionError("Cloudflare scanner did not become idle")
 
 
+async def _scan_until(env, wanted, maximum=100):
+    """Run ordinary bounded schedule turns until one reaches ``wanted``."""
+    for _ in range(maximum):
+        status = await scanner.scan(env)
+        if status == wanted:
+            return status
+    raise AssertionError(f"Cloudflare scanner did not reach {wanted}")
+
+
 async def _bootstrap(env, mode):
     env.NOTIFICATION_BOOTSTRAP_MODE = mode
     try:
@@ -479,7 +488,7 @@ def _published_world(tmp_path):
     canonical_reader = CanonicalReadService(workspace, canonical)
     scan_env = _scanner_env(workspace, canonical_reader, state, queue)
     assert run(_bootstrap(scan_env, "backfill")) == "bootstrapped-backfill"
-    assert run(scanner.scan(scan_env)) == "published"
+    assert run(_scan_until(scan_env, "published")) == "published"
     assert len(queue.bodies) == 1
     assert decode_hint(queue.bodies[0].encode()).facts == (event,)
     return (
@@ -531,7 +540,7 @@ def test_replacement_queue_republishes_and_completes_one_durable_cursor(
     old_env = _scanner_env(
         workspace, canonical_reader, state, old_queue)
     assert run(_bootstrap(old_env, "backfill")) == "bootstrapped-backfill"
-    assert run(scanner.scan(old_env)) == "published"
+    assert run(_scan_until(old_env, "published")) == "published"
     exact, = old_queue.bodies
 
     # The durable pending body belongs to semantic delivery authority, not to
@@ -779,7 +788,7 @@ def test_bootstrap_generation_blocks_paused_muted_worker_aba(tmp_path):
     queue.bodies.clear()
     assert run(_bootstrap(state_service.env, "backfill")) \
         == "bootstrapped-backfill"
-    assert run(scanner.scan(state_service.env)) == "published"
+    assert run(_scan_until(state_service.env, "published")) == "published"
     old_body, = queue.bodies
     paused, fcm = PausingComplete(state_service), FcmService()
     old_item = QueueMessage(old_body, "old-muted")
@@ -797,7 +806,8 @@ def test_bootstrap_generation_blocks_paused_muted_worker_aba(tmp_path):
         queue.bodies.clear()
         assert await _bootstrap(state_service.env, "backfill") \
             == "bootstrapped-backfill"
-        assert await scanner.scan(state_service.env) == "published"
+        assert await _scan_until(state_service.env, "published") \
+            == "published"
         new_body, = queue.bodies
         old_hint, new_hint = map(
             lambda body: decode_hint(body.encode()),

@@ -2,13 +2,13 @@
 
 The operational cursor owns three small authenticated maps: acknowledged head
 OID by writer, exact rejected head OID by writer, and already-emitted trigger
-FID by fact-object OID. One scan is pinned to one exact signed writer slot.
-RepositoryMirror and FactConsumer do all head, tree, pile-signature, closure,
-and fact validation. No workspace content root is read, written, or retained
-here.
+FID by fact-object OID. One scan is pinned to one exact signed writer slot and
+persists authenticated history/suffix continuation. FactConsumer performs the
+same pile-signature, closure, and fact validation as ordinary mirroring. No
+workspace content root is read, written, or retained here.
 """
 import asyncio
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import secrets
 
 import facts
@@ -18,38 +18,47 @@ from core.crypto import h
 from core.fact import canon, decode
 from core.limits import (
     MAX_FACT_BYTES,
+    MAX_HEAD_CONTROL_PILES,
     MAX_MERKLE_PAGE_BYTES,
+    MAX_OBJECT_BYTES,
+    MAX_SEMANTIC_PILE_BYTES,
     PAGE_BATCH,
     PayloadTooLarge,
     decode_json,
 )
 from core.object_store import (
     ABSENT,
-    CREATED,
-    EXISTS,
     STALE,
     Applied,
-    ListPage,
     OutcomeUnknown,
     OPERATIONAL_CURSOR_KEY,
     Versioned,
-    VersionToken,
     async_store,
     ensure_object_async,
     store_namespace,
 )
 from core.shape import valid_fid
 from core.writer_head import (
-    HeadSlot,
+    MAX_WRITER_HEAD_BYTES,
+    decode_head,
     decode_slot_at,
-    encode_slot,
-    head_slot_key,
     head_slot_prefix,
+    require_bound_head,
+    validate_advance,
 )
 from core.writer_repository import (
     FactConsumer,
     RepositoryMirror,
     ValidatedBatch,
+)
+from core.writer_tree import (
+    EMPTY_TREE,
+    LEAF_PREFIX,
+    MAX_WRITER_SEQUENCE,
+    leaf_key,
+    parse_leaf_key,
+    tree_reader,
+    validate_extension_awaited,
 )
 
 from .carrier import CarrierAccepted
@@ -64,8 +73,10 @@ from .hints import (
 )
 
 
-CURSOR_FORMAT = "notification-writer-cursor-v1"
+CURSOR_FORMAT = "notification-writer-cursor-v2"
 MAX_CURSOR_BYTES = 16 * 1024
+MAX_SCAN_PILES_PER_TURN = 1
+SCAN_PHASES = frozenset(("base", "suffix", "complete"))
 BOOTSTRAP_CURRENT = "current"
 BOOTSTRAP_BACKFILL = "backfill"
 PENDING_CURRENT = "current"
@@ -111,11 +122,22 @@ class Scan:
     device: str
     head: str
     removal_root: str
+    phase: str = "base"
+    after: str | None = None
+    sequence: int = 0
+    controls: dict = field(default_factory=empty_descriptor)
 
     def __post_init__(self):
         if not all(valid_fid(value) for value in (
-                self.device, self.head, self.removal_root)):
+                self.device, self.head, self.removal_root)) \
+                or self.phase not in SCAN_PHASES \
+                or self.after is not None and (
+                    not isinstance(self.after, str)
+                    or parse_leaf_key(self.after) < 1) \
+                or type(self.sequence) is not int \
+                or not 0 <= self.sequence <= MAX_WRITER_SEQUENCE:
             raise ValueError("notification scan")
+        object.__setattr__(self, "controls", _descriptor(self.controls))
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +165,7 @@ class Cursor:
     seen: dict
     scan: Scan | None = None
     pending: Pending | None = None
+    directory_after: str | None = None
 
     def __post_init__(self):
         if not valid_fid(self.workspace) or not valid_fid(self.owner) \
@@ -153,7 +176,10 @@ class Cursor:
                 or self.scan is not None and not isinstance(self.scan, Scan) \
                 or self.pending is not None and (
                     not isinstance(self.pending, Pending)
-                    or self.scan is None):
+                    or self.scan is None) \
+                or self.directory_after is not None and not isinstance(
+                    self.directory_after, str) \
+                or self.directory_after == "":
             raise ValueError("notification cursor")
         object.__setattr__(self, "heads", _descriptor(self.heads))
         object.__setattr__(self, "rejected", _descriptor(self.rejected))
@@ -162,7 +188,8 @@ class Cursor:
                 self.heads != empty_descriptor()
                 or self.rejected != empty_descriptor()
                 or self.seen != empty_descriptor()
-                or self.scan is not None or self.pending is not None):
+                or self.scan is not None or self.pending is not None
+                or self.directory_after is not None):
             raise ValueError("notification cursor initialization")
         if self.pending is not None and self.pending.heads != self.heads:
             raise ValueError("notification pending successor")
@@ -174,7 +201,7 @@ class Cursor:
             self.workspace, self.owner, self.generation, self.bootstrap,
             self.initialized, self.pending.heads, self.rejected,
             self.pending.seen,
-            self.scan,
+            self.scan, None, self.directory_after,
         )
 
 
@@ -196,9 +223,13 @@ def _descriptor_body(value):
 
 def _scan_body(value):
     return None if value is None else {
+        "after": value.after,
+        "controls": _descriptor_body(value.controls),
         "device": value.device,
         "head": value.head,
+        "phase": value.phase,
         "removal_root": value.removal_root,
+        "sequence": value.sequence,
     }
 
 
@@ -212,6 +243,7 @@ def encode_cursor(cursor):
     }
     raw = canon({
         "bootstrap": cursor.bootstrap,
+        "directory_after": cursor.directory_after,
         "format": CURSOR_FORMAT,
         "generation": cursor.generation,
         "heads": _descriptor_body(cursor.heads),
@@ -232,14 +264,16 @@ def decode_cursor(raw):
     value = decode_json(raw, MAX_CURSOR_BYTES, "notification cursor")
     if not isinstance(value, dict) or set(value) != {
             "bootstrap", "format", "generation", "heads", "initialized",
-            "owner", "pending", "rejected", "scan", "seen", "workspace"} \
+            "directory_after", "owner", "pending", "rejected", "scan",
+            "seen", "workspace"} \
             or value.get("format") != CURSOR_FORMAT:
         raise ValueError("notification cursor shape")
     raw_scan = value.get("scan")
     raw_pending = value.get("pending")
     if raw_scan is not None and (
             not isinstance(raw_scan, dict) or set(raw_scan) != {
-                "device", "head", "removal_root"}):
+                "after", "controls", "device", "head", "phase",
+                "removal_root", "sequence"}):
         raise ValueError("notification scan shape")
     if raw_pending is not None and (
             not isinstance(raw_pending, dict) or set(raw_pending) != {
@@ -247,7 +281,9 @@ def decode_cursor(raw):
         raise ValueError("notification pending shape")
     scan = None if raw_scan is None else Scan(
         raw_scan.get("device"), raw_scan.get("head"),
-        raw_scan.get("removal_root"))
+        raw_scan.get("removal_root"), raw_scan.get("phase"),
+        raw_scan.get("after"), raw_scan.get("sequence"),
+        raw_scan.get("controls"))
     pending = None if raw_pending is None else Pending(
         raw_pending.get("oid"), raw_pending.get("heads"),
         raw_pending.get("seen"))
@@ -255,7 +291,8 @@ def decode_cursor(raw):
         value.get("workspace"), value.get("owner"),
         value.get("generation"), value.get("bootstrap"),
         value.get("initialized"), value.get("heads"),
-        value.get("rejected"), value.get("seen"), scan, pending)
+        value.get("rejected"), value.get("seen"), scan, pending,
+        value.get("directory_after"))
     if encode_cursor(cursor) != raw:
         raise ValueError("notification cursor encoding")
     return cursor
@@ -355,99 +392,6 @@ class _CollectState:
                 additions.append(fid)
         self.projected[device] = head
         return tuple(additions)
-
-
-class _PinnedSource:
-    """Expose one exact observed slot while delegating immutable reads."""
-
-    def __init__(self, source, workspace, scan):
-        self.source = source
-        self.key = head_slot_key(workspace, scan.device)
-        self.raw = encode_slot(HeadSlot(
-            workspace, scan.device, scan.head, scan.removal_root))
-
-    async def get_bounded(self, key, maximum):
-        return await self.source.get_bounded(key, maximum)
-
-    async def copy_pile_object(self, oid, maximum, write):
-        return await self.source.copy_pile_object(oid, maximum, write)
-
-    async def read_versioned(self, key):
-        if key == self.key:
-            return Versioned(self.raw, VersionToken(h(self.raw)))
-        return await self.source.read_versioned(key)
-
-    async def list_page(self, prefix, cursor=None, limit=PAGE_BATCH):
-        if cursor is not None or not self.key.startswith(prefix) or limit < 1:
-            return ListPage((), None)
-        return ListPage((self.key,), None)
-
-
-class _ScanStore:
-    """Discarded mirror target pinned to the cursor's acknowledged head.
-
-    RepositoryMirror commits its accepted slot before returning.  That is the
-    right durable boundary for a peer, but notification progress belongs to
-    the cursor CAS.  Keep the mirror side effects in memory so a crash before
-    that CAS cannot make a retry mistake an already-mirrored head for an
-    acknowledged one.  Immutable fallback reads are safe because every body
-    is still verified by its content address.
-    """
-
-    def __init__(self, source, workspace, scan, base):
-        self.source = source
-        self.values = {}
-        self.key = head_slot_key(workspace, scan.device)
-        if base is not None:
-            self.values[self.key] = encode_slot(HeadSlot(
-                workspace, scan.device, base, scan.removal_root))
-
-    async def get_bounded(self, key, maximum):
-        raw = self.values.get(key)
-        return await self.source.get_bounded(key, maximum) \
-            if raw is None else raw
-
-    async def copy_pile_object(self, oid, maximum, write):
-        raw = self.values.get("obj/" + oid)
-        if raw is None:
-            return await self.source.copy_pile_object(oid, maximum, write)
-        if len(raw) > maximum:
-            raise PayloadTooLarge("notification scan pile")
-        write(raw)
-        return len(raw)
-
-    async def read_versioned(self, key):
-        raw = self.values.get(key)
-        return ABSENT if raw is None else Versioned(
-            raw, VersionToken(h(raw)))
-
-    async def put_if_absent(self, key, raw):
-        incumbent = self.values.get(key)
-        if incumbent is None:
-            self.values[key] = raw
-            return CREATED
-        if incumbent != raw:
-            raise ValueError("notification scan object conflict")
-        return EXISTS
-
-    async def cas(self, key, token, raw):
-        current = await self.read_versioned(key)
-        current_token = current.token \
-            if isinstance(current, Versioned) else ABSENT
-        if current_token != token:
-            return STALE
-        self.values[key] = raw
-        return Applied(VersionToken(h(raw)))
-
-    async def list_page(self, prefix, cursor=None, limit=PAGE_BATCH):
-        keys = sorted(
-            key for key in self.values
-            if key.startswith(prefix) and (cursor is None or key > cursor))
-        selected = tuple(keys[:limit])
-        return ListPage(
-            selected,
-            selected[-1] if len(keys) > limit else None,
-        )
 
 
 class NotificationDiscovery:
@@ -647,39 +591,181 @@ class NotificationDiscovery:
         return await self._bootstrap(BOOTSTRAP_BACKFILL)
 
     async def _candidate(self, cursor):
+        """Inspect at most one directory page and return durable progress."""
         prefix = head_slot_prefix(self.workspace)
-        after = None
-        while True:
-            page = await self.repository_store.list_page(
-                prefix, after, PAGE_BATCH)
-            opened = await asyncio.gather(*(
-                self.repository_store.read_versioned(key)
-                for key in page.keys), return_exceptions=True)
-            devices = []
-            slots = []
-            for key, value in zip(page.keys, opened):
-                if isinstance(value, BaseException):
-                    raise value
-                if not isinstance(value, Versioned):
-                    raise ValueError("listed writer slot disappeared")
-                slot = decode_slot_at(key, value.value)
-                if slot is None:
-                    continue
-                devices.append(slot.device)
-                slots.append(slot)
-            acknowledged = await self._map_points(
-                "heads", cursor.heads, devices)
-            rejected = await self._map_points(
-                "rejected", cursor.rejected, devices)
-            for slot in slots:
-                base = acknowledged[slot.device]
-                if base == slot.head or rejected[slot.device] == slot.head:
-                    continue
-                return Scan(
-                    slot.device, slot.head, slot.removal_root)
-            if page.cursor is None:
-                return None
-            after = page.cursor
+        page = await self.repository_store.list_page(
+            prefix, cursor.directory_after, PAGE_BATCH)
+        if len(page.keys) > PAGE_BATCH:
+            raise ValueError("notification directory page overflow")
+        opened = await asyncio.gather(*(
+            self.repository_store.read_versioned(key)
+            for key in page.keys), return_exceptions=True)
+        devices = []
+        slots = []
+        for key, value in zip(page.keys, opened):
+            if isinstance(value, BaseException):
+                raise value
+            if not isinstance(value, Versioned):
+                raise ValueError("listed writer slot disappeared")
+            slot = decode_slot_at(key, value.value)
+            devices.append(slot.device)
+            slots.append(slot)
+        acknowledged = await self._map_points(
+            "heads", cursor.heads, devices)
+        rejected = await self._map_points(
+            "rejected", cursor.rejected, devices)
+        for slot in slots:
+            base = acknowledged[slot.device]
+            if base == slot.head or rejected[slot.device] == slot.head:
+                continue
+            return Scan(
+                slot.device, slot.head, slot.removal_root), None
+        return None, page.cursor
+
+    async def _repository_object(self, oid, maximum):
+        raw = await self._get(
+            self.repository_store, "obj/" + oid, maximum)
+        if not isinstance(raw, bytes) or h(raw) != oid:
+            raise ValueError("notification repository object")
+        return raw
+
+    async def _tree_object(self, oid):
+        return await self._repository_object(oid, MAX_OBJECT_BYTES)
+
+    async def _head(self, oid, scan):
+        raw = await self._repository_object(oid, MAX_WRITER_HEAD_BYTES)
+        candidate = decode_head(raw)
+        binding = closure_writer_binding(
+            self.workspace, scan.device, scan.removal_root, candidate)
+        return require_bound_head(candidate, binding)
+
+    async def _pile(self, oid):
+        value = bytearray()
+        copied = await self.repository_store.copy_pile_object(
+            oid, MAX_SEMANTIC_PILE_BYTES, value.extend)
+        raw = bytes(value)
+        if copied is None or copied != len(raw) or h(raw) != oid:
+            raise ValueError("notification scan pile")
+        return raw
+
+    async def _scan_context(self, cursor):
+        scan = cursor.scan
+        base_oid = (await self._map_points(
+            "heads", cursor.heads, (scan.device,)))[scan.device]
+        candidate = await self._head(scan.head, scan)
+        accepted = None if base_oid is None else await self._head(
+            base_oid, scan)
+        if accepted is not None:
+            validate_advance(accepted, candidate, closure_writer_binding(
+                self.workspace, scan.device, scan.removal_root, candidate))
+        accepted_control = EMPTY_TREE if accepted is None else accepted.control
+        control_delta = candidate.control.count - accepted_control.count
+        if not 0 <= control_delta <= MAX_HEAD_CONTROL_PILES:
+            raise PayloadTooLarge("notification control delta")
+        controls = frozenset(
+            oid for _key, oid in await validate_extension_awaited(
+                accepted_control,
+                candidate.control,
+                self.workspace,
+                scan.device,
+                self._tree_object,
+                self._tree_object,
+            )
+        )
+        return base_oid, accepted, candidate, controls
+
+    async def _scan_page(self, cursor):
+        """Validate at most one tree-diff page and one closed pile."""
+        scan = cursor.scan
+        base_oid, accepted, candidate, controls = await self._scan_context(
+            cursor)
+        accepted_tree = EMPTY_TREE if accepted is None else accepted.tree
+        if scan.phase == "complete":
+            if scan.sequence != candidate.sequence:
+                raise ValueError("notification scan completion")
+            return base_oid, candidate, controls, scan, None, True
+
+        if scan.phase == "base":
+            if accepted_tree != EMPTY_TREE:
+                page = await tree_reader(
+                    accepted_tree,
+                    self.workspace,
+                    scan.device,
+                    self._tree_object,
+                ).diff_page_awaited(
+                    tree_reader(
+                        candidate.tree,
+                        self.workspace,
+                        scan.device,
+                        self._tree_object,
+                    ),
+                    after=scan.after,
+                    # This pass compares authenticated metadata only; pile
+                    # bodies remain subject to MAX_SCAN_PILES_PER_TURN below.
+                    limit=PAGE_BATCH,
+                )
+                if page.differing:
+                    raise ValueError("notification writer rewrote history")
+                if page.cursor is not None:
+                    return (
+                        base_oid, candidate, controls,
+                        replace(scan, after=page.cursor), None, False,
+                    )
+            scan = replace(
+                scan,
+                phase="suffix",
+                after=None,
+                sequence=accepted_tree.count,
+            )
+
+        page = await tree_reader(
+            candidate.tree,
+            self.workspace,
+            scan.device,
+            self._tree_object,
+        ).diff_page_awaited(
+            tree_reader(
+                accepted_tree,
+                self.workspace,
+                scan.device,
+                self._tree_object,
+            ),
+            start=leaf_key(accepted_tree.count + 1),
+            stop=LEAF_PREFIX + "\uffff",
+            after=scan.after,
+            limit=MAX_SCAN_PILES_PER_TURN,
+        )
+        if len(page.differing) > MAX_SCAN_PILES_PER_TURN:
+            raise ValueError("notification scan pile page")
+        state = None
+        sequence = scan.sequence
+        if page.differing:
+            key, pile_oid = page.differing[0]
+            if key != leaf_key(sequence + 1):
+                raise ValueError("notification writer noncontiguous suffix")
+            raw = await self._pile(pile_oid)
+            state = _CollectState()
+            consumer = FactConsumer(self.workspace, state)
+            batch = consumer.prepare_batch(
+                ((raw, scan.device),), owner=candidate.owner)
+            consumer.commit(batch, device=scan.device, head=scan.head)
+            actual_controls = set(batch.control_piles)
+            if actual_controls - controls:
+                raise ValueError("notification undeclared control pile")
+            sequence += 1
+        complete = page.cursor is None
+        if complete and sequence != candidate.sequence:
+            raise ValueError("notification writer suffix coverage")
+        next_scan = replace(
+            scan,
+            phase="complete" if complete else "suffix",
+            after=None if complete else page.cursor,
+            sequence=sequence,
+        )
+        processed = None if state is None else (
+            state, tuple(batch.control_piles))
+        return (
+            base_oid, candidate, controls, next_scan, processed, complete)
 
     async def _pending_body(self, cursor):
         raw = await self._get(
@@ -705,12 +791,6 @@ class NotificationDiscovery:
         if not isinstance(accepted, CarrierAccepted):
             raise TypeError("notification carrier did not accept hint")
 
-    async def _clear_stale_scan(self, cursor, token):
-        desired = replace(cursor, scan=None)
-        if await self._cas_exact(token, desired) is None:
-            return DiscoveryResult("raced", cursor.scan.head)
-        return DiscoveryResult("stale", cursor.scan.head)
-
     async def _reject_scan(self, cursor, token):
         rejected = await self._map_update(
             "rejected", cursor.rejected,
@@ -722,25 +802,29 @@ class NotificationDiscovery:
 
     async def _scan(self, cursor, token):
         scan = cursor.scan
-        base = (await self._map_points(
-            "heads", cursor.heads, (scan.device,))
-        )[scan.device]
-        state = _CollectState({scan.device: base})
-        target = _ScanStore(
-            self.repository_store, self.workspace, scan, base)
-        result = await RepositoryMirror(
-            self.workspace, target,
-            closure_writer_binding, FactConsumer(self.workspace, state),
-            observe_controls=True,
-        ).sync_from(_PinnedSource(
-            self.repository_store, self.workspace, scan))
-        if result.errors:
+        try:
+            base, _candidate, controls, next_scan, processed, complete = \
+                await self._scan_page(cursor)
+        except ValueError:
             return await self._reject_scan(cursor, token)
-        if state.projected_head(scan.device) != scan.head:
-            return await self._clear_stale_scan(cursor, token)
 
-        rows = await self._unseen(
-            cursor.seen, self._trigger_rows(state))
+        if processed is not None:
+            state, actual_controls = processed
+            if actual_controls:
+                next_controls = await self._map_update(
+                    "scan-controls",
+                    next_scan.controls,
+                    tuple((oid, oid) for oid in actual_controls),
+                )
+                next_scan = replace(next_scan, controls=next_controls)
+            rows = await self._unseen(
+                cursor.seen, self._trigger_rows(state))
+        else:
+            rows = ()
+
+        if complete and next_scan.controls["count"] != len(controls):
+            return await self._reject_scan(cursor, token)
+
         page = rows[:self.page_rows]
         if page:
             events = []
@@ -756,12 +840,27 @@ class NotificationDiscovery:
                 "seen", cursor.seen,
                 tuple((event.fid, event.oid) for event in events))
             pending = Pending(oid, cursor.heads, seen)
-            desired = replace(cursor, pending=pending)
+            # A deliberately small delivery page may not cover every trigger
+            # in this one closed pile. Re-evaluate that same bounded pile after
+            # completion; the durable seen map selects the next page.
+            successor = scan if len(rows) > len(page) else next_scan
+            if next_scan.controls != scan.controls:
+                successor = replace(
+                    successor, controls=next_scan.controls)
+            desired = replace(
+                cursor, scan=successor, pending=pending)
             if await self._cas_exact(token, desired) is None:
                 return DiscoveryResult("raced", scan.head)
             await self._publish(raw)
             return DiscoveryResult(
                 "published", scan.head, None, oid)
+
+        if not complete:
+            desired = replace(cursor, scan=next_scan)
+            if await self._cas_exact(token, desired) is None:
+                return DiscoveryResult("raced", scan.head)
+            return DiscoveryResult(
+                "continued", scan.head, next_scan.after)
 
         heads = await self._map_update(
             "heads", cursor.heads, ((scan.device, scan.head),))
@@ -779,10 +878,24 @@ class NotificationDiscovery:
                 "republished", cursor.scan.head, None,
                 cursor.pending.oid)
         if cursor.scan is None:
-            candidate = await self._candidate(cursor)
+            candidate, continuation = await self._candidate(cursor)
             if candidate is None:
-                return DiscoveryResult("idle")
-            desired = replace(cursor, scan=candidate)
+                if continuation == cursor.directory_after:
+                    return DiscoveryResult("idle")
+                desired = replace(
+                    cursor, directory_after=continuation)
+                next_token = await self._cas_exact(token, desired)
+                if next_token is None:
+                    return DiscoveryResult("raced")
+                return DiscoveryResult(
+                    "continued" if continuation is not None else "idle",
+                    continuation=continuation,
+                )
+            desired = replace(
+                cursor,
+                scan=candidate,
+                directory_after=continuation,
+            )
             next_token = await self._cas_exact(token, desired)
             if next_token is None:
                 return DiscoveryResult("raced", candidate.head)
