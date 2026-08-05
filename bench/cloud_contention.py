@@ -32,6 +32,10 @@ from peerlog.log import WriterLog
 
 
 THROTTLE_TOKENS = ("SlowDown", "TooManyRequests", "429", "503", "ServiceUnavailable")
+REQUEST_METRICS = (
+    "gets", "puts", "cas", "lists", "multipart_creates", "part_copies",
+    "multipart_completes",
+)
 
 
 @dataclass
@@ -61,6 +65,32 @@ def _classify(error, outcome):
 
 def _make_provider(factory):
     return factory()
+
+
+def provider_request_report(providers):
+    """Conservatively count and price every operation made by the probe."""
+    providers = tuple({
+        id(provider): provider for provider in providers
+    }.values())
+    operations = {
+        name: sum(getattr(provider.metrics, name) for provider in providers)
+        for name in REQUEST_METRICS
+    }
+    class_a = sum(operations[name] for name in (
+        "puts", "cas", "lists", "multipart_creates", "part_copies",
+        "multipart_completes",
+    ))
+    class_b = operations["gets"]
+    return {
+        "operations": operations,
+        "class_a": class_a,
+        "class_b": class_b,
+        "projected_r2_usd": round(
+            class_a * 4.50 / 1_000_000
+            + class_b * 0.36 / 1_000_000,
+            8,
+        ),
+    }
 
 
 def probe_directory_contention(factory, workspace, writers, rounds, announce):
@@ -202,6 +232,14 @@ def main():
         shared = MemoryCloud()
         factory = lambda: shared  # noqa: E731 - one in-memory provider
 
+    providers = []
+    untracked_factory = factory
+
+    def factory():
+        result = untracked_factory()
+        providers.append(result)
+        return result
+
     report = {"target": "live-r2" if args.live_r2 else "memory",
               "prefix": prefix}
 
@@ -253,6 +291,7 @@ def main():
         "writes_per_second": round(
             outcome.published / outcome.seconds, 2) if outcome.seconds else None,
     }
+    report["provider_requests"] = provider_request_report(providers)
 
     print(json.dumps(report, indent=2))
 
