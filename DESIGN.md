@@ -963,17 +963,18 @@ that enforcement-window trade stated. Tips otherwise serve as deterministic
 cache keys: identical control coverage yields identical tips at every holder,
 so equal tips short-circuit whole subjects.
 
-The weak tier is scoped to own path plus tip, permanently. Historical
-membership is an unexpirable credential — old device signatures never stop
-verifying — so whatever this tier serves, it serves every past member
-forever. It therefore returns nothing but the requester's own path (their
-exclusion, or the removal fact that ended their membership) and the current
-tip, both computed by the recipient from its own tree; raw control
-subsequences are never served on this tier. That is sufficient for a subject
-of uncertain standing to learn its status and why, refresh, retry, or seek
-readmission — its own admission chain already lives in its own log — and it
-is the cycle breaker: proving present standing requires reading removal
-state, so removal state must be readable on historical standing alone.
+There is no separate weak tier. Because the recipient judges by lookup, a
+caller proves nothing in order to be told its standing: every request is
+answered from its row, and the answer's richness follows the row. UNKNOWN
+fails closed and learns nothing. ACTIVE is rejected, and the rejection itself
+carries the caller's own removal path and the recipient's tip — the tree row
+is the historical record of admission, so no historical-membership credential
+is verified and no standalone read route exists. CLEAR proceeds. The old
+bootstrap cycle — proving standing would require reading removal state —
+dissolves rather than being broken: subjects never construct standing proofs,
+so they never need removal state. A past member can only ever learn its own
+story, delivered inside its own rejection; population privacy needs no
+scoping rule because there is no readable surface to scope.
 
 The lookup must stay zero-to-one store reads. The judgment tree is stored
 fetchable-whole and cached against the pin's entity tag, revalidated with one
@@ -988,12 +989,13 @@ The hosted store deliberately parses nothing, so its rows arrive as the
 bounded canonical plan inside the permit turn above. Both apply control
 effects before exposing the transition they authorize.
 
-Status: the hosted half of this section — strong and weak requests, the
-private tree, permits, pins — is the running implementation. The peer-side
-gate instance, the derived tip index, and the peer-served weak tier land with
-`poc-16-6j4.37`. Echoing tips relaxes this section's root-withholding to
-pairwise disclosure once that lands; the population-privacy floor becomes
-hashed subject ids plus own-path-only weak reads.
+Status: the hosted half of this section — strong requests, the private tree,
+permits, pins — is the running implementation, and the running standalone
+weak route (`POST /removal/path`) is subsumed by rejection payloads when
+`poc-16-6j4.37` lands. The peer-side gate instance and the derived tip index
+land with the same bead. Echoing tips relaxes this section's root-withholding
+to pairwise disclosure once that lands; the population-privacy floor becomes
+hashed subject ids plus own-story-in-own-rejection.
 
 ## 8. Suppression and deterministic union
 
