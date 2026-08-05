@@ -1,4 +1,6 @@
 """facts/auth/user.py — invite redemption and workspace membership."""
+from nacl.exceptions import CryptoError
+
 from core.close import decode_signed_pile
 from core.crypto import box_decrypt, kdf, load_sk, sign, verify
 from core.fact import Fact, Need, workspace_of
@@ -66,8 +68,12 @@ def accept(node, link, name):
     from core.kernel import drain
 
     seed, peer, encrypted = user_invite.decode_artifact(link)
+    try:
+        compressed = box_decrypt(kdf(seed, "key"), encrypted)
+    except CryptoError as error:
+        raise ValueError("invite ciphertext") from error
     workspace, invite_secret, pile = user_invite.decode_blob(
-        box_decrypt(kdf(seed, "key"), encrypted))
+        compressed)
     bootstrap = decode_signed_pile(pile, workspace).facts
     judgment = drain(bootstrap, workspace)
     if not judgment.ok:

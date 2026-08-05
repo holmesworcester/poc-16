@@ -19,6 +19,7 @@ from core.close import ClosedPileEvaluator, InvalidPile
 from core.limits import (
     MAX_INVITE_BYTES,
     MAX_INVITE_LINK_BYTES,
+    MAX_INVITE_QR_BYTES,
     PayloadTooLarge,
 )
 from full_peer.node import FullPeer
@@ -306,6 +307,21 @@ def test_invite_compression_fails_bounded_and_closed(
     assert node.workspaces() == []
 
 
+def test_tampered_invite_ciphertext_is_a_clean_client_error(tmp_path):
+    inviter = FullPeer(str(tmp_path / "inviter"))
+    inviter.peer_address = "https://offline.invalid"
+    workspace = facts.auth.workspace.create(inviter, "inviter", ts=1)
+    link = user_invite_family.make(inviter, workspace)
+    seed, peer, encrypted = user_invite_family.decode_artifact(link)
+    damaged = user_invite_family._encode_artifact(
+        seed, peer, encrypted[:-1] + bytes((encrypted[-1] ^ 1,)))
+    joiner = FullPeer(str(tmp_path / "joiner"))
+
+    with pytest.raises(ValueError, match="invite ciphertext"):
+        user_family.accept(joiner, damaged, "joiner")
+    assert joiner.workspaces() == []
+
+
 def test_invite_creation_checks_encrypted_size_without_store(
         tmp_path, monkeypatch):
     node = FullPeer(str(tmp_path / "inviter"))
@@ -333,12 +349,13 @@ def test_invite_creation_checks_encrypted_size_without_store(
     assert store.list("invite/") == []
 
 
-def test_chained_members_invite_offline_and_fit_one_qr(tmp_path, monkeypatch):
+def test_chained_members_invite_offline_by_qr_then_deeper_link(
+        tmp_path, monkeypatch):
     alice = FullPeer(str(tmp_path / "alice"))
     alice.peer_address = "https://alice.invalid"
     workspace = facts.auth.workspace.create(alice, "alice", ts=1)
     bob_link = user_invite_family.make(alice, workspace)
-    assert len(bob_link.encode("ascii")) <= MAX_INVITE_LINK_BYTES
+    assert len(bob_link.encode("ascii")) <= MAX_INVITE_QR_BYTES
 
     monkeypatch.setattr(
         "urllib.request.urlopen",
@@ -351,13 +368,28 @@ def test_chained_members_invite_offline_and_fit_one_qr(tmp_path, monkeypatch):
     # Bob's closure contains Alice's earlier invitation as authority. The
     # one-time invite public key selects Bob's new invitation unambiguously.
     carol_link = user_invite_family.make(bob, workspace)
-    assert len(carol_link.encode("ascii")) <= MAX_INVITE_LINK_BYTES
+    assert len(carol_link.encode("ascii")) <= MAX_INVITE_QR_BYTES
     carol = FullPeer(str(tmp_path / "carol"))
     assert user_family.accept(carol, carol_link, "carol") == workspace
     assert carol.local_writer_binding(workspace).device \
         == carol.identity(workspace)[1]
-    assert {row["name"] for row in user_family.members(carol, workspace)} \
-        >= {"alice", "bob", "carol"}
+    carol.peer_address = "https://carol.invalid"
+    dave_link = user_invite_family.make(carol, workspace)
+    assert len(dave_link.encode("ascii")) <= MAX_INVITE_QR_BYTES
+    dave = FullPeer(str(tmp_path / "dave"))
+    dave.peer_address = "https://dave.invalid"
+    assert user_family.accept(dave, dave_link, "dave") == workspace
+
+    # The complete fourth-generation authority closure can exceed one QR but
+    # remains a bounded, locally serviceable link and needs no author round.
+    erin_link = user_invite_family.make(dave, workspace)
+    assert MAX_INVITE_QR_BYTES < len(erin_link.encode("ascii")) \
+        <= MAX_INVITE_LINK_BYTES
+    erin = FullPeer(str(tmp_path / "erin"))
+    assert user_family.accept(erin, erin_link, "erin") == workspace
+    assert {row["name"] for row in user_family.members(erin, workspace)} \
+        >= {"alice", "bob", "carol", "dave", "erin"}
+
 
 def test_incompatible_projection_is_deleted_instead_of_migrated(tmp_path):
     workspace = "0" * 64

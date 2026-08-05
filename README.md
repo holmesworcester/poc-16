@@ -167,7 +167,8 @@ a single-machine test; normal mode enables Iroh's production reachability
 preset.
 
 An invite created by this daemon is a compact, compressed, encrypted bearer
-artifact bounded to one standard version-40 QR code. It carries the complete
+artifact. Ordinary and early chained invites fit one standard version-40 QR;
+deeper authority chains remain bounded link payloads. It carries the complete
 signed invite closure plus an out-of-band peer record:
 
 ```json
