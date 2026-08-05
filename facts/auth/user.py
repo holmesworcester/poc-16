@@ -94,13 +94,20 @@ def accept(node, link, name):
     secret, public = node.identity()
     member = user(invitation, invite_sk, public, name, ts)
     sig = signature.signature(secret, public, member, ts)
+    complete = tuple(bootstrap) + (sig, member)
+    complete_judgment = drain(complete, workspace)
+    if not complete_judgment.ok \
+            or len(complete_judgment.valids) != len(complete):
+        if complete_judgment.failure is not None:
+            raise complete_judgment.failure
+        raise ValueError("invite membership")
     node.add_workspace(
         workspace, name, peers=[peer],
         identity=node.keychain.default_id())
     # The bootstrap is already closed and topological.  The local writer
     # publishes that exact closure as one signed writer-tree leaf; network
     # reconciliation subsequently exchanges the same portable leaf.
-    node.publish_closed(workspace, (tuple(bootstrap) + (sig, member),))
+    node.publish_closed(workspace, (complete,))
     return workspace
 
 

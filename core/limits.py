@@ -61,10 +61,11 @@ MAX_REMOVAL_ROOT_BYTES = MAX_ROOT_BYTES
 MAX_REMOVAL_PROOF_BYTES = 32 * 1024
 
 MAX_INVITE_BYTES = MAX_PAGE_BATCH_BYTES
-# QR version 40-L carries at most 2,953 byte-mode bytes. Compact ordinary
-# invites fit that transport, while deeper authority chains remain usable as
-# links inside the local 1 MiB control envelope. Reserve 64 KiB there for the
-# command document, member display name, and encoding overhead.
+# QR version 40-L carries at most 2,953 byte-mode bytes. Compact invites can
+# fit that transport, while larger peer locators and deeper authority chains
+# remain usable as links inside the local 1 MiB control envelope. Reserve 64
+# KiB there for the command document, member display name, and encoding
+# overhead.
 MAX_INVITE_QR_BYTES = 2_953
 MAX_INVITE_LINK_BYTES = MAX_CONTROL_BYTES - 64 * 1024
 MAX_INVITE_ARTIFACT_BYTES = (MAX_INVITE_LINK_BYTES // 4) * 3

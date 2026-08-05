@@ -782,9 +782,9 @@ writer log identifies residence; stable fact IDs deduplicate a later author
 publication. From that point invite/device facts are ordinary control families
 under Rule 2. The gate-facing mint proof may carry the same facts ephemerally,
 unchanged, but no handoff ticket or redemption state exists.
-Ordinary and early chained artifacts fit one standard version-40 QR. A deeper
-authority chain may require link transport; it remains below the local command
-envelope rather than making later members unable to invite.
+Compact early chained artifacts fit one standard version-40 QR. A larger peer
+locator or deeper authority chain may require link transport; it remains below
+the local command envelope rather than making later members unable to invite.
 
 An UNKNOWN subject may present one device-signed mint request closed over its
 positive workspace admission and device-ownership chain. `AccessGate`

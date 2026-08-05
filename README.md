@@ -167,9 +167,9 @@ a single-machine test; normal mode enables Iroh's production reachability
 preset.
 
 An invite created by this daemon is a compact, compressed, encrypted bearer
-artifact. Ordinary and early chained invites fit one standard version-40 QR;
-deeper authority chains remain bounded link payloads. It carries the complete
-signed invite closure plus an out-of-band peer record:
+artifact. Small early chained invites fit one standard version-40 QR; larger
+peer locators and deeper authority chains remain bounded link payloads. It
+carries the complete signed invite closure plus an out-of-band peer record:
 
 ```json
 {"kind":"iroh","endpoint":"ENDPOINT_ID","ticket":"TICKET"}

@@ -375,7 +375,7 @@ def test_chained_members_invite_offline_by_qr_then_deeper_link(
         == carol.identity(workspace)[1]
     carol.peer_address = "https://carol.invalid"
     dave_link = user_invite_family.make(carol, workspace)
-    assert len(dave_link.encode("ascii")) <= MAX_INVITE_QR_BYTES
+    assert len(dave_link.encode("ascii")) <= MAX_INVITE_LINK_BYTES
     dave = FullPeer(str(tmp_path / "dave"))
     dave.peer_address = "https://dave.invalid"
     assert user_family.accept(dave, dave_link, "dave") == workspace
@@ -389,6 +389,29 @@ def test_chained_members_invite_offline_by_qr_then_deeper_link(
     assert user_family.accept(erin, erin_link, "erin") == workspace
     assert {row["name"] for row in user_family.members(erin, workspace)} \
         >= {"alice", "bob", "carol", "dave", "erin"}
+
+
+def test_deep_invite_rejects_oversize_membership_before_keyring_mutation(
+        tmp_path):
+    inviter = FullPeer(str(tmp_path / "member-0"))
+    inviter.peer_address = "x"
+    workspace = facts.auth.workspace.create(inviter, "member-0", ts=1)
+
+    for generation in range(1, 64):
+        link = user_invite_family.make(inviter, workspace)
+        joiner = FullPeer(str(tmp_path / f"member-{generation}"))
+        joiner.peer_address = "x"
+        assert user_family.accept(
+            joiner, link, f"member-{generation}") == workspace
+        inviter = joiner
+
+    link = user_invite_family.make(inviter, workspace)
+    rejected = FullPeer(str(tmp_path / "member-64"))
+    before = json.dumps(rejected.keyring, sort_keys=True)
+    with pytest.raises(PayloadTooLarge, match="pile has too many facts"):
+        user_family.accept(rejected, link, "member-64")
+    assert rejected.workspaces() == []
+    assert json.dumps(rejected.keyring, sort_keys=True) == before
 
 
 def test_incompatible_projection_is_deleted_instead_of_migrated(tmp_path):
