@@ -1060,6 +1060,17 @@ timestamp footers, but selected bodies are fetched whole. Facts neighboring a
 logical interval are authenticated and ingested as measured segment overfetch;
 they do not silently widen the logical request.
 
+Every cloud micro is closed over transitive cross-writer refs before its
+create-only write. The owner supplies local `PeerState` holdings; the publisher
+adds one deduplicated exact authenticated `Run` for every cross-writer target,
+recursively, bounded by `CLOUD_ANNEX_MAX_RUNS`. Folded ladder, mono, and epoch
+artifacts preserve those adjacent annex runs. Same-writer refs remain sequence
+cites and are not copied into annexes. Consequently a cold cloud range is
+judgeable and renderable from its selected artifacts, earlier same-writer
+artifacts, writer authentication, and the consumer's current control state. A
+cross-writer ref without either an explicit carry or local target holding is
+rejected before object creation.
+
 Requested segment bodies are read with bounded 64-way concurrency and ingested
 as each completes. Physical arrival therefore need not be topological. Once
 the requested roots are resident, the client closes their exact transitive
@@ -1085,8 +1096,11 @@ objects, forks, and containing segments that omit their addressed target fail
 closed and never produce an interactive-ready result. A conditional no-change
 poll preserves an incomplete cache result; it cannot turn pending into ready.
 
-Full catchup is the same demand with all visible writer intervals. Repeated
-sync is the propagation mechanism. There is no combined canonical P2P log,
+For a cloud-fetched citing artifact, the annex normally makes cross-writer
+closure chase-free. The demand pump remains necessary for same-writer
+backfills, refs originating in facts already held from P2P, and bounded
+unresolved outcomes. Full catchup is the same demand with all visible writer
+intervals. Repeated sync is the propagation mechanism. There is no combined canonical P2P log,
 shared cloud content index, cloud treap, per-fact session, or stored closed-pile
 format. Signed closed piles remain only the ephemeral gate-proof boundary.
 
@@ -1153,6 +1167,15 @@ trusts writers to maintain their trees. Bounded mirroring and per-device
 isolation ensure that such a tree can make only that writer's content unusable;
 a consuming peer rejects it, and it cannot wedge another slot, delete another
 writer's data, or corrupt the removal tree.
+
+The cloud queue's deterministic range-keyed micro is a more specific case. A
+crash after micro create but before its writer-slot CAS leaves an authenticated
+orphan. An identical retry reuses those bytes and finishes the CAS. A divergent
+retry raises `CloudMicroFork` with the range key and both SHA-256 hashes; it
+never loops or overwrites. `readmit_orphan()` decodes and verifies the stored
+publication, checks the exact current sequence base, and performs the missing
+slot CAS. That explicitly chooses the orphan branch, after which a divergent
+local restart must import/rebase it or rotate writer identity.
 
 A consuming mirror uses the same effects-before-one-CAS ordering, with a local
 identity derived from the exact signed base/head and canonical control plan

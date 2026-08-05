@@ -270,6 +270,7 @@ def test_live_r2_peerlog_rounds_and_five_mib_part_copy(live_r2_store):
     log = WriterLog.owned()
     log.append(Fact("msg", 1, (), b"first"))
     cloud.publish(log)
+    cloud.repair_directory()
     state, cache = PeerState(), CloudCache()
     assert cloud.sync(state, cache).rounds == 2
     assert cloud.sync(state, cache).rounds == 1
@@ -278,6 +279,7 @@ def test_live_r2_peerlog_rounds_and_five_mib_part_copy(live_r2_store):
     time.sleep(1.05)
     log.append(Fact("msg", 2, (), b"delta"))
     cloud.publish(log, 1, 2)
+    cloud.repair_directory()
     assert cloud.sync(state, cache).rounds == 2
 
     edge = b"r" * MULTIPART_EDGE

@@ -39,6 +39,7 @@ class Outcome:
     published: int = 0
     stale_slot: int = 0
     directory_exhausted: int = 0
+    micro_fork: int = 0
     throttled: int = 0
     other: list = field(default_factory=list)
     seconds: float = 0.0
@@ -48,6 +49,8 @@ def _classify(error, outcome):
     text = f"{type(error).__name__}: {error}"
     if "stale cloud writer slot" in text or "stale cloud fold" in text:
         outcome.stale_slot += 1
+    elif "cloud micro fork" in text:
+        outcome.micro_fork += 1
     elif "cloud directory CAS contention" in text:
         outcome.directory_exhausted += 1
     elif any(token in text for token in THROTTLE_TOKENS):
@@ -212,6 +215,7 @@ def main():
             "published_ok": outcome.published,
             "stale_slot": outcome.stale_slot,
             "directory_exhausted": outcome.directory_exhausted,
+            "micro_fork": outcome.micro_fork,
             "throttled": outcome.throttled,
             "other": outcome.other,
             "seconds": round(outcome.seconds, 3),
@@ -228,6 +232,7 @@ def main():
         "clients": args.clients,
         "won": outcome.published,
         "rejected_stale": outcome.stale_slot,
+        "micro_fork": outcome.micro_fork,
         "throttled": outcome.throttled,
         "other": outcome.other,
         "base_seq": base,

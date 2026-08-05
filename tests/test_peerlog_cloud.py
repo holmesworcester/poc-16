@@ -17,6 +17,7 @@ from peerlog.cloud import (
     CloudCache,
     CloudClosureLimits,
     CloudDemand,
+    CloudMicroFork,
     CloudQueue,
     MaintenanceRequired,
     MemoryCloud,
@@ -67,14 +68,41 @@ def dependency_chain_cloud(label="dependency closure"):
     for seq in range(5):
         a.append(Fact("msg", 300 + seq, (), f"a-old:{seq}".encode()))
     a.append(Fact("msg", 1_000, (Ref(b.writer, 2),), b"recent A"))
+    holdings = PeerState()
+    for log in (a, b, c):
+        holdings.add_owned(log)
     receipts = {
-        "c": cloud.publish(c, 0, 5, announce=False),
-        "b": cloud.publish(b, 0, 5, announce=False),
-        "a_old": cloud.publish(a, 0, 5, announce=False),
-        "a_recent": cloud.publish(a, 5, 6, announce=False),
+        "c": cloud.publish(c, 0, 5, holdings=holdings, announce=False),
+        "b": cloud.publish(b, 0, 5, holdings=holdings, announce=False),
+        "a_old": cloud.publish(
+            a, 0, 5, holdings=holdings, announce=False),
+        "a_recent": cloud.publish(
+            a, 5, 6, holdings=holdings, announce=False),
     }
     cloud.repair_directory()
     return store, cloud, a, b, c, receipts
+
+
+def same_writer_chain_cloud(label="same writer dependency closure"):
+    """Recent seq 5 reaches separately segmented old seqs 2 then 0."""
+    store = MemoryCloud()
+    cloud = CloudQueue(store, h(label))
+    log = WriterLog.owned()
+    log.append(Fact("msg", 100, (), b"old C"))
+    log.append(Fact("msg", 101, (), b"unrelated one"))
+    log.append(Fact("msg", 102, (Ref(log.writer, 0),), b"old B"))
+    log.append(Fact("msg", 103, (), b"unrelated three"))
+    log.append(Fact("msg", 104, (), b"unrelated four"))
+    log.append(Fact("msg", 1_000, (Ref(log.writer, 2),), b"recent A"))
+    receipts = {
+        "c": cloud.publish(log, 0, 1, announce=False),
+        "unrelated_one": cloud.publish(log, 1, 2, announce=False),
+        "b": cloud.publish(log, 2, 3, announce=False),
+        "unrelated_late": cloud.publish(log, 3, 5, announce=False),
+        "a": cloud.publish(log, 5, 6, announce=False),
+    }
+    cloud.repair_directory()
+    return store, cloud, log, receipts
 
 
 def assert_ref_closed(state, ref, seen=None):
@@ -114,6 +142,30 @@ def test_cloud_uses_exact_peer_runs_and_one_round_no_change():
     assert delta.downloaded_bytes == 0
 
 
+def test_publish_defaults_to_owner_only_and_poll_repairs_a_missing_directory():
+    store = MemoryCloud()
+    cloud = CloudQueue(store, h("owner only publish default"))
+    log = owned("quiet writer", 3)
+    before = store.metrics.copy()
+    cloud.publish(log)
+    publish_cost = store.metrics.delta(before)
+    assert publish_cost.cas == 1
+    assert store.get(cloud.directory_key)[0] is None
+
+    before = store.metrics.copy()
+    slots, tag = cloud.poll()
+    repair_cost = store.metrics.delta(before)
+    assert tag and slots[log.writer].hi == 3
+    assert repair_cost.lists == 1 and repair_cost.cas == 1
+
+    before = store.metrics.copy()
+    unchanged, same_tag = cloud.poll(tag)
+    noop_cost = store.metrics.delta(before)
+    assert unchanged is None and same_tag == tag
+    assert noop_cost.gets == noop_cost.conditional_gets == 1
+    assert noop_cost.lists == noop_cost.cas == 0
+
+
 def test_warm_delta_is_directory_plus_parallel_object_round():
     store = MemoryCloud()
     cloud = CloudQueue(store, h("warm"))
@@ -125,6 +177,7 @@ def test_warm_delta_is_directory_plus_parallel_object_round():
     for seq in range(4, 7):
         log.append(Fact("msg", 1_000 + seq, (), f"writer:{seq}".encode()))
     cloud.publish(log, 4, 7)
+    cloud.repair_directory()
     report = cloud.sync(state, cache)
     assert report.changed and report.rounds == 2
     assert report.object_gets == 1 and report.facts == 3
@@ -333,11 +386,82 @@ def test_rule2_carry_is_adjacent_and_resolves_before_citing_ingest():
     assert state.logs[citing.writer].fact(0) == citing.fact(0)
 
 
-def test_recent_window_fetches_minimal_transitive_out_of_range_segments():
+def test_folded_segment_inherits_deterministic_cross_writer_annex():
+    store = MemoryCloud()
+    cloud = CloudQueue(store, h("folded cross writer annex"))
+    target = owned("annex targets", 4, body_size=128)
+    citing = WriterLog.owned()
+    for seq in range(MICRO_TAIL):
+        refs = ()
+        if seq % 8 == 0:
+            refs = (Ref(target.writer, seq // 8),)
+        elif seq == MICRO_TAIL - 1:
+            refs = (Ref(citing.writer, 0),)  # same-writer backfill stays a cite
+        citing.append(Fact("msg", 10_000 + seq, refs, b"m" * 128))
+    holdings = PeerState()
+    holdings.add_owned(target)
+    holdings.add_owned(citing)
+    with pytest.raises(ValueError, match="adjacent annex"):
+        cloud.publish(citing, 0, 1)
+    for seq in range(MICRO_TAIL):
+        cloud.publish(
+            citing, seq, seq + 1, holdings=holdings, announce=False)
+    folded = cloud.fold_idle(citing.writer)
+    assert len(folded.segments) == 1
+    segment = folded.segments[0]
+    publications = cloud._read_segment(segment)
+    annex = tuple(run for publication in publications
+                  for run in publication.carries)
+    assert {(run.writer, run.lo) for run in annex} == {
+        (target.writer, seq) for seq in range(4)}
+    baseline = _encode_segment(tuple(
+        Publication(publication.main, (), publication.handoff_targets)
+        for publication in publications), "ladder")
+    annex_ratio = segment.size / len(baseline)
+    assert 1.05 < annex_ratio < 1.30
+
+    state = PeerState()
+    report = cloud.sync(state, demand=CloudDemand.exact({
+        citing.writer: ((24, 32),),
+    }))
+    assert report.interactive_ready and not report.pending
+    assert report.closure_segment_gets == report.closure_facts == 0
+    assert report.carries == 4
+    assert_ref_closed(state, Ref(citing.writer, 24))
+
+
+def test_applied_annex_publish_retries_without_rebuilding_local_holdings():
+    class LostResponseCloud(MemoryCloud):
+        def __init__(self):
+            super().__init__()
+            self.lose = True
+
+        def cas(self, key, token, value):
+            result = super().cas(key, token, value)
+            if self.lose and result and "/slots/" in key:
+                self.lose = False
+                raise OSError("annex slot response lost")
+            return result
+
+    store = LostResponseCloud()
+    cloud = CloudQueue(store, h("annex lost response"))
+    target = owned("annex retry target", 1)
+    citing = WriterLog.owned()
+    citing.append(Fact(
+        "msg", 10, (Ref(target.writer, 0),), b"annex retry"))
+    holdings = PeerState()
+    holdings.add_owned(target)
+    holdings.add_owned(citing)
+    with pytest.raises(OSError, match="response lost"):
+        cloud.publish(citing, holdings=holdings)
+    receipt = cloud.publish(citing)  # incumbent annex is self-authenticating
+    assert (receipt.segment.lo, receipt.segment.hi) == (0, 1)
+
+
+def test_recent_window_carries_minimal_transitive_out_of_range_annex():
     store, cloud, a, b, c, receipts = dependency_chain_cloud()
     directory, _tag = store.get(cloud.directory_key)
-    expected_bodies = sum(receipts[name].segment.size
-                          for name in ("a_recent", "b", "c"))
+    expected_bodies = receipts["a_recent"].segment.size
     state = PeerState()
     before = store.metrics.copy()
     report = cloud.sync(state, demand=CloudDemand.exact({
@@ -347,21 +471,20 @@ def test_recent_window_fetches_minimal_transitive_out_of_range_segments():
 
     assert report.interactive_ready and not report.pending
     assert report.initial_segment_gets == 1
-    assert report.closure_segment_gets == 2
-    assert report.object_gets == delta.gets - 1 == 3
-    assert report.rounds == 4  # directory, recent A, old B, older C
+    assert report.closure_segment_gets == 0
+    assert report.object_gets == delta.gets - 1 == 1
+    assert report.rounds == 2  # directory plus one closed recent micro
     assert report.initial_bytes == receipts["a_recent"].segment.size
-    assert report.closure_bytes == (
-        receipts["b"].segment.size + receipts["c"].segment.size)
+    assert report.closure_bytes == 0
     assert report.received_bytes == len(directory) + expected_bodies
     assert report.initial_facts == 1
-    assert report.closure_facts == 2
-    assert report.facts == 11
-    assert report.segment_overfetch_facts == 8
+    assert report.closure_facts == 0
+    assert report.facts == 1 and report.carries == 2
+    assert report.segment_overfetch_facts == 0
     assert report.closure_depth == 2
     assert set(state.logs[a.writer]._facts) == {5}
-    assert set(state.logs[b.writer]._facts) == set(range(5))
-    assert set(state.logs[c.writer]._facts) == set(range(5))
+    assert set(state.logs[b.writer]._facts) == {2}
+    assert set(state.logs[c.writer]._facts) == {1}
     assert_ref_closed(state, Ref(a.writer, 5))
 
 
@@ -375,10 +498,13 @@ def test_dependency_closure_deduplicates_refs_cycles_and_local_targets():
     a.append(Fact("msg", 25, (), b"unrelated old A"))
     a.append(Fact(
         "msg", 30, (Ref(b.writer, 0), Ref(b.writer, 0)), b"recent"))
-    cloud.publish(b, announce=False)
-    cloud.publish(c, announce=False)
-    cloud.publish(a, 0, 1, announce=False)
-    cloud.publish(a, 1, 2, announce=False)
+    holdings = PeerState()
+    for log in (a, b, c):
+        holdings.add_owned(log)
+    cloud.publish(b, holdings=holdings, announce=False)
+    cloud.publish(c, holdings=holdings, announce=False)
+    cloud.publish(a, 0, 1, holdings=holdings, announce=False)
+    cloud.publish(a, 1, 2, holdings=holdings, announce=False)
     cloud.repair_directory()
     state = PeerState()
     state.add_owned(c)
@@ -387,8 +513,9 @@ def test_dependency_closure_deduplicates_refs_cycles_and_local_targets():
         a.writer: ((1, 2),),
     }))
     assert report.interactive_ready and not report.pending
-    assert report.initial_segment_gets == report.closure_segment_gets == 1
-    assert report.closure_facts == 1
+    assert report.initial_segment_gets == 1
+    assert report.closure_segment_gets == report.closure_facts == 0
+    assert report.carries == 2
     assert report.closure_depth == 2
     assert set(state.logs[a.writer]._facts) == {1}
     assert set(state.logs[b.writer]._facts) == {0}
@@ -405,7 +532,8 @@ def test_cloud_closes_a_requested_citer_already_held_from_p2p():
     }))
     assert report.interactive_ready and not report.pending
     assert report.initial_segment_gets == report.initial_facts == 0
-    assert report.closure_segment_gets == report.closure_facts == 2
+    assert report.closure_segment_gets == report.closure_facts == 1
+    assert report.carries == 1
     assert report.closure_depth == 2
     assert state.logs[b.writer].fact(2) == b.fact(2)
     assert state.logs[c.writer].fact(1) == c.fact(1)
@@ -432,26 +560,38 @@ def test_cloud_cache_cannot_hide_downloads_when_reused_with_an_empty_state():
     CloudClosureLimits(max_bytes=1),
 ])
 def test_dependency_closure_bounds_fail_closed(limits):
-    _store, cloud, a, b, c, _receipts = dependency_chain_cloud(
+    _store, cloud, log, _receipts = same_writer_chain_cloud(
         f"closure bound {limits}")
     state = PeerState()
     report = cloud.sync(
         state,
-        demand=CloudDemand.exact({a.writer: ((5, 6),)}),
+        demand=CloudDemand.exact({log.writer: ((5, 6),)}),
         closure_limits=limits)
     assert report.closure_exhausted
     assert not report.interactive_ready
     assert report.pending
-    assert state.logs[a.writer].fact(5) == a.fact(5)
+    assert state.logs[log.writer].fact(5) == log.fact(5)
     assert any(ref in report.pending for ref in (
-        Ref(b.writer, 2), Ref(c.writer, 1)))
+        Ref(log.writer, 2), Ref(log.writer, 0)))
+
+
+def test_depth_exhaustion_keeps_a_resident_annex_target_pending():
+    _store, cloud, a, _b, c, _receipts = dependency_chain_cloud(
+        "resident annex depth bound")
+    report = cloud.sync(
+        PeerState(),
+        demand=CloudDemand.exact({a.writer: ((5, 6),)}),
+        closure_limits=CloudClosureLimits(max_depth=1),
+    )
+    assert report.closure_exhausted and not report.interactive_ready
+    assert report.pending == (Ref(c.writer, 1),)
 
 
 def test_missing_dependency_stays_pending_and_never_becomes_interactive():
     store = MemoryCloud()
     cloud = CloudQueue(store, h("missing dependency"))
     log = WriterLog.owned()
-    missing = Ref(h("absent writer"), 17)
+    missing = Ref(log.writer, 17)
     log.append(Fact("msg", 1, (missing,), b"cannot render"))
     cloud.publish(log)
     state, cache = PeerState(), CloudCache()
@@ -467,33 +607,33 @@ def test_missing_dependency_stays_pending_and_never_becomes_interactive():
 def test_target_published_after_citer_closes_on_the_next_window_sync():
     store = MemoryCloud()
     cloud = CloudQueue(store, h("target after citer"))
-    citing, target = WriterLog.owned(), WriterLog.owned()
-    target.append(Fact("msg", 1, (), b"late cloud target"))
-    citing.append(Fact("msg", 1, (), b"old citing history"))
-    citing.append(Fact(
-        "msg", 2, (Ref(target.writer, 0),), b"recent citing fact"))
-    cloud.publish(citing, 0, 1, announce=False)
-    cloud.publish(citing, 1, 2, announce=False)
+    log = WriterLog.owned()
+    log.append(Fact("msg", 1, (), b"old citing history"))
+    log.append(Fact(
+        "msg", 2, (Ref(log.writer, 2),), b"recent citing fact"))
+    cloud.publish(log, 0, 1, announce=False)
+    cloud.publish(log, 1, 2, announce=False)
     cloud.repair_directory()
     state, cache = PeerState(), CloudCache()
 
-    demand = CloudDemand.exact({citing.writer: ((1, 2),)})
+    demand = CloudDemand.exact({log.writer: ((1, 2),)})
     first = cloud.sync(state, cache, demand=demand)
-    assert first.pending == (Ref(target.writer, 0),)
+    assert first.pending == (Ref(log.writer, 2),)
     assert not first.interactive_ready
 
-    cloud.publish(target, announce=False)
+    log.append(Fact("msg", 3, (), b"late cloud target"))
+    cloud.publish(log, 2, 3, announce=False)
     cloud.repair_directory()
     second = cloud.sync(state, cache, demand=demand)
     assert second.interactive_ready and not second.pending
     assert second.initial_segment_gets == 0
     assert second.closure_segment_gets == second.closure_facts == 1
-    assert state.logs[target.writer].fact(0) == target.fact(0)
+    assert state.logs[log.writer].fact(2) == log.fact(2)
 
 
 @pytest.mark.parametrize("damage", ["missing", "corrupt"])
 def test_missing_or_corrupt_dependency_object_fails_without_ready_result(damage):
-    store, cloud, _a, _b, _c, receipts = dependency_chain_cloud(
+    store, cloud, log, receipts = same_writer_chain_cloud(
         f"dependency object {damage}")
     key = receipts["b"].segment.key
     if damage == "missing":
@@ -503,17 +643,18 @@ def test_missing_or_corrupt_dependency_object_fails_without_ready_result(damage)
     state = PeerState()
     with pytest.raises(ValueError, match="cloud segment"):
         cloud.sync(state, demand=CloudDemand.exact({
-            _a.writer: ((5, 6),),
+            log.writer: ((5, 6),),
         }))
 
 
-def test_consumer_rejects_writer_that_bypasses_rule2_publication_check():
+@pytest.mark.parametrize("family", ["member", "msg"])
+def test_consumer_rejects_writer_that_bypasses_annex_check(family):
     store = MemoryCloud()
     cloud = CloudQueue(store, h("hostile rule two"))
     target = owned("unpublished target", 1)
     citing = WriterLog.owned()
     citing.append(Fact(
-        "member", 2_000, (Ref(target.writer, 0),), b"missing carry"))
+        family, 2_000, (Ref(target.writer, 0),), b"missing carry"))
     run = prove_run(citing, 0, 1)
     raw = _encode_segment((Publication(run),), "micro")
     key = _micro_key(cloud.workspace, citing.writer, 0, 1)
@@ -567,6 +708,7 @@ def test_micro_tail_folds_to_binary_ladder_and_footer_is_suffix_readable():
     log.append(Fact("msg", MICRO_TAIL + 1, (), b"requires idle fold"))
     with pytest.raises(MaintenanceRequired):
         cloud.publish(log, MICRO_TAIL, MICRO_TAIL + 1)
+    assert cloud.visible_heads()[log.writer] == MICRO_TAIL
     slot = cloud.fold_idle(log.writer)
     assert sum(segment.kind == "micro" for segment in slot.segments) == 0
     assert len(slot.segments) < MICRO_TAIL
@@ -828,10 +970,72 @@ def test_lost_slot_cas_response_retries_as_exact_idempotent_ack():
     receipt = cloud.publish(log, 0, 4)
     delta = store.metrics.delta(before)
     assert (receipt.segment.lo, receipt.segment.hi) == (0, 4)
-    assert delta.cas == 1  # directory repair only; writer slot was acknowledged
+    assert delta.cas == 0  # exact slot retry; announcement is idle work
     replica = PeerState()
     assert cloud.sync(replica).facts == 4
     assert set(replica.entries()) == entries(log)
+
+
+def test_crash_orphan_exact_retry_finishes_the_original_slot_transition():
+    class CrashBeforeSlotCloud(MemoryCloud):
+        def __init__(self):
+            super().__init__()
+            self.crash = True
+
+        def cas(self, key, token, value):
+            if self.crash and "/slots/" in key:
+                self.crash = False
+                raise OSError("crash before writer-slot CAS")
+            return super().cas(key, token, value)
+
+    store = CrashBeforeSlotCloud()
+    cloud = CloudQueue(store, h("exact crash orphan"))
+    log = owned("orphaned exact branch", 1)
+    with pytest.raises(OSError, match="before writer-slot"):
+        cloud.publish(log)
+    assert cloud._slot_versioned(log.writer)[0] is None
+    receipt = cloud.publish(log)
+    assert (receipt.segment.lo, receipt.segment.hi) == (0, 1)
+    assert cloud._slot_versioned(log.writer)[0].hi == 1
+
+
+def test_divergent_crash_orphan_has_typed_evidence_and_readmission_recovery():
+    class CrashBeforeSlotCloud(MemoryCloud):
+        def __init__(self):
+            super().__init__()
+            self.crash = True
+
+        def cas(self, key, token, value):
+            if self.crash and "/slots/" in key:
+                self.crash = False
+                raise OSError("crash before writer-slot CAS")
+            return super().cas(key, token, value)
+
+    secret = signing.SigningKey.generate()
+    orphan = WriterLog.owned(secret)
+    divergent = WriterLog.owned(signing.SigningKey(secret.encode()))
+    orphan.append(Fact("msg", 1, (), b"orphan branch"))
+    divergent.append(Fact("msg", 1, (), b"divergent restart"))
+    store = CrashBeforeSlotCloud()
+    cloud = CloudQueue(store, h("divergent crash orphan"))
+    with pytest.raises(OSError, match="before writer-slot"):
+        cloud.publish(orphan)
+
+    with pytest.raises(CloudMicroFork) as found:
+        cloud.publish(divergent)
+    evidence = found.value.evidence
+    assert evidence.writer == orphan.writer
+    assert (evidence.lo, evidence.hi) == (0, 1)
+    assert evidence.incumbent_hash != evidence.proposed_hash
+    assert "readmit" in str(found.value)
+    receipt = cloud.readmit_orphan(orphan.writer, 0, 1)
+    assert receipt.segment.key == evidence.key
+    assert cloud.readmit_orphan(orphan.writer, 0, 1) == receipt
+    cloud.repair_directory()
+    state = PeerState()
+    report = cloud.sync(state)
+    assert report.interactive_ready and report.facts == 1
+    assert state.logs[orphan.writer].fact(0) == orphan.fact(0)
 
 
 def test_same_base_identical_publishers_have_one_slot_winner_and_retry_ack():
@@ -877,7 +1081,7 @@ def test_same_base_identical_publishers_have_one_slot_winner_and_retry_ack():
     before = store.metrics.copy()
     queues[0].publish(log, 0, 3)
     delta = store.metrics.delta(before)
-    assert delta.cas == 1  # derived directory only
+    assert delta.cas == 0  # exact slot retry; announcement is idle work
     state = PeerState()
     assert queues[0].sync(state).facts == 3
     assert set(state.entries()) == entries(log)
@@ -914,8 +1118,11 @@ def test_same_writer_divergent_same_sequence_fails_at_immutable_address():
     thread = threading.Thread(target=publish_first)
     thread.start()
     assert store.entered.wait(3)
-    with pytest.raises(ValueError, match="immutable object collision"):
+    with pytest.raises(CloudMicroFork) as found:
         CloudQueue(store, workspace).publish(second, announce=False)
+    assert found.value.evidence.writer == first.writer
+    assert found.value.evidence.incumbent_hash \
+        != found.value.evidence.proposed_hash
     store.release.set()
     thread.join(3)
     assert not failures and not thread.is_alive()

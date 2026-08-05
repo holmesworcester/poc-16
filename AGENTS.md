@@ -85,6 +85,9 @@ layout is a create-only micro-tail, a client-folded binary ladder below the
 provider's multipart threshold, and server-side part-copy mono-log segments
 above it; deterministic tree summaries ride in object footers. This cloud
 layout is phase 2 (`poc-16-6j4.31`) and follows the P2P cut.
+Every downloadable cloud artifact is closed over transitive cross-writer refs:
+the owner supplies local holdings and each micro carries deduplicated exact Run
+annexes, which folds preserve. Same-writer backrefs remain ranged cites.
 
 P2P deliberately restores the previously tested one-sided Merkle RBSR walk
 over a peer-local, history-independent `(ts, fid)` treap. The session initiator
@@ -181,7 +184,8 @@ Refs on the passive path are located `(writer, seq)` addresses. A target at or
 below the stored target head is fetchable; one above it is a pending interval,
 not a failed-GET event. Validity-critical control refs cite visible targets or
 carry exact proof material inline beside the citing fact (Rule 2); render refs
-may remain pending. Handoff facts are explicitly parked and require a separate
+arriving over P2P may remain pending, while cloud publication rejects a missing
+cross-writer annex. Handoff facts are explicitly parked and require a separate
 decision before the cloud phase closes.
 
 Bao descriptors and slices are ordinary facts. Large pile and pack bodies use

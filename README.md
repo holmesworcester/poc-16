@@ -707,6 +707,21 @@ was exhausted. The report separates initial and closure GETs, bytes, logical
 facts, closure depth, and segment overfetch. Missing advertised objects,
 corrupt proofs, forks, and omitted addressed targets fail closed.
 
+Cloud publication defaults to owner-confined work: one create-only micro and
+one writer-slot CAS, with no workspace-directory write. `fold_idle()`, the
+32-micro `MaintenanceRequired` boundary, an explicit maintenance call, or a
+reader that observes a missing directory repairs the deterministic LIST-derived
+hint. A closed conditional no-change poll remains one GET.
+
+Every micro also carries a bounded deterministic transitive annex of its
+cross-writer refs, built from the owner's local `PeerState` holdings as exact
+authenticated runs. Folds preserve those carries, so ordinary cold ranges need
+no cross-writer chase round. Same-writer cites remain range work, and the
+dependency pump still closes citing roots that arrived over P2P without a cloud
+annex. A create-before-slot crash is recoverable: an exact retry finishes the
+slot; a divergent retry returns typed `CloudMicroFork` hashes and
+`readmit_orphan()` can validate and install the already-created branch.
+
 ## Hosted owner publication
 
 Peers do not proxy large immutable bodies through Lambda or a Worker. Under
@@ -1080,24 +1095,29 @@ python3 -m deploy.aws_notifications.manage remove \
 The current peerlog benchmark measures signed `WriterLog` construction,
 authenticated cloud `Run` publication, bounded concurrent body download, and
 semantic ingest into `PeerState`. A dependency-closed 1,000-fact recent view
-over equal 1,000-writer histories used exactly 1,002 body GETs and 19 rounds at
+over equal 1,000-writer histories used exactly 1,000 body GETs and 17 rounds at
 10k, 100k, and 1M total facts. Local pending-empty TTI was
-0.746/0.962/1.063 seconds; transferred bytes were
-1,563,376/1,696,948/2,071,136. The increase is the two whole old segments
-containing the fixed A-to-B-to-C chain and is reported as closure overfetch.
+0.731/0.866/1.026 seconds; transferred bytes were
+1,560,134/1,666,328/1,768,522. The fixed A-to-B-to-C chain is carried as two
+annex facts, with zero closure GETs and zero segment overfetch.
 
 The skew profile uses one hot writer, five medium writers, and 1,000 long-tail
 writers distributed across zero through three facts. A tail-2 request names
 1,006 writers and selects 1,262 facts. At 10k/100k/1M total history it stayed at
-756 initial segment GETs, two closure GETs, and 15 rounds; local TTI was
-0.709/1.566/11.852 seconds. At 1M facts the hot writer held 748,875 entries;
-the 16,381,810 transferred bytes were dominated by the two deliberately old
-medium-writer dependency segments, not the hot writer's sequence number.
+756 initial segment GETs, zero closure GETs, and 13 rounds; local TTI was
+0.679/0.594/0.803 seconds. At 1M facts the hot writer held 748,875 entries,
+while initial body bytes were 672,480 and total received bytes were 1,298,538.
+
+Folded annex measurements at 256/2,048/16,384 main facts and one distinct
+cross-writer ref per eight facts were 1.203x/1.271x/1.309x. The multi-MiB case
+is 0.9% above the store-model 1.1–1.3x prediction because every distinct target
+still carries an exact inclusion path; it remains far below the old
+256-fact-pile 2.2–2.65x regime.
 
 These are local `MemoryCloud` execution measurements. Projected times using the
 decision-record 90 ms RTT and 2.5 MB/s link are models, not real-link evidence.
 The corresponding projections for equal-fanout 10k/100k/1M were
-2.335/2.389/2.538 seconds and for skew were 1.919/2.464/7.903 seconds.
+2.154/2.197/2.237 seconds and for skew were 1.688/1.689/1.689 seconds.
 
 No 50k/200k fact-rate or file-throughput number is asserted here until the
 benchmark is rerun. The corresponding bead requires facts/s at both sizes and

@@ -48,6 +48,8 @@ CLOUD_CLOSURE_MAX_BYTES = 256 * 1024 * 1024
 CLOUD_DEMAND_MAX_WRITERS = 4 * 1024
 CLOUD_DEMAND_MAX_INTERVALS_PER_WRITER = 64
 CLOUD_DEMAND_MAX_INTERVALS = 8 * 1024
+CLOUD_ANNEX_MAX_RUNS = 256
+CLOUD_PUBLICATION_MAX_BYTES = 16 * 1024 * 1024
 SEGMENT_MAGIC = b"P16Q1\x00"
 FOOTER_MAGIC = b"P16F"
 SLOT_FORMAT = "poc16-cloud-writer-slot-v1"
@@ -95,6 +97,29 @@ class PartCopyUnavailable(RuntimeError):
 
 class MaintenanceRequired(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class MicroForkEvidence:
+    workspace: bytes
+    writer: bytes
+    lo: int
+    hi: int
+    key: str
+    incumbent_hash: str
+    proposed_hash: str
+
+
+class CloudMicroFork(ValueError):
+    """A divergent publication collided with a crash-orphaned micro."""
+
+    def __init__(self, evidence):
+        if not isinstance(evidence, MicroForkEvidence):
+            raise ValueError("cloud micro fork evidence")
+        self.evidence = evidence
+        super().__init__(
+            "cloud micro fork; readmit the authenticated orphan before "
+            "rebasing or rotate the writer identity")
 
 
 class CloudObjectStore(Protocol):
@@ -513,7 +538,7 @@ def decode_slot(raw):
 
 def _publication_bytes(publication):
     main = encode_run(publication.main)
-    if len(publication.carries) > 256 \
+    if len(publication.carries) > CLOUD_ANNEX_MAX_RUNS \
             or len(publication.handoff_targets) > 256:
         raise ValueError("cloud publication count")
     raw = bytearray(PUBLICATION_MAGIC)
@@ -529,11 +554,14 @@ def _publication_bytes(publication):
         if not isinstance(target, bytes) or len(target) != 32:
             raise ValueError("cloud handoff target")
         raw.extend(target)
-    return bytes(raw)
+    result = bytes(raw)
+    if len(result) > CLOUD_PUBLICATION_MAX_BYTES:
+        raise ValueError("cloud publication too large")
+    return result
 
 
 def _decode_publication(raw):
-    if not isinstance(raw, bytes) or len(raw) > 16 * 1024 * 1024 \
+    if not isinstance(raw, bytes) or len(raw) > CLOUD_PUBLICATION_MAX_BYTES \
             or not raw.startswith(PUBLICATION_MAGIC):
         raise ValueError("cloud publication")
     try:
@@ -732,7 +760,7 @@ class CloudQueue:
                 for writer, slot in _decode_directory(raw, self.workspace).items()}
 
     def publish(self, log, lo=None, hi=None, *, carries=(), handoff_targets=(),
-                announce=True):
+                holdings=None, announce=False):
         """Create one immutable micro publication and CAS only its owner slot.
 
         ``announce=False`` is the store-lag lever: a chat burst updates only
@@ -755,34 +783,41 @@ class CloudQueue:
                     and slot.head == encode_head(log.head()):
                 retry_lo = slot.segments[-1].lo if lo is None else lo
                 retry_run = prove_run(log, retry_lo, hi)
-                retry_publication = Publication(
-                    retry_run, carries, handoff_targets)
-                retry_raw = _encode_segment((retry_publication,), "micro")
                 retry_key = _micro_key(
                     self.workspace, log.writer, retry_lo, hi)
-                retry_descriptor = Segment(
-                    retry_key, retry_lo, hi, len(retry_raw), 1, "micro")
                 incumbent, _tag = self.store.get(retry_key)
-                if retry_descriptor == slot.segments[-1] \
-                        and incumbent == retry_raw:
-                    if announce:
-                        self.repair_directory()
-                    return PublicationReceipt(
-                        retry_descriptor,
-                        tuple(HandoffTicket(
-                            self.workspace, log.writer, retry_lo, hi,
-                            retry_key, target)
-                            for target in handoff_targets),
-                    )
+                if incumbent is not None:
+                    stored = _decode_segment(incumbent)
+                    retry_descriptor = Segment(
+                        retry_key, retry_lo, hi, len(incumbent), 1, "micro")
+                    if len(stored) == 1 \
+                            and stored[0].main == retry_run \
+                            and stored[0].handoff_targets == handoff_targets \
+                            and retry_descriptor == slot.segments[-1]:
+                        if announce:
+                            self.repair_directory()
+                        return PublicationReceipt(
+                            retry_descriptor,
+                            tuple(HandoffTicket(
+                                self.workspace, log.writer, retry_lo, hi,
+                                retry_key, target)
+                                for target in handoff_targets),
+                        )
             if slot is not None and sum(
                     item.kind == "micro" for item in slot.segments) \
                     >= MICRO_TAIL:
+                # The owner-confined slot is durable even if the shared hint
+                # lagged throughout the burst. Hitting the maintenance bound
+                # always advertises that durable prefix before asking the
+                # caller to fold it.
+                self.repair_directory()
                 raise MaintenanceRequired("cloud micro tail is ready to fold")
             lo = expected if lo is None else lo
             if lo != expected or hi <= lo:
                 raise ValueError("cloud writer sequence")
             run = prove_run(log, lo, hi)
-            publication = Publication(run, carries, handoff_targets)
+            publication = self._close_publication(
+                Publication(run, carries, handoff_targets), holdings)
             main_facts = decode_slice(run.facts, run.hi - run.lo)
             needs_heads = any(
                 fact.refs and (
@@ -792,7 +827,17 @@ class CloudQueue:
                 publication, self.visible_heads() if needs_heads else {})
             raw = _encode_segment((publication,), "micro")
             key = _micro_key(self.workspace, log.writer, lo, hi)
-            self.store.create(key, raw)
+            try:
+                self.store.create(key, raw)
+            except ValueError as error:
+                incumbent, _tag = self.store.get(key)
+                if incumbent is None or incumbent == raw:
+                    raise
+                raise CloudMicroFork(MicroForkEvidence(
+                    self.workspace, log.writer, lo, hi, key,
+                    hashlib.sha256(incumbent).hexdigest(),
+                    hashlib.sha256(raw).hexdigest(),
+                )) from error
             descriptor = Segment(key, lo, hi, len(raw), 1, "micro")
             segments = (*(() if slot is None else slot.segments), descriptor)
             new_slot = Slot(
@@ -808,6 +853,129 @@ class CloudQueue:
             )
             return PublicationReceipt(descriptor, tickets)
 
+    def readmit_orphan(self, writer, lo, hi, *, announce=False):
+        """Validate and install one micro created before a crashed slot CAS.
+
+        This chooses the already signed orphan branch. A divergent restarted
+        writer must then import/rebase that accepted branch or rotate identity;
+        it may never overwrite the immutable range key.
+        """
+        if not valid_writer(writer) or any(
+                type(item) is not int for item in (lo, hi)) \
+                or lo < 0 or hi <= lo:
+            raise ValueError("cloud orphan range")
+        with self._lock:
+            slot, token = self._slot_versioned(writer)
+            expected = 0 if slot is None else slot.hi
+            key = _micro_key(self.workspace, writer, lo, hi)
+            raw, _tag = self.store.get(key)
+            if raw is None:
+                raise ValueError("missing cloud orphan")
+            publications = _decode_segment(raw)
+            if len(publications) != 1:
+                raise ValueError("cloud orphan publication")
+            publication = publications[0]
+            run = publication.main
+            if run.writer != writer or run.lo != lo or run.hi != hi:
+                raise ValueError("cloud orphan binding")
+            descriptor = Segment(key, lo, hi, len(raw), 1, "micro")
+            if slot is not None and slot.segments \
+                    and slot.segments[-1] == descriptor \
+                    and slot.head == encode_head(run.head):
+                return PublicationReceipt(
+                    descriptor,
+                    tuple(HandoffTicket(
+                        self.workspace, writer, lo, hi, key, target)
+                        for target in publication.handoff_targets),
+                )
+            if expected != lo:
+                raise ValueError("stale cloud orphan")
+            self._validate_publication(publication, self.visible_heads())
+            segments = (*(() if slot is None else slot.segments), descriptor)
+            replacement = Slot(
+                self.workspace, writer, encode_head(run.head), segments)
+            if not self.store.cas(
+                    self._slot_key(writer), token, encode_slot(replacement)):
+                raise ValueError("stale cloud orphan")
+            if announce:
+                self.repair_directory()
+            return PublicationReceipt(
+                descriptor,
+                tuple(HandoffTicket(
+                    self.workspace, writer, lo, hi, key, target)
+                    for target in publication.handoff_targets),
+            )
+
+    def _close_publication(self, publication, holdings):
+        """Carry the exact transitive cross-writer closure once per micro.
+
+        A same-writer ref remains a sequence cite. Every cross-writer target
+        is an authenticated exact Run drawn from the publisher's local
+        holdings (or an explicit caller-supplied carry), recursively. Folds
+        preserve these deterministic adjacent annex runs unchanged.
+        """
+        if holdings is not None and not isinstance(holdings, PeerState):
+            raise ValueError("cloud publication holdings")
+        carried_facts = {}
+        for run in publication.carries:
+            facts = decode_slice(run.facts, run.hi - run.lo)
+            for offset, fact in enumerate(facts):
+                address = (run.writer, run.lo + offset)
+                incumbent = carried_facts.get(address)
+                if incumbent is not None and incumbent != fact:
+                    raise ValueError("cloud annex equivocation")
+                carried_facts[address] = fact
+
+        main_facts = decode_slice(
+            publication.main.facts,
+            publication.main.hi - publication.main.lo)
+        main_addresses = {
+            (publication.main.writer, publication.main.lo + offset)
+            for offset in range(len(main_facts))
+        }
+        frontier = []
+
+        def extend(writer, seq, fact):
+            for ref in fact.refs:
+                if ref.writer != writer \
+                        and (ref.writer, ref.seq) not in main_addresses:
+                    frontier.append(ref)
+
+        for offset, fact in enumerate(main_facts):
+            extend(publication.main.writer,
+                   publication.main.lo + offset, fact)
+
+        generated = []
+        visited = set(main_addresses)
+        while frontier:
+            ref = frontier.pop(0)
+            address = (ref.writer, ref.seq)
+            if address in visited:
+                continue
+            visited.add(address)
+            fact = carried_facts.get(address)
+            if fact is None:
+                target = None if holdings is None \
+                    else holdings.logs.get(ref.writer)
+                if target is None or ref.seq not in target._facts:
+                    raise ValueError(
+                        "Rule-2/cross-writer reference lacks adjacent annex")
+                run = prove_run(target, ref.seq, ref.seq + 1)
+                generated.append(run)
+                fact = target.fact(ref.seq)
+                carried_facts[address] = fact
+            extend(ref.writer, ref.seq, fact)
+
+        encoded = {}
+        for run in (*publication.carries, *generated):
+            raw = encode_run(run)
+            encoded[raw] = run
+        carries = tuple(encoded[raw] for raw in sorted(encoded))
+        if len(carries) > CLOUD_ANNEX_MAX_RUNS:
+            raise ValueError("cloud annex run count")
+        return Publication(
+            publication.main, carries, publication.handoff_targets)
+
     def _validate_publication(self, publication, visible):
         main_facts = decode_slice(
             publication.main.facts, publication.main.hi - publication.main.lo)
@@ -815,9 +983,27 @@ class CloudQueue:
         if handoff != bool(publication.handoff_targets):
             raise ValueError("handoff facts require explicit out-of-band targets")
         carried = {}
+        carried_facts = []
         for run in publication.carries:
-            for seq in range(run.lo, run.hi):
+            facts = decode_slice(run.facts, run.hi - run.lo)
+            for offset, seq in enumerate(range(run.lo, run.hi)):
                 carried[(run.writer, seq)] = run
+                carried_facts.append((run.writer, seq, facts[offset]))
+        available = set(carried)
+        available.update(
+            (publication.main.writer, publication.main.lo + offset)
+            for offset in range(len(main_facts)))
+        all_facts = [
+            (publication.main.writer,
+             publication.main.lo + offset, fact)
+            for offset, fact in enumerate(main_facts)]
+        all_facts.extend(carried_facts)
+        for writer, _seq, fact in all_facts:
+            for ref in fact.refs:
+                if ref.writer != writer \
+                        and (ref.writer, ref.seq) not in available:
+                    raise ValueError(
+                        "Rule-2/cross-writer reference lacks adjacent annex")
         for fact in main_facts:
             if not (is_control(fact) or fact.family in HANDOFF_FAMILIES):
                 continue
@@ -999,6 +1185,12 @@ class CloudQueue:
     def poll(self, if_none_match=None):
         raw, tag = self.store.get(
             self.directory_key, if_none_match=if_none_match)
+        # A missing derived hint is repairable from owner-confined slots by
+        # any reader. A conditional 304 has an opaque tag and remains the
+        # one-GET no-change path; it is not a missing object.
+        if raw is None and tag is None:
+            self.repair_directory()
+            raw, tag = self.store.get(self.directory_key)
         return (None if raw is None else _decode_directory(raw, self.workspace)), tag
 
     def read_run(self, writer, lo, hi):
@@ -1149,9 +1341,9 @@ class CloudQueue:
                     root_addresses.add((writer, seq))
                     initial_refs.update(fact.refs)
         visited = {Ref(writer, seq) for writer, seq in root_addresses}
-        initial_refs.update(cache.pending)
         frontier = {ref: 1 for ref in initial_refs if ref not in visited}
         pending = set()
+        exhausted_pending = set()
         closure_segments = set()
         closure_target_addresses = set()
         closure_bytes = 0
@@ -1174,12 +1366,14 @@ class CloudQueue:
                     continue
                 if refs_examined >= closure_limits.max_refs:
                     pending.add(ref)
+                    exhausted_pending.add(ref)
                     closure_exhausted = True
                     continue
                 refs_examined += 1
                 visited.add(ref)
                 if depth > closure_limits.max_depth:
                     pending.add(ref)
+                    exhausted_pending.add(ref)
                     closure_exhausted = True
                     continue
                 fact = resident(ref)
@@ -1212,6 +1406,8 @@ class CloudQueue:
                         or closure_bytes + sum(item.size for item in allowed) \
                         + segment.size > closure_limits.max_bytes:
                     pending.update(ref for ref, _depth in needed[segment])
+                    exhausted_pending.update(
+                        ref for ref, _depth in needed[segment])
                     closure_exhausted = True
                 else:
                     allowed.append(segment)
@@ -1246,9 +1442,8 @@ class CloudQueue:
                                 next_frontier.get(dependency, 0), depth + 1)
             frontier = next_frontier
 
-        pending = {
-            ref for ref in pending if resident(ref) is None
-        }
+        pending = exhausted_pending | {
+            ref for ref in pending if resident(ref) is None}
         delta = self.store.metrics.delta(before)
         # Directory, bounded footer waves, then bounded immutable-body waves.
         footer_gets = len(all_segments) if ts_window is not None else 0
@@ -1333,14 +1528,17 @@ def _subtract_coverage(intervals, coverage):
 
 
 __all__ = (
+    "CLOUD_ANNEX_MAX_RUNS",
     "CLOUD_CLOSURE_MAX_BYTES", "CLOUD_CLOSURE_MAX_DEPTH",
     "CLOUD_CLOSURE_MAX_REFS", "CLOUD_CLOSURE_MAX_SEGMENTS",
     "CLOUD_DEMAND_MAX_INTERVALS", "CLOUD_DEMAND_MAX_INTERVALS_PER_WRITER",
     "CLOUD_DEMAND_MAX_WRITERS", "CLOUD_GET_CONCURRENCY", "CloudCache",
-    "CloudClosureLimits", "CloudDemand",
+    "CLOUD_PUBLICATION_MAX_BYTES",
+    "CloudClosureLimits", "CloudDemand", "CloudMicroFork",
     "CloudMetrics", "CloudObjectStore", "CloudQueue", "CloudSyncReport",
     "EPOCH_CAP", "FOOTER_READ", "HANDOFF_FAMILIES", "HandoffTicket",
     "MICRO_TAIL", "MULTIPART_EDGE", "MaintenanceRequired", "MemoryCloud",
+    "MicroForkEvidence",
     "PartCopyUnavailable",
     "PublicationReceipt", "Segment", "WriterDemand", "decode_footer",
     "decode_slot", "encode_slot",

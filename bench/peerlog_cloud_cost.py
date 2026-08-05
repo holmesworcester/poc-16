@@ -75,6 +75,7 @@ def measure(writers=3, facts_per_writer=64, body_bytes=90):
     start = store.metrics.copy()
     cloud.publish(changed, seq, seq + 1)
     warm_publish = store.metrics.delta(start)
+    cloud.repair_directory()
     start = store.metrics.copy()
     warm = cloud.sync(state, cache)
     warm_cost = store.metrics.delta(start)

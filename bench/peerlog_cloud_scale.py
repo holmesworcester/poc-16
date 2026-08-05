@@ -22,6 +22,8 @@ from peerlog.cloud import (
     CloudDemand,
     CloudQueue,
     MemoryCloud,
+    Publication,
+    _encode_segment,
 )
 from peerlog.fact import Fact, Ref
 from peerlog.ingest import PeerState
@@ -87,6 +89,7 @@ class InteractiveScale:
     initial_bytes: int
     closure_bytes: int
     closure_facts: int
+    annex_facts: int
     segment_overfetch_facts: int
     closure_depth: int
     interactive_ready: bool
@@ -113,12 +116,23 @@ class SkewedInteractiveScale:
     initial_bytes: int
     closure_bytes: int
     closure_facts: int
+    annex_facts: int
     segment_overfetch_facts: int
     closure_depth: int
     interactive_ready: bool
     time_to_interactive_s: float
     semantic_facts_per_s: float
     projected_network_s: float
+
+
+@dataclass(frozen=True)
+class AnnexScale:
+    facts: int
+    refs: int
+    segment_bytes: int
+    baseline_bytes: int
+    annex_bytes: int
+    annex_ratio: float
 
 
 def _workspace(label):
@@ -145,6 +159,14 @@ def _log(ordinal, count, body_bytes, refs_by_seq=None):
     return log
 
 
+def _holdings(logs):
+    """Publication-only local holdings; no derived treap rebuild is needed."""
+    state = PeerState()
+    state.logs = {log.writer: log for log in logs}
+    state.heads = {log.writer: log.head() for log in logs if len(log)}
+    return state
+
+
 def measure_cold(*, writers=50, facts=100_000, body_bytes=80):
     if type(writers) is not int or writers <= 0 \
             or type(facts) is not int or facts <= 0 or facts % writers:
@@ -153,6 +175,7 @@ def measure_cold(*, writers=50, facts=100_000, body_bytes=80):
     queue = CloudQueue(store, _workspace(f"cold/{writers}/{facts}"))
     started = time.perf_counter()
     per_writer = facts // writers
+    logs = []
     for ordinal in range(writers):
         log = _log(ordinal, per_writer, body_bytes)
         queue.publish(log, announce=False)
@@ -238,8 +261,8 @@ def measure_interactive(*, history_facts, recent_facts=1_000,
 
     Each writer has one old immutable segment and one recent segment.  One
     recent fact from writer 0 cites an old writer-1 fact, which cites an older
-    writer-2 fact.  TTI therefore includes two out-of-window dependency waves
-    and ends only at a pending-empty, renderable view.
+    writer-2 fact. The recent micro carries that exact transitive annex, so TTI
+    ends at a pending-empty renderable view without cross-writer chase waves.
     """
     if type(history_facts) is not int or history_facts <= 0 \
             or type(recent_facts) is not int or recent_facts <= 0 \
@@ -257,6 +280,7 @@ def measure_interactive(*, history_facts, recent_facts=1_000,
     recent_lo = per_writer - recent_per_writer
     b_target = max(0, recent_lo // 2)
     c_target = max(0, b_target // 2)
+    logs = []
     for ordinal in range(writers):
         refs = {}
         if ordinal == 0:
@@ -264,8 +288,14 @@ def measure_interactive(*, history_facts, recent_facts=1_000,
         elif ordinal == 1:
             refs[b_target] = (Ref(_writer_id(2), c_target),)
         log = _log(ordinal, per_writer, body_bytes, refs)
-        queue.publish(log, 0, recent_lo, announce=False)
-        queue.publish(log, recent_lo, per_writer, announce=False)
+        logs.append(log)
+    holdings = _holdings(logs)
+    for log in logs:
+        queue.publish(
+            log, 0, recent_lo, holdings=holdings, announce=False)
+        queue.publish(
+            log, recent_lo, per_writer,
+            holdings=holdings, announce=False)
     queue.repair_directory()
 
     state = PeerState()
@@ -279,7 +309,7 @@ def measure_interactive(*, history_facts, recent_facts=1_000,
     elapsed = time.perf_counter() - started
     if not report.interactive_ready or report.pending \
             or report.initial_facts != recent_facts \
-            or report.closure_facts != 2:
+            or report.closure_facts != 0 or report.carries != 2:
         raise AssertionError("interactive scale convergence")
     projected = report.received_bytes / BANDWIDTH_BYTES_S \
         + report.rounds * RTT_S
@@ -288,9 +318,10 @@ def measure_interactive(*, history_facts, recent_facts=1_000,
         report.initial_segment_gets, report.closure_segment_gets,
         report.rounds, report.received_bytes,
         report.initial_bytes, report.closure_bytes, report.closure_facts,
+        report.carries,
         report.segment_overfetch_facts, report.closure_depth,
         report.interactive_ready, elapsed, recent_facts / elapsed,
-        (recent_facts + report.closure_facts) / elapsed, projected,
+        (recent_facts + report.carries) / elapsed, projected,
     )
 
 
@@ -331,13 +362,16 @@ def measure_skewed_interactive(*, history_facts, requested_tail=2,
                 Ref(_writer_id(2), second_medium_target),)
         log = _log(ordinal, count, body_bytes, refs)
         logs.append(log)
+    holdings = _holdings(logs)
+    for log, count in zip(logs, counts):
         if not count:
             continue
         split = max(0, count - requested_tail)
         cursor = micros = 0
         while cursor < split:
             stop = min(split, cursor + SKEW_PUBLICATION_FACTS)
-            queue.publish(log, cursor, stop, announce=False)
+            queue.publish(
+                log, cursor, stop, holdings=holdings, announce=False)
             cursor = stop
             micros += 1
             if micros == SKEW_FOLD_PUBLICATIONS:
@@ -345,7 +379,8 @@ def measure_skewed_interactive(*, history_facts, requested_tail=2,
                 micros = 0
         if micros:
             queue.fold_idle(log.writer, announce=False)
-        queue.publish(log, split, count, announce=False)
+        queue.publish(
+            log, split, count, holdings=holdings, announce=False)
     queue.repair_directory()
 
     demand = CloudDemand.tails(
@@ -357,7 +392,7 @@ def measure_skewed_interactive(*, history_facts, requested_tail=2,
     selected = sum(min(requested_tail, count) for count in counts)
     if not report.interactive_ready or report.pending \
             or report.initial_facts != selected \
-            or report.closure_facts != 2:
+            or report.closure_facts != 0 or report.carries != 2:
         raise AssertionError("skew scale convergence")
     projected = report.received_bytes / BANDWIDTH_BYTES_S \
         + report.rounds * RTT_S
@@ -367,9 +402,46 @@ def measure_skewed_interactive(*, history_facts, requested_tail=2,
         report.initial_segment_gets, report.closure_segment_gets,
         report.rounds, report.received_bytes, report.initial_bytes,
         report.closure_bytes,
-        report.closure_facts, report.segment_overfetch_facts,
+        report.closure_facts, report.carries,
+        report.segment_overfetch_facts,
         report.closure_depth, report.interactive_ready, elapsed,
-        (selected + report.closure_facts) / elapsed, projected,
+        (selected + report.carries) / elapsed, projected,
+    )
+
+
+def measure_annex(*, facts, ref_stride=8, body_bytes=160):
+    """Measure universal cross-writer annex cost in one folded artifact."""
+    if type(facts) is not int or facts < 32 or facts % 32 \
+            or type(ref_stride) is not int or ref_stride <= 0:
+        raise ValueError("annex scale shape")
+    target_count = (facts + ref_stride - 1) // ref_stride
+    target = _log(20_000, target_count, body_bytes)
+    citing = WriterLog.owned(_writer_secret(20_001))
+    for seq in range(facts):
+        refs = () if seq % ref_stride else (
+            Ref(target.writer, seq // ref_stride),)
+        citing.append(Fact("msg", 30_000_000 + seq, refs, b"m" * body_bytes))
+    holdings = _holdings((target, citing))
+    store = MemoryCloud()
+    queue = CloudQueue(store, _workspace(
+        f"annex/{facts}/{ref_stride}/{body_bytes}"))
+    width = facts // 32
+    for lo in range(0, facts, width):
+        queue.publish(
+            citing, lo, lo + width,
+            holdings=holdings, announce=False)
+    slot = queue.fold_idle(citing.writer, announce=False)
+    if len(slot.segments) != 1:
+        raise AssertionError("annex scale segment")
+    segment = slot.segments[0]
+    publications = queue._read_segment(segment)
+    baseline = _encode_segment(tuple(
+        Publication(publication.main, (), publication.handoff_targets)
+        for publication in publications), segment.kind)
+    annex_bytes = segment.size - len(baseline)
+    return AnnexScale(
+        facts, target_count, segment.size, len(baseline), annex_bytes,
+        segment.size / len(baseline),
     )
 
 
@@ -383,6 +455,9 @@ def main():
     parser.add_argument(
         "--skew-full", action="store_true",
         help="measure skew-aware tails over 10k/100k/1M histories")
+    parser.add_argument(
+        "--annex-full", action="store_true",
+        help="measure folded cross-writer annex ratios by segment size")
     args = parser.parse_args()
     result = {
         "concurrency": CLOUD_GET_CONCURRENCY,
@@ -401,6 +476,11 @@ def main():
         result["skewed_interactive"] = [
             asdict(measure_skewed_interactive(history_facts=facts))
             for facts in (10_000, 100_000, 1_000_000)
+        ]
+    if args.annex_full:
+        result["annex"] = [
+            asdict(measure_annex(facts=facts))
+            for facts in (256, 2_048, 16_384)
         ]
     print(json.dumps(result, indent=2, sort_keys=True))
 

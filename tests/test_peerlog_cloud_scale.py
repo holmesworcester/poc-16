@@ -1,6 +1,7 @@
 import math
 
 from bench.peerlog_cloud_scale import (
+    measure_annex,
     measure_cold,
     measure_fanout,
     measure_interactive,
@@ -53,18 +54,18 @@ def test_recent_window_cost_is_independent_of_cold_history_size():
     for report in (small, large):
         assert report.recent_facts == 100
         assert report.initial_segment_gets == 10
-        assert report.closure_segment_gets == 2
-        assert report.object_gets == 12
-        assert report.rounds == 4
-        assert report.closure_facts == report.closure_depth == 2
+        assert report.closure_segment_gets == report.closure_facts == 0
+        assert report.annex_facts == report.closure_depth == 2
+        assert report.object_gets == 10
+        assert report.rounds == 2
         assert report.interactive_ready
         assert report.initial_bytes < 128 * 1024
         assert report.semantic_facts_per_s > 0
-    # Initial recent-view cost stays fixed. Only the two containing old
-    # segments grow with history; unrelated old segments remain unopened.
+    # The recent micro carries the fixed two-fact annex. No old segment opens.
     assert abs(small.initial_bytes - large.initial_bytes) < 4 * 1024
-    assert large.closure_bytes > small.closure_bytes
-    assert large.segment_overfetch_facts > small.segment_overfetch_facts
+    assert small.closure_bytes == large.closure_bytes == 0
+    assert small.segment_overfetch_facts \
+        == large.segment_overfetch_facts == 0
 
 
 def test_skewed_recent_view_cost_tracks_writer_tails_not_hot_sequence():
@@ -75,8 +76,9 @@ def test_skewed_recent_view_cost_tracks_writer_tails_not_hot_sequence():
         assert report.requested_writers == 1_006
         assert report.selected_facts == 1_262
         assert report.initial_segment_gets == 756
-        assert report.closure_segment_gets == report.closure_facts == 2
-        assert report.object_gets == 758
+        assert report.closure_segment_gets == report.closure_facts == 0
+        assert report.annex_facts == report.closure_depth == 2
+        assert report.object_gets == 756
         assert report.closure_depth == 2
         assert report.hot_facts > report.selected_facts
         assert report.interactive_ready
@@ -84,4 +86,12 @@ def test_skewed_recent_view_cost_tracks_writer_tails_not_hot_sequence():
     assert small.initial_segment_gets == large.initial_segment_gets
     assert small.rounds == large.rounds
     assert abs(small.initial_bytes - large.initial_bytes) < 8 * 1024
-    assert large.closure_bytes > small.closure_bytes
+    assert small.closure_bytes == large.closure_bytes == 0
+
+
+def test_folded_annex_ratio_stays_near_the_store_model_prediction():
+    for facts in (256, 2_048):
+        report = measure_annex(facts=facts)
+        assert report.refs == facts // 8
+        assert report.annex_bytes > 0
+        assert 1.05 < report.annex_ratio < 1.30
