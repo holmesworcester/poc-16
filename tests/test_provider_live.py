@@ -9,8 +9,10 @@ Commands:
       POC16_R2_ACCESS_KEY_ID=... POC16_R2_SECRET_ACCESS_KEY=... \
       python3 -m pytest -q -m live_r2 tests/test_provider_live.py
 
-Scenario 8-11 lookup-gate contention is included in the live R2 selection and
-prints exact operation counts plus projected request cost.
+Scenario 8-11 lookup-gate contention is included in the live R2 selection.
+The queue probe prints logical adapter-operation counts and their projected
+cost; SDK retries and list pagination are intentionally not called billing-
+exact physical-request telemetry.
 
 These tests reject endpoint overrides.  Emulator runs can exercise SDK wiring
 elsewhere but are not provider evidence.
@@ -421,12 +423,17 @@ class _RangeCountingCloud(S3Cloud):
     def __init__(self, store):
         super().__init__(store)
         self.range_gets = 0
+        self.not_modified_responses = 0
 
     def get(self, key, *, if_none_match=None, suffix=None):
         if suffix is not None:
             self.range_gets += 1
-        return super().get(
+        value, token = super().get(
             key, if_none_match=if_none_match, suffix=suffix)
+        if if_none_match is not None and value is None \
+                and token == if_none_match:
+            self.not_modified_responses += 1
+        return value, token
 
 
 @pytest.mark.live
@@ -563,14 +570,12 @@ def test_live_r2_queue_clobber_scenarios_3_4_5_7(live_r2_store):
     churn_thread = threading.Thread(target=churn, name="live-r2-read-churn")
     churn_thread.start()
     churn_state, churn_cache = PeerState(), CloudCache()
-    not_modified = changed = 0
+    changed = 0
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline:
         report = reader.sync(
             churn_state, churn_cache, ts_window=(0, 10_000))
-        if report.rounds == 1:
-            not_modified += 1
-        else:
+        if report.changed:
             changed += 1
         if done.is_set() and churn_state.logs.get(churn_log.writer) \
                 is not None and churn_state.logs[
@@ -581,7 +586,7 @@ def test_live_r2_queue_clobber_scenarios_3_4_5_7(live_r2_store):
     assert not churn_thread.is_alive()
     assert not churn_errors
     assert churn_state.logs[churn_log.writer].coverage() == ((0, 8),)
-    assert changed > 0 and not_modified > 0
+    assert changed > 0 and reader_provider.not_modified_responses > 0
     assert reader_provider.range_gets > 0
 
     cost = provider_request_report(providers)
@@ -591,12 +596,12 @@ def test_live_r2_queue_clobber_scenarios_3_4_5_7(live_r2_store):
         "orphan_readmitted": True,
         "multipart_completes": 2,
         "read_churn_changes": changed,
-        "read_churn_not_modified": not_modified,
+        "read_churn_not_modified": reader_provider.not_modified_responses,
         "footer_range_gets": reader_provider.range_gets,
         **cost,
     }
     print(json.dumps(report, indent=2), flush=True)
-    assert cost["projected_r2_usd"] < 0.05
+    assert cost["projected_logical_r2_usd"] < 0.05
 
 
 @pytest.mark.live

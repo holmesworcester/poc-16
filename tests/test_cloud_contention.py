@@ -8,7 +8,7 @@ class Provider:
         self.metrics = CloudMetrics(**values)
 
 
-def test_contention_report_counts_and_prices_all_provider_requests():
+def test_contention_report_counts_and_prices_logical_adapter_operations():
     first = Provider(gets=7, puts=5, cas=3, lists=2)
     report = provider_request_report((
         first,
@@ -23,7 +23,7 @@ def test_contention_report_counts_and_prices_all_provider_requests():
         ),
     ))
 
-    assert report["operations"] == {
+    assert report["logical_operations"] == {
         "gets": 11,
         "puts": 6,
         "cas": 5,
@@ -32,6 +32,6 @@ def test_contention_report_counts_and_prices_all_provider_requests():
         "part_copies": 1,
         "multipart_completes": 1,
     }
-    assert report["class_a"] == 16
-    assert report["class_b"] == 11
-    assert report["projected_r2_usd"] == 0.00007596
+    assert report["logical_class_a"] == 16
+    assert report["logical_class_b"] == 11
+    assert report["projected_logical_r2_usd"] == 0.00007596

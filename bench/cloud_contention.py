@@ -68,7 +68,12 @@ def _make_provider(factory):
 
 
 def provider_request_report(providers):
-    """Conservatively count and price every operation made by the probe."""
+    """Count logical adapter operations and estimate their request cost.
+
+    These counters sit above the SDK.  A paginated list or an SDK read retry
+    can issue more than one physical provider request, so this report must not
+    be presented as billing-exact request telemetry.
+    """
     providers = tuple({
         id(provider): provider for provider in providers
     }.values())
@@ -82,10 +87,10 @@ def provider_request_report(providers):
     ))
     class_b = operations["gets"]
     return {
-        "operations": operations,
-        "class_a": class_a,
-        "class_b": class_b,
-        "projected_r2_usd": round(
+        "logical_operations": operations,
+        "logical_class_a": class_a,
+        "logical_class_b": class_b,
+        "projected_logical_r2_usd": round(
             class_a * 4.50 / 1_000_000
             + class_b * 0.36 / 1_000_000,
             8,
@@ -291,7 +296,7 @@ def main():
         "writes_per_second": round(
             outcome.published / outcome.seconds, 2) if outcome.seconds else None,
     }
-    report["provider_requests"] = provider_request_report(providers)
+    report["provider_logical_operations"] = provider_request_report(providers)
 
     print(json.dumps(report, indent=2))
 
