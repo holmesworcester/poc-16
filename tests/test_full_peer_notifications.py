@@ -171,7 +171,7 @@ def test_crash_after_fcm_acceptance_replays_stable_delivery(tmp_path):
     def crash_on_progress(key, token, value):
         nonlocal calls
         calls += 1
-        if calls == 3:
+        if calls == 4:
             raise RuntimeError("crash after FCM acceptance")
         return real_cas(key, token, value)
 

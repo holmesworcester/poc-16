@@ -1264,8 +1264,12 @@ each invocation opens at most one `PAGE_BATCH` directory page and persists its
 opaque provider continuation. One exact unknown head remains pinned across
 turns. Its cursor first checks at most one `PAGE_BATCH` authenticated-history
 page, then validates at most one independently closed suffix pile per turn and
-records the exact phase, leaf continuation, sequence, and observed-control map
-before proceeding. The ordinary head/tree/pile/fact ceilings still apply, and
+records the exact phase, leaf continuation, sequence, observed-control map,
+and staged trigger-reference map before proceeding. No pending delivery is
+installed until every pile and the exact control declaration for that pinned
+head have passed; a bad later pile therefore discards the staged references and
+quarantines the head without leaking an early trigger. The ordinary
+head/tree/pile/fact ceilings still apply, and
 an invalid `(device, head)` is retained in the rejected map until that device
 advertises a different head. Removal therefore cannot turn either a directory
 page or one stale writer suffix into an unbounded invocation.

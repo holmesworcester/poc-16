@@ -76,7 +76,7 @@ from .hints import (
 CURSOR_FORMAT = "notification-writer-cursor-v2"
 MAX_CURSOR_BYTES = 16 * 1024
 MAX_SCAN_PILES_PER_TURN = 1
-SCAN_PHASES = frozenset(("base", "suffix", "complete"))
+SCAN_PHASES = frozenset(("base", "suffix", "emit", "complete"))
 BOOTSTRAP_CURRENT = "current"
 BOOTSTRAP_BACKFILL = "backfill"
 PENDING_CURRENT = "current"
@@ -126,18 +126,29 @@ class Scan:
     after: str | None = None
     sequence: int = 0
     controls: dict = field(default_factory=empty_descriptor)
+    events: dict = field(default_factory=empty_descriptor)
 
     def __post_init__(self):
+        after_ok = self.after is None
+        if self.after is not None and isinstance(self.after, str):
+            try:
+                after_ok = valid_fid(self.after) if self.phase == "emit" \
+                    else parse_leaf_key(self.after) >= 1
+            except ValueError:
+                after_ok = False
         if not all(valid_fid(value) for value in (
                 self.device, self.head, self.removal_root)) \
                 or self.phase not in SCAN_PHASES \
-                or self.after is not None and (
-                    not isinstance(self.after, str)
-                    or parse_leaf_key(self.after) < 1) \
+                or not after_ok \
+                or self.phase == "complete" and self.after is not None \
                 or type(self.sequence) is not int \
                 or not 0 <= self.sequence <= MAX_WRITER_SEQUENCE:
             raise ValueError("notification scan")
         object.__setattr__(self, "controls", _descriptor(self.controls))
+        object.__setattr__(self, "events", _descriptor(self.events))
+        if self.controls["count"] > MAX_HEAD_CONTROL_PILES \
+                or self.phase == "emit" and not self.events["count"]:
+            raise ValueError("notification scan")
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +237,7 @@ def _scan_body(value):
         "after": value.after,
         "controls": _descriptor_body(value.controls),
         "device": value.device,
+        "events": _descriptor_body(value.events),
         "head": value.head,
         "phase": value.phase,
         "removal_root": value.removal_root,
@@ -272,7 +284,7 @@ def decode_cursor(raw):
     raw_pending = value.get("pending")
     if raw_scan is not None and (
             not isinstance(raw_scan, dict) or set(raw_scan) != {
-                "after", "controls", "device", "head", "phase",
+                "after", "controls", "device", "events", "head", "phase",
                 "removal_root", "sequence"}):
         raise ValueError("notification scan shape")
     if raw_pending is not None and (
@@ -283,7 +295,7 @@ def decode_cursor(raw):
         raw_scan.get("device"), raw_scan.get("head"),
         raw_scan.get("removal_root"), raw_scan.get("phase"),
         raw_scan.get("after"), raw_scan.get("sequence"),
-        raw_scan.get("controls"))
+        raw_scan.get("controls"), raw_scan.get("events"))
     pending = None if raw_pending is None else Pending(
         raw_pending.get("oid"), raw_pending.get("heads"),
         raw_pending.get("seen"))
@@ -500,6 +512,25 @@ class NotificationDiscovery:
         )
         return built_descriptor(built)
 
+    async def _map_page(self, name, descriptor, after, limit):
+        """Read one bounded page from an authenticated cursor map."""
+        seed = self._seed(name)
+        remote = merkle_map.Reader(
+            descriptor["root"], seed, self._map_fetch,
+            max_page_depth=descriptor["depth"],
+            expected_count=descriptor["count"],
+            expected_depth=descriptor["depth"],
+        )
+        empty = merkle_map.Reader(
+            "", seed, self._map_fetch,
+            max_page_depth=0, expected_count=0, expected_depth=0,
+        )
+        page = await remote.diff_page_awaited(
+            empty, after=after, limit=limit)
+        if page.rows != page.differing or len(page.rows) > limit:
+            raise ValueError("notification cursor map page")
+        return page.rows, page.cursor
+
     @staticmethod
     def _trigger_rows(state):
         rows = []
@@ -680,10 +711,8 @@ class NotificationDiscovery:
         base_oid, accepted, candidate, controls = await self._scan_context(
             cursor)
         accepted_tree = EMPTY_TREE if accepted is None else accepted.tree
-        if scan.phase == "complete":
-            if scan.sequence != candidate.sequence:
-                raise ValueError("notification scan completion")
-            return base_oid, candidate, controls, scan, None, True
+        if scan.phase not in {"base", "suffix"}:
+            raise ValueError("notification scan validation phase")
 
         if scan.phase == "base":
             if accepted_tree != EMPTY_TREE:
@@ -800,10 +829,57 @@ class NotificationDiscovery:
             return DiscoveryResult("raced", cursor.scan.head)
         return DiscoveryResult("invalid", cursor.scan.head)
 
+    async def _emit(self, cursor, token):
+        """Publish one page only after the complete pinned head validated."""
+        scan = cursor.scan
+        rows, continuation = await self._map_page(
+            "scan-events", scan.events, scan.after, self.page_rows)
+        if not rows:
+            raise ValueError("notification staged event page")
+        events = []
+        for fid, oid in rows:
+            if not valid_fid(fid) or not valid_fid(oid):
+                raise ValueError("notification staged event")
+            raw = await self._get(
+                self.cursor_store, "obj/" + oid, MAX_FACT_BYTES)
+            if not isinstance(raw, bytes) or h(raw) != oid:
+                raise ValueError("notification staged event")
+            events.append(EventRef(fid, oid))
+        base = (await self._map_points(
+            "heads", cursor.heads, (scan.device,)))[scan.device]
+        hint = NotificationHint(
+            self.workspace, self.owner, cursor.generation,
+            scan.device, base, scan.head, tuple(events))
+        raw = encode_hint(hint)
+        oid = await self._ensure_object(raw, MAX_HINT_BYTES)
+        seen = await self._map_update(
+            "seen", cursor.seen,
+            tuple((event.fid, event.oid) for event in events))
+        successor = replace(
+            scan,
+            phase="complete" if continuation is None else "emit",
+            after=continuation,
+        )
+        pending = Pending(oid, cursor.heads, seen)
+        desired = replace(cursor, scan=successor, pending=pending)
+        if await self._cas_exact(token, desired) is None:
+            return DiscoveryResult("raced", scan.head)
+        await self._publish(raw)
+        return DiscoveryResult("published", scan.head, None, oid)
+
     async def _scan(self, cursor, token):
         scan = cursor.scan
+        if scan.phase == "emit":
+            return await self._emit(cursor, token)
+        if scan.phase == "complete":
+            heads = await self._map_update(
+                "heads", cursor.heads, ((scan.device, scan.head),))
+            desired = replace(cursor, heads=heads, scan=None)
+            if await self._cas_exact(token, desired) is None:
+                return DiscoveryResult("raced", scan.head)
+            return DiscoveryResult("advanced", scan.head)
         try:
-            base, _candidate, controls, next_scan, processed, complete = \
+            _base, _candidate, controls, next_scan, processed, complete = \
                 await self._scan_page(cursor)
         except ValueError:
             return await self._reject_scan(cursor, token)
@@ -819,55 +895,34 @@ class NotificationDiscovery:
                 next_scan = replace(next_scan, controls=next_controls)
             rows = await self._unseen(
                 cursor.seen, self._trigger_rows(state))
-        else:
-            rows = ()
+            if rows:
+                staged = []
+                for fid, oid, raw in rows:
+                    if await self._ensure_object(raw, MAX_FACT_BYTES) != oid:
+                        raise ValueError("notification staged event")
+                    staged.append((fid, oid))
+                event_map = await self._map_update(
+                    "scan-events", next_scan.events, tuple(staged))
+                next_scan = replace(next_scan, events=event_map)
 
         if complete and next_scan.controls["count"] != len(controls):
             return await self._reject_scan(cursor, token)
-
-        page = rows[:self.page_rows]
-        if page:
-            events = []
-            for fid, oid, raw in page:
-                await self._ensure_object(raw, MAX_FACT_BYTES)
-                events.append(EventRef(fid, oid))
-            hint = NotificationHint(
-                self.workspace, self.owner, cursor.generation,
-                scan.device, base, scan.head, tuple(events))
-            raw = encode_hint(hint)
-            oid = await self._ensure_object(raw, MAX_HINT_BYTES)
-            seen = await self._map_update(
-                "seen", cursor.seen,
-                tuple((event.fid, event.oid) for event in events))
-            pending = Pending(oid, cursor.heads, seen)
-            # A deliberately small delivery page may not cover every trigger
-            # in this one closed pile. Re-evaluate that same bounded pile after
-            # completion; the durable seen map selects the next page.
-            successor = scan if len(rows) > len(page) else next_scan
-            if next_scan.controls != scan.controls:
-                successor = replace(
-                    successor, controls=next_scan.controls)
-            desired = replace(
-                cursor, scan=successor, pending=pending)
-            if await self._cas_exact(token, desired) is None:
-                return DiscoveryResult("raced", scan.head)
-            await self._publish(raw)
-            return DiscoveryResult(
-                "published", scan.head, None, oid)
-
-        if not complete:
-            desired = replace(cursor, scan=next_scan)
-            if await self._cas_exact(token, desired) is None:
-                return DiscoveryResult("raced", scan.head)
-            return DiscoveryResult(
-                "continued", scan.head, next_scan.after)
-
-        heads = await self._map_update(
-            "heads", cursor.heads, ((scan.device, scan.head),))
-        desired = replace(cursor, heads=heads, scan=None)
-        if await self._cas_exact(token, desired) is None:
+        if complete:
+            next_scan = replace(
+                next_scan,
+                phase="emit" if next_scan.events["count"] else "complete",
+                after=None,
+            )
+        desired = replace(cursor, scan=next_scan)
+        next_token = await self._cas_exact(token, desired)
+        if next_token is None:
             return DiscoveryResult("raced", scan.head)
-        return DiscoveryResult("advanced", scan.head)
+        if next_scan.phase == "emit":
+            return await self._emit(desired, next_token)
+        if next_scan.phase == "complete":
+            return await self._scan(desired, next_token)
+        return DiscoveryResult(
+            "continued", scan.head, next_scan.after)
 
     async def run_once(self):
         cursor, token = await self._read_cursor()

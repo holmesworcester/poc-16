@@ -557,8 +557,10 @@ def test_malformed_writer_is_quarantined_without_blocking_other_heads(
     carrier = MemoryCarrier([])
     discovery = _discovery(node, workspace, store, carrier)
     asyncio.run(discovery.bootstrap_current())
-    bad = message.post(node, workspace, "general", "corrupt", ts=30)
-    good = message.post(other, workspace, "general", "valid", ts=31)
+    bad = message.post(node, workspace, "general", "valid early", ts=30)
+    bad_later = message.post(
+        node, workspace, "general", "corrupt later", ts=31)
+    good = message.post(other, workspace, "general", "valid", ts=32)
     mirrored = asyncio.run(
         node.mirror(workspace).sync_from(other.store(workspace)))
     assert mirrored.errors == ()
@@ -583,7 +585,7 @@ def test_malformed_writer_is_quarantined_without_blocking_other_heads(
     assert "invalid" in {result.status for result in results}
     assert rejected[slot.device] == slot.head
     assert cursor.scan is cursor.pending is None
-    assert good in found and bad not in found
+    assert good in found and bad not in found and bad_later not in found
     assert asyncio.run(discovery.run_once()).status == "idle"
 
 
@@ -760,7 +762,8 @@ def test_large_writer_suffix_persists_one_pile_continuation_per_turn(
     found = {
         fid for raw in carrier.payloads for fid in decode_hint(raw).facts}
     assert found == expected
-    assert statuses.count("published") == len(expected)
+    assert statuses.count("published") == 1
+    assert "continued" in statuses
     assert max(observed_sequences) >= len(expected)
     assert observed_sequences == sorted(observed_sequences)
 
@@ -832,6 +835,8 @@ def test_hint_and_cursor_codecs_are_canonical_and_reject_old_shape():
     assert b'"phase":"suffix"' in encoded_cursor
     assert b'"sequence":1' in encoded_cursor
     assert b'"controls"' in encoded_cursor
+    assert b'"events":{"count":0,"depth":0,"root":""}' \
+        in encoded_cursor
     assert b'"removal_root"' in encoded_cursor
     assert b'"authority_root"' not in encoded_cursor
     assert decode_cursor(encoded_cursor) == cursor

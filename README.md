@@ -292,6 +292,13 @@ writer head is quarantined without being acknowledged or blocking other
 writers. Discovery does not consult SQLite, ingress, or a workspace-wide
 content root.
 
+Trigger references and their exact fact bytes are staged in notification state
+while a multi-pile head is scanned, but are not made pending or sent until the
+complete pinned suffix and its control declaration validate. A malformed later
+pile therefore cannot leak an earlier event or wedge delivery; the whole head
+is quarantined and unrelated writers remain discoverable. Once validated, the
+staged authenticated map is paged into ordinary bounded carrier bodies.
+
 Bootstrap is explicit: normal launch validates all current writer heads and
 marks their existing triggers seen, while a deliberate backfill starts with
 empty acknowledged/seen maps. Scanning with an absent cursor fails loudly.
@@ -301,10 +308,11 @@ worker cannot complete identical work after state loss and rebootstrap.
 One canonical body contains only workspace, immutable deployment owner,
 bootstrap generation, writer device, acknowledged/base head, pinned target
 head, and sorted `(fid, fact-object OID)` trigger references. Before
-publishing, the scanner copies those exact event bytes and the hint into
-notification state, then CASes one pending body OID with its exact seen-map
-successor. Writer validation itself is discarded until that cursor CAS, so a
-crash after validation cannot make a retry skip unacknowledged work. There is
+publishing, the scanner has already copied those exact event bytes into
+notification state and committed the complete validated-suffix continuation.
+It then stores the hint and CASes one pending body OID with its exact seen-map
+successor. A crash during validation or between staging and pending publication
+resumes from durable cursor state without skipping unacknowledged work. There is
 at most one pending page per workspace. Queue, SQS, and local deliveries are
 disposable wakes: every fair scheduled turn republishes the byte-identical
 pending body until the worker records completion. A lost wake, finite queue

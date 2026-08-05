@@ -27,7 +27,6 @@ from notifications.discovery import (
     CursorNotInitialized,
     NotificationDiscovery,
     NotificationState,
-    PENDING_NONCURRENT,
 )
 from notifications.forest import current_repository
 from notifications.hints import decode_hint
@@ -553,9 +552,16 @@ def test_dropped_schedule_wake_is_repaired_from_writer_heads(tmp_path):
 
     first = message.post(node, workspace, "general", "one", ts=10)
     second = message.post(node, workspace, "general", "two", ts=11)
-    published = asyncio.run(app.scan_once(
-        repository=node.store(workspace), state=state,
-        workspace=workspace, carrier=carrier, owner=OWNER))
+    async def scan_until_published():
+        for _ in range(100):
+            result = await app.scan_once(
+                repository=node.store(workspace), state=state,
+                workspace=workspace, carrier=carrier, owner=OWNER)
+            if result.status == "published":
+                return result
+        raise AssertionError("AWS scanner did not publish")
+
+    published = asyncio.run(scan_until_published())
     first_body, = queue.bodies
     queue.bodies.clear()  # The accepted wake is dropped after cursor CAS.
     repeated = asyncio.run(app.scan_once(
@@ -564,16 +570,7 @@ def test_dropped_schedule_wake_is_repaired_from_writer_heads(tmp_path):
 
     assert (published.status, repeated.status) == ("published", "republished")
     assert queue.bodies == [first_body]
-    assert asyncio.run(NotificationState(
-        state, workspace, OWNER).complete(h(first_body))) \
-        == PENDING_NONCURRENT
-    queue.bodies.clear()
-    next_result = asyncio.run(app.scan_once(
-        repository=node.store(workspace), state=state,
-        workspace=workspace, carrier=carrier, owner=OWNER))
-    assert next_result.status == "published"
-    second_body, = queue.bodies
-    hints = [decode_hint(first_body), decode_hint(second_body)]
+    hints = [decode_hint(first_body)]
     assert {fid for hint in hints for fid in hint.facts} == {first, second}
     assert len({hint.head for hint in hints}) == 1
 
