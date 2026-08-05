@@ -626,6 +626,13 @@ def smoke():
         raise cleanup
 
 
+def stress():
+    """Run the opt-in disposable live HTTP/R2 head-contention proof."""
+    from bench.cloudflare_http_contention import live_run
+
+    print(json.dumps(live_run(), indent=2, sort_keys=True))
+
+
 def help_text():
     return """usage: manage.py COMMAND
 
@@ -637,6 +644,7 @@ Commands:
   deploy    deploy one configured workspace with validated secrets
   remove    remove the configured production Worker
   smoke     opt-in live mint test using a unique, automatically removed Worker
+  stress    opt-in live HTTP head-contention test with exact R2 cleanup
   stage     internal custom-build hook used by Wrangler
 """
 
@@ -666,6 +674,9 @@ def main(argv):
         return 0
     if command == "smoke" and len(argv) == 2:
         smoke()
+        return 0
+    if command == "stress" and len(argv) == 2:
+        stress()
         return 0
     print(help_text(), file=sys.stderr, end="")
     return 2
