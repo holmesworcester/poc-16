@@ -297,7 +297,10 @@ while a multi-pile head is scanned, but are not made pending or sent until the
 complete pinned suffix and its control declaration validate. A malformed later
 pile therefore cannot leak an earlier event or wedge delivery; the whole head
 is quarantined and unrelated writers remain discoverable. Once validated, the
-staged authenticated map is paged into ordinary bounded carrier bodies.
+staged authenticated map is paged into ordinary bounded carrier bodies, one
+event per durable pending body. This keeps current-authority matching and
+delivery budgets independent for each event even when one head spans many
+piles.
 
 Bootstrap is explicit: normal launch validates all current writer heads and
 marks their existing triggers seen, while a deliberate backfill starts with

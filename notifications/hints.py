@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 from core.crypto import h
 from core.fact import canon
-from core.limits import MAX_PILE_FACTS, decode_json
+from core.limits import decode_json
 from core.shape import valid_fid
 
 from .carrier import MAX_CARRIER_BYTES
@@ -12,10 +12,13 @@ from .delivery import PublicationHint
 
 FORMAT = "notification-writer-hint-v1"
 MAX_HINT_BYTES = MAX_CARRIER_BYTES
-# Each event carries two 64-hex identities plus JSON framing.  Keep a simple
-# protocol constant comfortably below the carrier byte ceiling rather than
-# discovering that ceiling after a cursor has already selected a page.
-MAX_HINT_EVENTS = min(MAX_PILE_FACTS, 512)
+# One durable pending item carries one event.  Delivery derives users,
+# preferences, and endpoints from current authority, so reference count and
+# fact byte count alone cannot bound the aggregate downstream work of a batch.
+# Keeping this at one makes every worker budget apply independently to one
+# event and prevents a large multi-pile writer suffix from creating a pending
+# item that can never complete.
+MAX_HINT_EVENTS = 1
 
 
 @dataclass(frozen=True, slots=True, order=True)

@@ -762,7 +762,9 @@ def test_large_writer_suffix_persists_one_pile_continuation_per_turn(
     found = {
         fid for raw in carrier.payloads for fid in decode_hint(raw).facts}
     assert found == expected
-    assert statuses.count("published") == 1
+    assert statuses.count("published") == len(expected)
+    assert all(
+        len(decode_hint(raw).events) == 1 for raw in carrier.payloads)
     assert "continued" in statuses
     assert max(observed_sequences) >= len(expected)
     assert observed_sequences == sorted(observed_sequences)
