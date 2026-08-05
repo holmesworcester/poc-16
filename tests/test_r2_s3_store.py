@@ -122,3 +122,63 @@ def test_r2_explicit_credentials_are_complete_and_not_mixed_with_clients():
         R2S3Store(
             config(), access_key_id="id", secret_access_key="secret",
             client=client)
+
+
+def test_r2_sdk_clients_require_checksums_only_when_modeled(monkeypatch):
+    configs = []
+    client_calls = []
+
+    class FakeConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            configs.append(self)
+
+    class FakeBoto3:
+        @staticmethod
+        def client(service, **kwargs):
+            client = object()
+            client_calls.append((service, kwargs, client))
+            return client
+
+    class FakeSession:
+        @staticmethod
+        def get_service_model(service):
+            assert service == "s3"
+            operation = type("Operation", (), {
+                "input_shape": type("Shape", (), {
+                    "members": {
+                        "ChecksumSHA256": object(),
+                        "IfMatch": object(),
+                        "IfNoneMatch": object(),
+                    },
+                })(),
+            })()
+            return type("Service", (), {
+                "operation_model": staticmethod(lambda _name: operation),
+            })()
+
+    modules = {
+        "boto3": FakeBoto3,
+        "botocore.config": type("Module", (), {"Config": FakeConfig}),
+        "botocore.session": type("Module", (), {
+            "get_session": staticmethod(FakeSession),
+        }),
+    }
+    monkeypatch.setattr(
+        "adapters.s3.store.importlib.import_module",
+        lambda name: modules[name])
+    store = R2S3Store(
+        config(), access_key_id="r2-id", secret_access_key="r2-secret")
+
+    runtime_configs = configs[1:]
+    assert len(runtime_configs) == 2
+    for configured in runtime_configs:
+        assert configured.kwargs["request_checksum_calculation"] \
+            == "when_required"
+        assert configured.kwargs["response_checksum_validation"] \
+            == "when_required"
+    assert [call[1]["config"] for call in client_calls] == runtime_configs
+    assert all(call[1]["endpoint_url"] == config().endpoint_url
+               for call in client_calls)
+    assert store._read_client is client_calls[0][2]
+    assert store._mutation_client is client_calls[1][2]

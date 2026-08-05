@@ -314,7 +314,8 @@ class S3Store:
         )
 
     @staticmethod
-    def _sdk_clients(config, **provider_credentials):
+    def _sdk_clients(
+            config, *, _config_overrides=None, **provider_credentials):
         from .sdk_smoke import require_s3_capabilities
 
         try:
@@ -334,6 +335,10 @@ class S3Store:
             "read_timeout": config.read_timeout,
             "max_pool_connections": config.max_pool_connections,
         }
+        if _config_overrides is not None:
+            if not isinstance(_config_overrides, dict):
+                raise ValueError("S3 SDK config overrides")
+            base.update(_config_overrides)
         if config.addressing_style is not None:
             base["s3"] = {"addressing_style": config.addressing_style}
         read_config = botocore_config.Config(

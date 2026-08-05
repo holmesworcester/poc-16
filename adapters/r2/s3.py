@@ -97,3 +97,19 @@ class R2S3Store(S3Store):
         args["ContentMD5"] = base64.b64encode(
             hashlib.md5(value, usedforsecurity=False).digest()).decode("ascii")
         return args
+
+    @staticmethod
+    def _sdk_clients(config, **provider_credentials):
+        # boto3 >= 1.36 otherwise applies flexible response checksums to R2's
+        # empty 304 Not Modified response. Botocore then tries to parse a
+        # StreamingChecksumBody as an error document and raises TypeError.
+        # Cloudflare's R2 guidance is to calculate and validate checksums only
+        # when the modeled operation requires them.
+        return S3Store._sdk_clients(
+            config,
+            _config_overrides={
+                "request_checksum_calculation": "when_required",
+                "response_checksum_validation": "when_required",
+            },
+            **provider_credentials,
+        )
