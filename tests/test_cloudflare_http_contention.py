@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 import pytest
 
 from bench import cloudflare_http_contention as contention
+from core.access import AccessGate
 from core.object_store import (
     ABSENT,
     Applied,
@@ -21,6 +22,8 @@ from core.writer_head import (
     encode_slot,
     head_slot_key,
 )
+from core.store import FsStore
+from core.writer_repository import OpaqueHeadGate
 
 
 class HttpResponse:
@@ -193,6 +196,51 @@ def test_overlapped_http_results_verify_exact_final_slots(tmp_path):
     assert performance["attempt_status_counts"] == {201: 3, 412: 3}
     assert performance["requests_per_second"] > 0
     assert performance["latency_ms_max"] >= performance["latency_ms_p50"]
+
+
+def test_same_writer_losers_rebase_publish_and_cold_sync_every_message(
+        tmp_path):
+    fixture = contention.build_fixture(
+        tmp_path / "fixture", 4, 2, now=10_000_000)
+    target = FsStore(str(tmp_path / "target"))
+    contention.seed(target, fixture)
+    winner = fixture.raced[2]
+    _replace_head(target, fixture.workspace, winner.device, winner.head)
+    outcomes = tuple(
+        (candidate, 201 if candidate == winner else 412, 1.0,
+         (201 if candidate == winner else 412,))
+        for candidate in fixture.raced
+    )
+    access = AccessGate(fixture.workspace, target)
+    heads = OpaqueHeadGate(target, access.authorize_head)
+
+    async def advance_head(proof, proposed):
+        return await heads.advance(
+            proof,
+            proposed,
+            contention.time.time_ns() // 1_000_000,
+        )
+
+    report = contention.recover_same_writer(
+        target,
+        fixture,
+        outcomes,
+        "https://unused.example",
+        tmp_path / "cold-receiver",
+        advance_head=advance_head,
+    )
+
+    assert report["losing_closures_rebased"] == 3
+    assert report["rebased_sequence"] == 5
+    assert report["publisher_status"] == "applied"
+    assert report["published_piles"] == 3
+    assert report["raced_message_facts_expected"] == 4
+    assert report["raced_message_facts_present"] == 4
+    assert report["all_raced_writes_reachable"] is True
+    assert report["cold_listed"] == 3
+    assert report["cold_changed"] == 3
+    assert report["cold_piles"] == 7
+    assert report["http"] == {}
 
 
 def test_activation_requires_one_concurrently_ready_probe_round(monkeypatch):

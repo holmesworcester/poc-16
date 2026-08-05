@@ -1008,7 +1008,10 @@ python3 -m deploy.cloudflare_worker.manage remove
 The opt-in live contention command instead creates a random disposable Worker
 and an exact `poc16-http-contention/run-*` R2 prefix, overlaps same-writer and
 independent-writer `/head/<oid>` requests, audits every final slot through the
-R2 S3 API, and verifies both resources absent during cleanup. It requires
+R2 S3 API, rebases every losing same-writer closure behind the winner through
+the normal `OwnerPublisher`, and cold-syncs a new `RepositoryMirror` to prove
+every raced message remains reachable. It then verifies both resources absent
+during cleanup. It requires
 Python 3.13 or newer, `uv`, Node.js with `npx`, the normal Worker control token,
 and `POC16_R2_ACCOUNT_ID`, `POC16_R2_BUCKET`, `POC16_R2_ACCESS_KEY_ID`, and
 `POC16_R2_SECRET_ACCESS_KEY`. Live changes remain separately gated:
@@ -1023,6 +1026,14 @@ The bounded default projects fewer than 500 R2 operations and less than USD
 retried; retries remain safe because every request names one exact proposed
 head and the final R2 slot audit distinguishes old, candidate, and invalid
 bytes.
+
+Ordinary commands on one `FullPeer` serialize under its node lock, and
+different device writers use different slots, so neither path normally
+produces this same-writer conflict. The forced race represents duplicate
+processes sharing one device identity. The gateway safely returns conflict to
+all but one exact-base candidate; the caller must retain those closures,
+import the winner, and rebase them. Automatic cross-process rebase is not yet
+part of `FullPeer.sync`.
 
 Generated provider claims intentionally say `live_verified: false` until the
 live S3/R2 conformance suite has been run for the selected account and

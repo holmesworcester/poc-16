@@ -37,11 +37,18 @@ from core.object_store import (
 )
 from core.store import FsStore
 from core.writer_head import (
+    WriterBinding,
     decode_slot_at,
     head_slot_key,
     writer_store_binding,
 )
-from core.writer_repository import OpaqueHeadGate, WriterLog
+from core.writer_repository import (
+    FactConsumer,
+    OpaqueHeadGate,
+    OwnerPublisher,
+    RepositoryMirror,
+    WriterLog,
+)
 from deploy.cloudflare_worker import manage
 from facts.auth.device import device as device_fact
 from facts.auth.device_invite import device_invite
@@ -74,12 +81,18 @@ class Candidate:
     device: str
     head: str
     proof: bytes
+    closure: tuple = ()
+    fact_id: str | None = None
 
 
 @dataclass(frozen=True)
 class Fixture:
     workspace: str
     founder: str
+    root: object
+    basis: str
+    raced_secret: bytes
+    raced_writer: WriterLog
     store: FsStore
     initial_heads: tuple
     raced: tuple
@@ -224,6 +237,7 @@ async def _build_fixture(directory, racers, independent_writers, now):
         if update.base_head != initial.head_oid:
             raise RuntimeError("raced candidates do not share one base")
         await writer.establish(update)
+        closure = (*authority, item_signature, item)
         raced.append(Candidate(
             device,
             update.head_oid,
@@ -237,6 +251,8 @@ async def _build_fixture(directory, racers, independent_writers, now):
                 update.head_oid,
                 now,
             ),
+            closure,
+            item.fid,
         ))
 
     independent = []
@@ -258,6 +274,7 @@ async def _build_fixture(directory, racers, independent_writers, now):
         if update.base_head != initial.head_oid:
             raise RuntimeError("independent candidate base")
         await writer.establish(update)
+        closure = (*authority, item_signature, item)
         independent.append(Candidate(
             device,
             update.head_oid,
@@ -271,10 +288,16 @@ async def _build_fixture(directory, racers, independent_writers, now):
                 update.head_oid,
                 now,
             ),
+            closure,
+            item.fid,
         ))
     return Fixture(
         root.fid,
         founder,
+        root,
+        basis,
+        writers[0][0],
+        writers[0][3],
         store,
         tuple(initial_heads),
         tuple(raced),
@@ -537,6 +560,186 @@ def verify_slots(store, fixture, outcomes):
     return evidence
 
 
+def recover_same_writer(
+        store, fixture, outcomes, url, receiver_directory,
+        *, advance_head=None):
+    """Rebase every losing closure, publish it, then cold-sync all facts.
+
+    The forced race models multiple processes sharing one writer identity.
+    Recovery deliberately uses the production ``OwnerPublisher`` and
+    ``RepositoryMirror`` components; only the application policy that chooses
+    to retain and rebase the losing closures lives in this harness.
+    """
+    raced_outcomes = tuple(
+        (candidate, status)
+        for candidate, status, _latency, _attempts in outcomes
+        if candidate.device == fixture.raced[0].device
+    )
+    winners = tuple(
+        candidate for candidate, status in raced_outcomes
+        if status in {201, 204}
+    )
+    if len(winners) != 1:
+        raise RuntimeError("same-writer recovery needs exactly one winner")
+    winner = winners[0]
+    losers = tuple(
+        candidate for candidate in fixture.raced
+        if candidate.head != winner.head
+    )
+    if len(losers) != len(fixture.raced) - 1:
+        raise RuntimeError("same-writer recovery candidate accounting")
+
+    key = head_slot_key(fixture.workspace, winner.device)
+    remote_opened = store.read_versioned(key)
+    if not isinstance(remote_opened, Versioned) \
+            or decode_slot_at(key, remote_opened.value).head != winner.head:
+        raise RuntimeError("same-writer winner is not durable")
+    local_opened = fixture.store.read_versioned(key)
+    if not isinstance(local_opened, Versioned):
+        raise RuntimeError("same-writer local slot absent")
+    imported = fixture.store.cas(
+        key, local_opened.token, remote_opened.value)
+    if not isinstance(imported, Applied):
+        raise RuntimeError("same-writer winner import conflicted")
+
+    rebased = _run(fixture.raced_writer.prepare(
+        tuple(candidate.closure for candidate in losers)))
+    if rebased.base_head != winner.head \
+            or len(rebased.piles) != len(losers):
+        raise RuntimeError("same-writer closures were not rebased")
+    _run(fixture.raced_writer.establish(rebased))
+
+    trusted_now = time.time_ns() // 1_000_000
+    local_access = AccessGate(fixture.workspace, fixture.store)
+    local_heads = OpaqueHeadGate(
+        fixture.store, local_access.authorize_head)
+    local_proof = _head_proof(
+        fixture.raced_secret,
+        winner.device,
+        fixture.founder,
+        fixture.root,
+        fixture.basis,
+        winner.head,
+        rebased.head_oid,
+        trusted_now,
+    )
+    local_advance = _run(local_heads.advance(
+        local_proof, rebased.head_oid, trusted_now))
+    if local_advance.status != "applied":
+        raise RuntimeError("same-writer local rebase advance failed")
+
+    http_evidence = {}
+
+    async def make_proof(base, proposed):
+        return _head_proof(
+            fixture.raced_secret,
+            winner.device,
+            fixture.founder,
+            fixture.root,
+            fixture.basis,
+            base,
+            proposed,
+            time.time_ns() // 1_000_000,
+        )
+
+    async def reject_control(*_args):
+        raise RuntimeError("message-only recovery unexpectedly needs permit")
+
+    async def advance(proof, proposed):
+        if advance_head is not None:
+            result = advance_head(proof, proposed)
+            if hasattr(result, "__await__"):
+                result = await result
+            return result
+        candidate = Candidate(winner.device, proposed, proof)
+        posted, performance = await asyncio.to_thread(
+            contend, url, fixture.workspace, (candidate,))
+        _candidate, status, _latency, attempts = posted[0]
+        http_evidence.update({
+            "terminal_status": status,
+            "attempt_statuses": list(attempts),
+            "performance": performance,
+        })
+        return {
+            201: "applied",
+            204: "noop",
+            409: "retryable",
+            412: "conflict",
+        }.get(status, "retryable")
+
+    binding = WriterBinding(
+        fixture.workspace,
+        winner.device,
+        fixture.founder,
+        writer_store_binding(fixture.workspace, winner.device),
+    )
+    publisher = OwnerPublisher(
+        fixture.workspace,
+        winner.device,
+        binding,
+        fixture.store,
+        store,
+        make_proof,
+        reject_control,
+        reject_control,
+        advance,
+    )
+    published = _run(publisher.publish())
+    if published.status not in {"applied", "noop"}:
+        raise RuntimeError(
+            f"same-writer rebased publication {published.status}")
+
+    consumer = FactConsumer(fixture.workspace)
+    known_devices = {device for device, _head in fixture.initial_heads}
+
+    def binding_for(workspace, device, _removal_root, _head):
+        if workspace != fixture.workspace or device not in known_devices:
+            return None
+        return WriterBinding(
+            workspace,
+            device,
+            fixture.founder,
+            writer_store_binding(workspace, device),
+        )
+
+    mirror = RepositoryMirror(
+        fixture.workspace,
+        FsStore(str(receiver_directory)),
+        binding_for,
+        consumer,
+    )
+    cold = _run(mirror.sync_from(store))
+    if cold.errors:
+        raise RuntimeError(
+            "same-writer cold sync failed: " + repr(cold.errors))
+    expected = {candidate.fact_id for candidate in fixture.raced}
+    present = expected.intersection(consumer.fact_ids())
+    if None in expected or present != expected:
+        raise RuntimeError("same-writer recovery lost message facts")
+
+    final_opened = store.read_versioned(key)
+    if not isinstance(final_opened, Versioned) \
+            or decode_slot_at(key, final_opened.value).head \
+            != rebased.head_oid:
+        raise RuntimeError("same-writer rebased head is not durable")
+    return {
+        "winner_head": winner.head,
+        "losing_closures_rebased": len(losers),
+        "rebased_head": rebased.head_oid,
+        "rebased_sequence": rebased.head.sequence,
+        "publisher_status": published.status,
+        "published_piles": published.piles,
+        "cold_listed": cold.listed,
+        "cold_changed": cold.changed,
+        "cold_piles": cold.piles,
+        "cold_facts": cold.facts,
+        "raced_message_facts_expected": len(expected),
+        "raced_message_facts_present": len(present),
+        "all_raced_writes_reachable": present == expected,
+        "http": http_evidence,
+    }
+
+
 def _health(url, opener):
     try:
         with opener(Request(
@@ -698,6 +901,13 @@ def live_run(
             outcomes, performance = contend(
                 url, fixture.workspace, all_candidates)
             correctness = verify_slots(store, fixture, outcomes)
+            recovery = recover_same_writer(
+                store,
+                fixture,
+                outcomes,
+                url,
+                Path(directory) / "cold-receiver",
+            )
             wrong_status = _wrong_workspace(url, fixture)
             if wrong_status != 404:
                 raise RuntimeError("wrong workspace was not denied")
@@ -713,6 +923,7 @@ def live_run(
                 "activation": activation,
                 "http": performance,
                 "correctness": correctness,
+                "same_writer_recovery": recovery,
                 "wrong_workspace_status": wrong_status,
             }
         except Exception as error:  # noqa: BLE001 - preserve cleanup evidence
