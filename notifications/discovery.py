@@ -53,7 +53,7 @@ from core.writer_repository import (
 )
 
 from .carrier import CarrierAccepted
-from .forest import MemoryStore, claimed_writer_binding
+from .forest import MemoryStore, closure_writer_binding
 from .hints import (
     EventRef,
     MAX_HINT_BYTES,
@@ -618,7 +618,7 @@ class NotificationDiscovery:
             state = _CollectState()
             result = await RepositoryMirror(
                 self.workspace, MemoryStore(),
-                claimed_writer_binding, FactConsumer(self.workspace, state),
+                closure_writer_binding, FactConsumer(self.workspace, state),
                 observe_controls=True,
             ).sync_from(self.repository_store)
             if result.errors:
@@ -730,7 +730,7 @@ class NotificationDiscovery:
             self.repository_store, self.workspace, scan, base)
         result = await RepositoryMirror(
             self.workspace, target,
-            claimed_writer_binding, FactConsumer(self.workspace, state),
+            closure_writer_binding, FactConsumer(self.workspace, state),
             observe_controls=True,
         ).sync_from(_PinnedSource(
             self.repository_store, self.workspace, scan))

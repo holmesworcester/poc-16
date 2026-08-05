@@ -1248,6 +1248,23 @@ and never relies on `RepositoryMirror` having done so. It no longer advances one
 workspace `FactTree` cursor. It retains per-writer acknowledged head OIDs,
 lists the directory, and performs bounded diffs only for unknown writer heads.
 
+Notification history uses the same closure-proved writer binding as ordinary
+consumption. The slot key fixes workspace and device, the device signature
+authenticates the head, the logical store binding is derived canonically from
+that workspace/device pair, and every consumed closed pile must prove the
+head's claimed owner with the exact member/device offers. Thus neither an
+owner claim nor a store claim can route work across a member, workspace, or
+writer store boundary. Resolving positive ownership from a removal-tree root
+would create a second authority model: the tree intentionally contains only
+non-carriable removal judgments, while the positive admission chain travels in
+each closure.
+
+The slot's recorded removal root remains pinned with the scan so a retry judges
+the same historical head. It does not decide present delivery eligibility.
+Current membership/removal state is reread separately immediately before
+provider delivery; removing a writer can cancel delivery but cannot rewrite or
+invalidate an event that was valid when its historical head was accepted.
+
 A pending notification page pins the exact writer heads and triggering facts
 it represents. Delivery separately pins current membership/removal state,
 preferences, and endpoints. SQS, Cloudflare Queue, or FullPeer wakes remain

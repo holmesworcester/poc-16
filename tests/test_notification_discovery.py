@@ -10,7 +10,18 @@ from core.crypto import h, keypair
 from core.fact import canon, encode
 from core.object_store import OutcomeUnknown
 from core.store import FsStore
-from core.writer_head import decode_head, decode_slot_at, head_slot_key
+from core.writer_head import (
+    HeadSlot,
+    decode_head,
+    decode_slot_at,
+    encode_head,
+    encode_slot,
+    head_oid,
+    head_slot_key,
+    make_head,
+    require_bound_head,
+    writer_store_binding,
+)
 from core.writer_tree import leaf_key, tree_reader
 from facts.auth.device import bind
 from facts.content import delete, message
@@ -40,6 +51,7 @@ from notifications.hints import (
     encode_hint,
     materialize_hint,
 )
+from notifications.forest import closure_writer_binding
 from tests.util import add_member
 
 
@@ -117,6 +129,21 @@ class CrashBeforeSecondCas(DelegateStore):
                 self.remaining = None
                 raise SimulatedCrash()
         return self.store.cas(key, token, value)
+
+
+class CrashAfterNextCas(DelegateStore):
+    """Preserve one cursor CAS, then lose the process before scan work."""
+
+    def __init__(self, store):
+        super().__init__(store)
+        self.armed = False
+
+    def cas(self, key, token, value):
+        result = self.store.cas(key, token, value)
+        if self.armed:
+            self.armed = False
+            raise SimulatedCrash()
+        return result
 
 
 class AwaitedStore:
@@ -201,6 +228,36 @@ def _slot(node, workspace, device=None):
     return decode_slot_at(key, node.store(workspace).get(key))
 
 
+def _replace_head_claim(node, anchored_workspace, **changes):
+    """Install one device-signed hostile head over the genuine tree."""
+    secret, device = node.identity(anchored_workspace)
+    store = node.store(anchored_workspace)
+    key = head_slot_key(anchored_workspace, device)
+    opened = store.read_versioned(key)
+    slot = decode_slot_at(key, opened.value)
+    current = decode_head(store.get("obj/" + slot.head))
+    candidate = make_head(
+        secret,
+        changes.get("workspace", current.workspace),
+        device,
+        changes.get("owner", current.owner),
+        current.sequence,
+        current.tree,
+        changes.get("store", current.store),
+        current.control,
+    )
+    raw = encode_head(candidate)
+    oid = head_oid(raw)
+    store.put_if_absent("obj/" + oid, raw)
+    store.cas(
+        key,
+        opened.token,
+        encode_slot(HeadSlot(
+            anchored_workspace, device, oid, slot.removal_root)),
+    )
+    return oid
+
+
 async def _pending_body(discovery):
     pending = _cursor(discovery.cursor_store).pending
     return await discovery.state.get_bounded(
@@ -259,6 +316,39 @@ def test_backfill_validates_writer_head_and_materializes_exact_event(tmp_path):
         "obj/" + reference.events[0].oid)
     assert materialize_hint(reference, (event_raw,)).facts == (event,)
     assert not discovery.cursor_store.store.list(f"heads/{workspace}")
+
+
+def test_closure_binding_uses_proved_owner_and_canonical_writer_store(
+        tmp_path):
+    node, workspace = _world(tmp_path)
+    slot = _slot(node, workspace)
+    head = decode_head(node.store(workspace).get("obj/" + slot.head))
+
+    binding = closure_writer_binding(
+        workspace, head.device, slot.removal_root, head)
+
+    assert binding.owner == head.owner
+    assert binding.store == writer_store_binding(workspace, head.device)
+    assert require_bound_head(head, binding) == head
+
+
+@pytest.mark.parametrize("field", ("owner", "store", "workspace"))
+def test_notification_scan_rejects_signed_cross_boundary_head_claim(
+        tmp_path, field):
+    node, workspace = _world(tmp_path)
+    event = message.post(node, workspace, "general", "hostile", ts=3)
+    _replace_head_claim(node, workspace, **{field: h(field.encode())})
+    carrier = MemoryCarrier([])
+    discovery = _discovery(
+        node, workspace, FsStore(str(tmp_path / "cursor")), carrier)
+    asyncio.run(discovery.bootstrap_backfill())
+
+    result = asyncio.run(discovery.run_once())
+
+    assert result.status == "invalid"
+    assert carrier.payloads == []
+    assert event not in {
+        fid for raw in carrier.payloads for fid in decode_hint(raw).facts}
 
 
 def test_current_bootstrap_skips_history_but_finds_later_facts(tmp_path):
@@ -500,6 +590,60 @@ def test_current_suppression_does_not_erase_historical_discovery(tmp_path):
 
     assert event in {
         fid for raw in carrier.payloads for fid in decode_hint(raw).facts}
+
+
+def test_current_member_removal_does_not_rewrite_historical_writer_event(
+        tmp_path):
+    alice, bob, workspace = _forest(tmp_path)
+    mirrored = asyncio.run(
+        alice.mirror(workspace).sync_from(bob.store(workspace)))
+    assert mirrored.errors == ()
+    store = FsStore(str(tmp_path / "cursor"))
+    carrier = MemoryCarrier([])
+    discovery = _discovery(alice, workspace, store, carrier)
+    asyncio.run(discovery.bootstrap_current())
+    event = message.post(bob, workspace, "general", "before removal", ts=30)
+    mirrored = asyncio.run(
+        alice.mirror(workspace).sync_from(bob.store(workspace)))
+    assert mirrored.errors == ()
+    facts.auth.removal.evict(alice, workspace, bob.pk)
+
+    asyncio.run(_drain(discovery))
+
+    assert next(
+        row for row in facts.auth.user.members(alice, workspace)
+        if row["pk"] == bob.pk)["evicted"] is True
+    assert event in {
+        fid for raw in carrier.payloads for fid in decode_hint(raw).facts}
+
+
+def test_scan_retry_replays_exact_slot_recorded_removal_root(tmp_path):
+    node, workspace = _world(tmp_path)
+    base = FsStore(str(tmp_path / "cursor"))
+    fault = CrashAfterNextCas(base)
+    discovery = _discovery(node, workspace, fault, MemoryCarrier([]))
+    asyncio.run(discovery.bootstrap_current())
+    event = message.post(node, workspace, "general", "pinned root", ts=10)
+    pinned = _slot(node, workspace)
+    fault.armed = True
+
+    with pytest.raises(SimulatedCrash):
+        asyncio.run(discovery.run_once())
+    crashed = _cursor(base)
+    assert crashed.scan == Scan(
+        pinned.device, pinned.head, pinned.removal_root)
+
+    add_member(node, workspace, "later member", ts=20)
+    current = _slot(node, workspace)
+    assert current.head != pinned.head
+    assert current.removal_root != pinned.removal_root
+
+    carrier = MemoryCarrier([])
+    retry = _discovery(node, workspace, base, carrier)
+    assert asyncio.run(retry.run_once()).status == "published"
+    reference = decode_hint(carrier.payloads[0])
+    assert reference.head == pinned.head
+    assert reference.facts == (event,)
 
 
 def test_actual_async_stores_preserve_writer_cursor_protocol(tmp_path):

@@ -26,7 +26,7 @@ from core.object_store import (
     VersionToken,
 )
 from core.shape import valid_fid
-from core.writer_head import WriterBinding
+from core.writer_head import WriterBinding, writer_store_binding
 from core.writer_repository import FactConsumer, RepositoryMirror
 
 
@@ -88,18 +88,21 @@ class MemoryStore:
         )
 
 
-def claimed_writer_binding(workspace, device, _removal_root, candidate):
-    """Bind a signed head to its claim; its piles must prove that claim.
+def closure_writer_binding(workspace, device, _removal_root, candidate):
+    """Bind a signed head to the owner its closed piles must prove.
 
     RepositoryMirror verifies the head signature and FactConsumer additionally
     requires each received closure to contain the exact member/device offer.
-    Current liveness is deliberately a separate delivery-time decision.
+    The logical store is derived from the addressed workspace/device rather
+    than trusted from the head. Current liveness is deliberately a separate
+    delivery-time decision.
     """
     if getattr(candidate, "workspace", None) != workspace \
             or getattr(candidate, "device", None) != device:
         raise ValueError("notification writer binding")
     return WriterBinding(
-        workspace, device, candidate.owner, candidate.store)
+        workspace, device, candidate.owner,
+        writer_store_binding(workspace, device))
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,7 +215,7 @@ async def current_repository(source, workspace):
     local = MemoryStore()
     consumer = FactConsumer(workspace)
     result = await RepositoryMirror(
-        workspace, local, claimed_writer_binding, consumer,
+        workspace, local, closure_writer_binding, consumer,
         observe_controls=True,
     ).sync_from(source)
     if result.errors:
@@ -230,6 +233,6 @@ __all__ = (
     "CurrentRepository",
     "CurrentView",
     "MemoryStore",
-    "claimed_writer_binding",
+    "closure_writer_binding",
     "current_repository",
 )
