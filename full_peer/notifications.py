@@ -142,6 +142,9 @@ class FullPeerNotifications:
         self._status = {}
         self._service_error = ""
         self._status_lock = threading.Lock()
+        self._activity = threading.Condition()
+        self._active_turns = 0
+        self._rebootstrapping = False
         self._wake = threading.Event()
         self._stopping = threading.Event()
         self._thread = None
@@ -204,7 +207,18 @@ class FullPeerNotifications:
         """Explicitly initialize one workspace before scheduled scanning."""
         if not valid_fid(workspace):
             raise ValueError("notification workspace")
-        return asyncio.run(self._bootstrap(workspace, mode))
+        if mode != REBOOTSTRAP_CURRENT:
+            return asyncio.run(self._bootstrap(workspace, mode))
+        with self._activity:
+            self._rebootstrapping = True
+            while self._active_turns:
+                self._activity.wait()
+        try:
+            return asyncio.run(self._bootstrap(workspace, mode))
+        finally:
+            with self._activity:
+                self._rebootstrapping = False
+                self._activity.notify_all()
 
     async def _run_once(self):
         out = []
@@ -228,7 +242,16 @@ class FullPeerNotifications:
 
     def run_once(self):
         """Run one bounded discovery page for every configured workspace."""
-        return asyncio.run(self._run_once())
+        with self._activity:
+            while self._rebootstrapping:
+                self._activity.wait()
+            self._active_turns += 1
+        try:
+            return asyncio.run(self._run_once())
+        finally:
+            with self._activity:
+                self._active_turns -= 1
+                self._activity.notify_all()
 
     def kick(self):
         self._wake.set()

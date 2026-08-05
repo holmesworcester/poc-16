@@ -150,6 +150,44 @@ def test_explicit_current_rebootstrap_is_idempotent_and_fences_old_work(
     assert delivered in payload
 
 
+def test_current_rebootstrap_waits_for_an_inflight_local_delivery(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+    provider = ScriptedProvider([])
+
+    def blocking_send(request):
+        entered.set()
+        assert release.wait(5)
+        provider.requests.append(request)
+        return PushAccepted("accepted-before-reset")
+
+    provider.send = blocking_send
+    node, workspace, provider, service = _world(tmp_path, provider)
+    message.post(node, workspace, "general", "already in flight", ts=4)
+    delivery = []
+    reset = []
+    delivery_thread = threading.Thread(
+        target=lambda: delivery.extend(service.run_once()))
+    reset_thread = threading.Thread(
+        target=lambda: reset.append(
+            service.bootstrap(workspace, REBOOTSTRAP_CURRENT)))
+
+    delivery_thread.start()
+    assert entered.wait(5)
+    reset_thread.start()
+    reset_thread.join(.1)
+    assert reset_thread.is_alive()
+    release.set()
+    delivery_thread.join(5)
+    reset_thread.join(5)
+
+    assert not delivery_thread.is_alive()
+    assert not reset_thread.is_alive()
+    assert delivery[0].status == "published"
+    assert reset[0]["mode"] == REBOOTSTRAP_CURRENT
+    assert service.run_once()[0].status == "idle"
+
+
 def test_completion_kicks_drain_staged_events_without_cadence(tmp_path):
     node, workspace, provider, service = _world(tmp_path)
     service.cadence = 3600
