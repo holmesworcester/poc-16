@@ -96,6 +96,7 @@ def target_proof(world, *, basis="", admission=True, ts=30):
         world["service"],
         world["service"],
         world["binding"].fid,
+        world["binding"].body["administrator"],
         world["operations"].fid,
         world["provider"],
         world["capability"],
@@ -236,6 +237,111 @@ def test_local_and_hosted_gates_authorize_exact_same_service_then_go_warm(
         operations_proof(foreign),
         100,
     )) is None
+
+
+def test_warm_lookup_cannot_recombine_one_binding_with_another_cell(
+        tmp_path):
+    first = service_world(capability="workspace-role")
+    target, operations = gates(tmp_path, first)
+    assert run(authorize_service(
+        target, operations,
+        target_proof(first), operations_proof(first), 100)) is not None
+
+    second = dict(first)
+    second["capability"] = "database-reader"
+    second["cell"] = binding_cell(
+        second["operations"].fid,
+        second["provider"],
+        second["capability"],
+        second["service"],
+    )
+    second["binding"] = service_binding(
+        second["target"].fid,
+        second["founder"],
+        second["founder"],
+        second["service"],
+        second["operations"].fid,
+        second["provider"],
+        second["capability"],
+        25,
+    )
+    second["binding_signature"] = signature(
+        second["founder_secret"], second["founder"],
+        second["binding"], 25)
+    assert run(authorize_service(
+        target, operations,
+        target_proof(second, ts=32),
+        operations_proof(second, admission=False, ts=33),
+        100,
+    )).capability == "database-reader"
+
+    removed = delete(
+        second["target"].fid,
+        second["service"],
+        second["binding"].key,
+        _policy.OWNER,
+        40,
+        second["service"],
+        second["service"],
+    )
+    removed_signature = signature(
+        second["service_secret"], second["service"], removed, 40)
+    control = signed(
+        second["service_secret"], second["service"], second["target"], (
+            *second["target_membership"],
+            second["binding_signature"],
+            second["binding"],
+            removed_signature,
+            removed,
+        ))
+    assert run(target.state.apply_control(
+        control, second["service"])).status == "applied"
+
+    # Both rows existed independently in the old lookup shape: binding A was
+    # CLEAR and cell B had been admitted.  Their composite was never admitted.
+    forged = dict(second)
+    forged["binding"] = first["binding"]
+    forged["binding_signature"] = first["binding_signature"]
+    assert run(authorize_service(
+        target, operations,
+        target_proof(forged, admission=False, ts=41),
+        operations_proof(forged, admission=False, ts=42),
+        100,
+    )) is None
+
+
+def test_approving_administrator_removal_revokes_warm_binding(tmp_path):
+    world = service_world()
+    target, operations = gates(tmp_path, world)
+    assert run(authorize_service(
+        target, operations,
+        target_proof(world), operations_proof(world), 100)) is not None
+
+    evicted = member_removal(
+        world["target"].fid,
+        world["founder"],
+        world["founder"],
+        40,
+        world["founder"],
+    )
+    evicted_signature = signature(
+        world["founder_secret"], world["founder"], evicted, 40)
+    control = signed(
+        world["founder_secret"], world["founder"], world["target"], (
+            world["target"],
+            evicted_signature,
+            evicted,
+        ))
+    assert run(target.state.apply_control(
+        control, world["founder"])).status == "applied"
+
+    with pytest.raises(LookupActive):
+        run(authorize_service(
+            target, operations,
+            target_proof(world, admission=False, ts=41),
+            operations_proof(world, admission=False, ts=42),
+            100,
+        ))
 
 
 def test_target_leave_revokes_and_fresh_binding_rejoins(tmp_path):

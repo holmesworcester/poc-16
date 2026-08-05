@@ -2,7 +2,8 @@
 
 import facts
 
-from core.fact import Fact, Need
+from core.crypto import h
+from core.fact import Fact, Need, canon
 from core.limits import MAX_REMOVAL_PATH_SCOPES, PayloadTooLarge
 from core.shape import valid_fid
 from core.suppression import scoped_id
@@ -18,10 +19,11 @@ POLICY = FamilyPolicy(suppression=(Parent("binding"),))
 
 # SHAPE
 def service_request(
-        workspace, device, owner, binding, operations, provider, capability,
-        cell, exp, basis, ts):
+        workspace, device, owner, binding, administrator, operations, provider,
+        capability, cell, exp, basis, ts):
     if not all(valid_fid(value) for value in (
-            workspace, device, owner, binding, operations, cell)) \
+            workspace, device, owner, binding, administrator, operations,
+            cell)) \
             or basis and not valid_fid(basis):
         raise ValueError("service request binding")
     if service_binding.binding_cell(
@@ -32,6 +34,7 @@ def service_request(
         ts,
         author_selectors(POLICY, {"binding": binding}),
         {
+            "administrator": administrator,
             "basis": basis,
             "binding": binding,
             "capability": capability,
@@ -64,8 +67,8 @@ def validate(fact, _context):
     try:
         body = fact.body
         return set(body) == {
-            "basis", "binding", "capability", "cell", "device", "exp",
-            "operations", "owner", "provider",
+            "administrator", "basis", "binding", "capability", "cell",
+            "device", "exp", "operations", "owner", "provider",
         } and not fact.refs() and type(body["exp"]) is int \
             and service_binding.binding_cell(
                 body["operations"], body["provider"], body["capability"],
@@ -75,6 +78,7 @@ def validate(fact, _context):
                 body["device"],
                 body["owner"],
                 body["binding"],
+                body["administrator"],
                 body["operations"],
                 body["provider"],
                 body["capability"],
@@ -109,6 +113,7 @@ def payload(
     )
     item = service_request(
         workspace, device, owner, binding,
+        selected.body["administrator"],
         selected.body["operations"],
         selected.body["provider"],
         selected.body["capability"],
@@ -124,17 +129,32 @@ PROOF_COMMANDS = {PURPOSE: payload}
 
 
 # QUERIES
+def _binding_scope(binding, cell, administrator):
+    if not all(valid_fid(value) for value in (
+            binding, cell, administrator)):
+        raise ValueError("service binding lookup scope")
+    return scoped_id("service-binding", h(canon([
+        "poc16-service-binding-scope-v1",
+        binding,
+        cell,
+        administrator,
+    ])))
+
+
 def _claim(
-        workspace, device, owner, binding, operations, provider, capability,
-        cell):
+        workspace, device, owner, binding, administrator, operations,
+        provider, capability, cell):
     identity = _access.lookup_claim(device, owner)
     shaped = service_request(
         workspace, device, owner, binding,
-        operations, provider, capability, cell, 0, "", 0)
+        administrator, operations, provider, capability, cell, 0, "", 0)
     scopes = tuple(sorted(
         set(identity.scopes)
         | facts.fact_scopes(shaped)
-        | {scoped_id("service-binding", cell)}
+        | {
+            _binding_scope(binding, cell, administrator),
+            facts.principal_sid("member", administrator),
+        }
     ))
     if len(scopes) > MAX_REMOVAL_PATH_SCOPES:
         raise PayloadTooLarge("service identity has too many removal scopes")
@@ -151,6 +171,7 @@ def lookup(fact, writer, trusted_now, *, purpose=None, proposed_head=None):
         body["device"],
         body["owner"],
         body["binding"],
+        body["administrator"],
         body["operations"],
         body["provider"],
         body["capability"],
@@ -172,6 +193,7 @@ def authorize_admission(
             or binding.t != service_binding.TAG \
             or binding.fid != body["binding"] \
             or binding.body.get("owner") != identity.owner \
+            or binding.body.get("administrator") != body["administrator"] \
             or service_binding.binding_cell(
                 binding.body.get("operations"),
                 binding.body.get("provider"),
@@ -184,6 +206,7 @@ def authorize_admission(
         identity.device,
         identity.owner,
         binding.fid,
+        binding.body["administrator"],
         binding.body["operations"],
         binding.body["provider"],
         binding.body["capability"],
