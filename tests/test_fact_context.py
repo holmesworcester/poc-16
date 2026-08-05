@@ -1,5 +1,7 @@
 """Differential contract for database-free and SQL fact relationship reads."""
 
+import random
+
 import facts
 
 from .util import signed_pile_facts
@@ -198,4 +200,40 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
         for name in {name for name, _, _ in fact.offers()}:
             assert memory.offers_from(fact.fid, name) \
                 == sql.offers_from(fact.fid, name)
+
+    # Preserve the replay seed in every assertion: a family whose relationship
+    # extraction accidentally depends on arrival order must be reproducible in
+    # CI without a probabilistic test runner.
+    for seed in range(16):
+        pending = list(corpus)
+        random.Random(seed).shuffle(pending)
+        shuffled = MemoryContext(workspace)
+        while pending:
+            progressed = []
+            retained = []
+            for source in pending:
+                fact = facts.hydrate(source)
+                edges = resolve_edges(fact, shuffled)
+                depth = None if edges is None else shuffled.depth(
+                    tuple(edge.fid for edge in edges))
+                if edges is None or depth is None \
+                        or not accepts(fact, edges, shuffled):
+                    retained.append(source)
+                    continue
+                shuffled.admit(fact, depth, edges)
+                progressed.append(fact.fid)
+            assert progressed, (
+                f"seed={seed:#x} unresolved="
+                f"{[fact.fid for fact in retained]!r}"
+            )
+            pending = retained
+        for source in corpus:
+            fact = facts.hydrate(source)
+            assert shuffled.fact_of(fact.fid) == sql.fact_of(fact.fid), (
+                f"seed={seed:#x} fact={fact.fid}"
+            )
+            assert resolve_edges(fact, shuffled, strict=True) \
+                == resolve_edges(fact, sql, strict=True), (
+                    f"seed={seed:#x} edges={fact.fid}"
+                )
     sql.db.close()
