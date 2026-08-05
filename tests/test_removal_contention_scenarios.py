@@ -12,8 +12,9 @@ def test_removal_scenarios_8_to_11_run_against_the_shared_gate(tmp_path):
         factory, members=13)
     assert convergence["recipients"] == 3
     assert convergence["active_subjects"] == 2
-    assert race["stale_permit_rejected"] is True
-    assert race["rebound_commit"] == "applied"
+    assert race["stale_removal_joined"] is True
+    assert race["removal_commit"] == "applied"
+    assert race["exact_replay"] == "noop"
     assert purge["members"] == 13
     assert purge["transitions"] == 3
     assert purge["offline_over_bound"] == "blocked:poc-16-6j4.26"

@@ -906,9 +906,11 @@ a self-contained HMAC permit from `/head/<oid>/permit`. Issuance evaluates the
 current proof and original signed control piles exactly once and binds the
 workspace, device, exact base/head, issue-time removal root, and canonical
 aggregate CLEAR/ACTIVE plan. The commit body is only those authenticated permit
-bytes. `/head/<oid>/commit` verifies the issue-time root (or recognizes an exact
-already-applied crash replay), applies the plan, then performs one CAS of the
-final slot with the resulting root and permit hash. The active sender retains
+bytes. `/head/<oid>/commit` verifies the issue-time root, recognizes an exact
+already-applied crash replay, or joins a stale ACTIVE-only plan. Concurrent
+removals therefore all land, while a stale permit with unapplied CLEAR rows
+cannot grant or revive authority. Commit then performs one CAS of the final
+slot with the resulting root and permit hash. The active sender retains
 one exact permit across a named bounded number of retryable removal-root, 5xx,
 and lost-response attempts with full jitter. A competing-head HTTP 412 is
 terminal and requires rebase.
@@ -1021,8 +1023,11 @@ export POC16_LIVE_CF_HTTP=1
 python3 -m deploy.cloudflare_worker.manage stress
 ```
 
-The bounded default projects fewer than 500 R2 operations and less than USD
-0.01. Workers.dev activation and transient 404/409/5xx mutation responses are
+The bounded default projects fewer than 1,000 R2 operations and less than USD
+0.01. In addition to ordinary writer-slot contention, it issues simultaneous
+and deliberately delayed control permits from distinct devices, proves every
+mutual removal lands, and proves a stale CLEAR permit cannot grant authority.
+Workers.dev activation and transient 404/409/5xx mutation responses are
 retried; retries remain safe because every request names one exact proposed
 head and the final R2 slot audit distinguishes old, candidate, and invalid
 bytes.

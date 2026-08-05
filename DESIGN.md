@@ -726,8 +726,11 @@ across process or serverless-instance replacement. It is not a bearer grant
 for a namespace and has no expiry that could strand a writer after
 self-removal. Replaying it can only finish or observe that one exact slot
 transition. A writer removed before permit issuance fails the normal strong
-proof. A different removal root observed before commit makes the permit
-retryable unless its exact ACI rows are already subsumed, which is the bounded
+proof. A different removal root observed before commit makes a permit with
+unapplied CLEAR rows retryable. An authenticated ACTIVE-only plan remains safe
+to join: ACTIVE dominates CLEAR and concurrent ACTIVE actions converge by
+immutable action FID, so mutually concurrent removals remove both subjects
+regardless of commit order. An exact already-subsumed plan is the bounded
 crash-replay case.
 
 Commit applies the ACI rows and then conditionally replaces the device's exact
@@ -739,9 +742,11 @@ caller-selected authority, object addresses, grants, or historical admission
 proofs.
 
 The caller retains the permit until it observes the exact slot outcome; the
-recipient deliberately stores no permit journal. Retryable removal-root
+recipient deliberately stores no permit journal. Retryable removal-root CAS
 contention, a provider 5xx, and an unknown transport outcome reuse those same
-bytes for only a named bounded number of attempts. A competing head is a
+bytes for only a named bounded number of attempts. An unapplied stale CLEAR
+plan requires fresh authorization; a stale ACTIVE-only plan may finish its
+preauthorized monotone removals. A competing head is a
 terminal HTTP 412 and requires the writer to rebase; it is never retried as the
 same transition. A live FullPeer turn applies bounded exponential full jitter
 and never reissues authorization.

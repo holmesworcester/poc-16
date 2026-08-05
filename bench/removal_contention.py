@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from time import perf_counter
 
-from core.access import AccessGate, ControlHeadRetry, LookupActive, LookupRefresh
+from core.access import AccessGate, LookupActive, LookupRefresh
 from core.close import decode_signed_pile, encode_signed_pile, make_signed_pile
 from core.crypto import h, keypair
 from core.limits import MAX_HEAD_REMOVAL_UPDATES
@@ -276,7 +276,7 @@ def scenario_8_and_10_convergent_removers(store_factory, pace=lambda: None):
 
 
 def scenario_9_removal_publish_race(store_factory, pace=lambda: None):
-    """A stale issued permit cannot cross a live removal-root advance."""
+    """An issued removal joins after an unrelated live-root advance."""
     value = _world()
     store = CountingStore(store_factory("scenario-9"))
     started = perf_counter()
@@ -318,8 +318,9 @@ def scenario_9_removal_publish_race(store_factory, pace=lambda: None):
         permit = await gate.issue_head_permit(
             proof, update.head_oid, (control,), 100, PERMIT_SECRET)
 
-        # Move the live root after issue. The old CLEAR request refreshes and
-        # the old permit must not apply across that root.
+        # Move the live root after issue. The old access request refreshes,
+        # while the authenticated ACTIVE-only permit remains a safe monotone
+        # join and must not lose its removal merely because CLEAR moved first.
         assert (await gate.state.tree.apply(((
             scoped_id("member", h(b"unrelated live overlap")),
             suppression_slot(),
@@ -333,25 +334,13 @@ def scenario_9_removal_publish_race(store_factory, pace=lambda: None):
         else:
             refreshed = False
         head_gate = OpaqueHeadGate(store, gate.authorize_head)
-        try:
-            await gate.commit_head_permit(
-                head_gate, permit, update.head_oid, PERMIT_SECRET)
-        except ControlHeadRetry:
-            stale_rejected = True
-        else:
-            stale_rejected = False
-        assert refreshed and stale_rejected
-
-        pace()
-        live = (await gate.state.pin()).root_oid
-        rebound = _head_proof(
-            value.founder_secret, value.founder,
-            value.root, live, update.head_oid)
-        permit = await gate.issue_head_permit(
-            rebound, update.head_oid, (control,), 100, PERMIT_SECRET)
         committed = await gate.commit_head_permit(
             head_gate, permit, update.head_oid, PERMIT_SECRET)
-        assert committed.status == "applied"
+        assert refreshed and committed.status == "applied"
+        replay = await gate.commit_head_permit(
+            head_gate, permit, update.head_oid, PERMIT_SECRET)
+        assert replay.status == "noop"
+        live = (await gate.state.pin()).root_oid
         try:
             await gate.authorize_access(_access_proof(
                 value.founder_secret, value.founder,
@@ -368,8 +357,9 @@ def scenario_9_removal_publish_race(store_factory, pace=lambda: None):
         "9-removal-vs-publish-live-pin",
         (store,),
         started,
-        stale_permit_rejected=True,
-        rebound_commit=status,
+        stale_removal_joined=True,
+        exact_replay="noop",
+        removal_commit=status,
     )
 
 

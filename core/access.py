@@ -299,7 +299,14 @@ class AccessGate:
             return None
         recovering = pin.root_oid != permit.removal_root
         if recovering and not await self.state.includes(
-                pin, permit.updates):
+                pin, permit.updates) and any(
+                    value.get("state") != "active"
+                    for _sid, value in permit.updates):
+            # An issue-time removal remains a safe monotone effect after
+            # another device advances the root: ACTIVE dominates CLEAR and
+            # concurrent ACTIVE actions have one deterministic ACI join.
+            # Positive/CLEAR authority is deliberately different.  A stale
+            # permit may never introduce it after its authorization pin.
             raise ControlHeadRetry("control head removal root is stale")
 
         result = None

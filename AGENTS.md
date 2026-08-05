@@ -66,8 +66,10 @@ advertised content tree.
 A control-bearing head is the one removal-state exception. While the ordinary
 current proof still succeeds, the gate issues a stateless permit bound to that
 writer, base, proposed head, issue-time root, and bounded canonical control
-rows. Commit verifies that root (or an already-applied exact replay), joins the
-permit's CLEAR/ACTIVE cells first, then attempts one bound slot CAS. Never add a
+rows. Commit verifies that root, an already-applied exact replay, or an
+ACTIVE-only monotone removal plan; joins the permitted cells first; then
+attempts one bound slot CAS. A stale permit may merge removals because ACTIVE
+dominates CLEAR, but may never introduce unapplied CLEAR authority. Never add a
 bearer-only removal update, accepted-leaf poke, scan, cursor, or cached repair
 state. Removal may be ahead after a crash; an accepted head may never be ahead
 of its removal effects.

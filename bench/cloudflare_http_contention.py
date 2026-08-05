@@ -26,6 +26,10 @@ from adapters.r2.s3 import R2S3Config, R2S3Store
 from core.access import AccessGate
 from core.close import encode_signed_pile, make_signed_pile
 from core.crypto import h, keypair
+from core.http import (
+    encode_head_commit_request,
+    encode_head_permit_request,
+)
 from core.object_store import (
     ABSENT,
     CREATED,
@@ -36,6 +40,7 @@ from core.object_store import (
     mutable_key,
 )
 from core.store import FsStore
+from core.suppression import scoped_id, suppression_slot
 from core.writer_head import (
     WriterBinding,
     decode_slot_at,
@@ -50,11 +55,16 @@ from core.writer_repository import (
     WriterLog,
 )
 from deploy.cloudflare_worker import manage
+from facts._policy import OWNER
+from facts.auth.admin import admin
 from facts.auth.device import device as device_fact
 from facts.auth.device_invite import device_invite
+from facts.auth.device_removal import device_removal
 from facts.auth.head_request import head_request
 from facts.auth.request import request as access_request
 from facts.auth.signature import signature
+from facts.auth.user import user
+from facts.auth.user_invite import user_invite
 from facts.auth.workspace import workspace as workspace_fact
 from facts.content.message import message
 
@@ -71,7 +81,7 @@ WRONG_WORKSPACE_MAX_ATTEMPTS = 8
 ACTIVATION_TIMEOUT_SECONDS = 120
 ACTIVATION_POLL_SECONDS = 0.5
 PROOF_LIFETIME_MS = 15 * 60 * 1000
-PROJECTED_MAX_R2_OPERATIONS = 500
+PROJECTED_MAX_R2_OPERATIONS = 1_000
 PROJECTED_MAX_COST_USD = 0.01
 SEED_WORKERS = 8
 
@@ -86,6 +96,14 @@ class Candidate:
 
 
 @dataclass(frozen=True)
+class WriterActor:
+    secret: bytes
+    device: str
+    authority: tuple
+    writer: WriterLog
+
+
+@dataclass(frozen=True)
 class Fixture:
     workspace: str
     founder: str
@@ -93,6 +111,7 @@ class Fixture:
     basis: str
     raced_secret: bytes
     raced_writer: WriterLog
+    actors: tuple
     store: FsStore
     initial_heads: tuple
     raced: tuple
@@ -298,6 +317,7 @@ async def _build_fixture(directory, racers, independent_writers, now):
         basis,
         writers[0][0],
         writers[0][3],
+        tuple(WriterActor(*values[:4]) for values in writers),
         store,
         tuple(initial_heads),
         tuple(raced),
@@ -740,6 +760,349 @@ def recover_same_writer(
     }
 
 
+def _post_control(
+        url, workspace, proposed, phase, body, *, retry_conflict=False,
+        opener=urlopen):
+    if phase not in {"permit", "commit"}:
+        raise ValueError("control HTTP phase")
+    request = Request(
+        f"{url}/head/{proposed}/{phase}?ws={workspace}",
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/octet-stream",
+            "User-Agent": "poc-16-live-cross-device-control/1",
+        },
+    )
+    attempts = []
+    started = time.perf_counter()
+    response_body = b""
+    retryable = set(HTTP_RETRY_STATUSES) - {409}
+    if retry_conflict:
+        retryable.add(409)
+    for attempt in range(HTTP_MAX_ATTEMPTS):
+        try:
+            with opener(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+                response_body = response.read()
+                status = response.status
+        except HTTPError as error:
+            status = error.code
+            response_body = error.read()
+            error.close()
+        except (URLError, OSError):
+            status, response_body = 0, b""
+        attempts.append(status)
+        if status not in retryable:
+            break
+        if attempt + 1 < HTTP_MAX_ATTEMPTS:
+            time.sleep(min(2.0, 0.25 * (2 ** attempt)))
+    return status, response_body, {
+        "attempt_statuses": attempts,
+        "latency_ms": round(
+            (time.perf_counter() - started) * 1000, 2),
+    }
+
+
+def _merged_closure(*closures):
+    found = set()
+    merged = []
+    for closure in closures:
+        for fact in closure:
+            if fact.fid not in found:
+                found.add(fact.fid)
+                merged.append(fact)
+    return tuple(merged)
+
+
+def cross_device_controls(store, fixture, url, opener=urlopen):
+    """Force simultaneous and delayed control commits from distinct devices."""
+    if len(fixture.actors) < 5:
+        raise ValueError("cross-device control proof needs five writers")
+    actors = fixture.actors[:5]
+    slot_before = {}
+    for actor in actors:
+        key = head_slot_key(fixture.workspace, actor.device)
+        remote = store.read_versioned(key)
+        local = fixture.store.read_versioned(key)
+        if not isinstance(remote, Versioned) \
+                or not isinstance(local, Versioned):
+            raise RuntimeError("cross-device control slot missing")
+        slot_before[actor.device] = decode_slot_at(key, remote.value).head
+        if decode_slot_at(key, local.value).head != slot_before[actor.device]:
+            imported = fixture.store.cas(key, local.token, remote.value)
+            if not isinstance(imported, Applied):
+                raise RuntimeError("cross-device control import conflicted")
+
+    access = AccessGate(fixture.workspace, store)
+    pin = _run(access.state.pin())
+    if pin is None:
+        raise RuntimeError("cross-device control removal root absent")
+    basis = pin.root_oid
+    now = time.time_ns() // 1_000_000
+    pairs = ((0, 1), (1, 0), (2, 3), (3, 2))
+    prepared = []
+    actions = []
+    for ordinal, (writer_index, target_index) in enumerate(pairs):
+        actor = actors[writer_index]
+        target = actors[target_index]
+        action = device_removal(
+            fixture.workspace,
+            actor.device,
+            target.device,
+            fixture.founder,
+            OWNER,
+            now + ordinal,
+            fixture.founder,
+        )
+        action_signature = signature(
+            actor.secret, actor.device, action, action.ts)
+        closure = _merged_closure(
+            actor.authority,
+            target.authority,
+            (action_signature, action),
+        )
+        update = _run(actor.writer.prepare((closure,)))
+        if update.base_head != slot_before[actor.device]:
+            raise RuntimeError("cross-device control base")
+        _run(actor.writer.establish(update))
+        _run(actor.writer.establish(update, store))
+        proof = _head_proof(
+            actor.secret,
+            actor.device,
+            fixture.founder,
+            fixture.root,
+            basis,
+            update.base_head,
+            update.head_oid,
+            now,
+        )
+        prepared.append((actor, update, proof, (encode_signed_pile(
+            make_signed_pile(
+                actor.secret,
+                fixture.workspace,
+                actor.device,
+                closure,
+            )),)))
+        actions.append((target.device, action.fid))
+
+    clear_actor = actors[4]
+    invite_secret, invite_public = keypair()
+    invited_member = user_invite(
+        fixture.workspace,
+        fixture.founder,
+        invite_public,
+        now + 10,
+    )
+    invited_member_signature = signature(
+        fixture.raced_secret,
+        fixture.founder,
+        invited_member,
+        invited_member.ts,
+    )
+    _member_secret, new_member = keypair()
+    joined_member = user(
+        invited_member,
+        invite_secret,
+        new_member,
+        "stale-clear-must-not-land",
+        now + 11,
+    )
+    joined_member_signature = signature(
+        _member_secret,
+        new_member,
+        joined_member,
+        joined_member.ts,
+    )
+    granted_admin = admin(
+        fixture.workspace,
+        clear_actor.device,
+        new_member,
+        now + 12,
+        fixture.founder,
+    )
+    granted_admin_signature = signature(
+        clear_actor.secret,
+        clear_actor.device,
+        granted_admin,
+        granted_admin.ts,
+    )
+    clear_closure = _merged_closure(
+        clear_actor.authority,
+        (
+            invited_member_signature,
+            invited_member,
+            joined_member_signature,
+            joined_member,
+            granted_admin_signature,
+            granted_admin,
+        ),
+    )
+    clear_update = _run(clear_actor.writer.prepare((clear_closure,)))
+    if clear_update.base_head != slot_before[clear_actor.device]:
+        raise RuntimeError("cross-device clear base")
+    _run(clear_actor.writer.establish(clear_update))
+    _run(clear_actor.writer.establish(clear_update, store))
+    clear_proof = _head_proof(
+        clear_actor.secret,
+        clear_actor.device,
+        fixture.founder,
+        fixture.root,
+        basis,
+        clear_update.base_head,
+        clear_update.head_oid,
+        now,
+    )
+    clear_control = encode_signed_pile(make_signed_pile(
+        clear_actor.secret,
+        fixture.workspace,
+        clear_actor.device,
+        clear_closure,
+    ))
+
+    permits = []
+    issue_evidence = []
+    for actor, update, proof, controls in prepared:
+        status, permit, evidence = _post_control(
+            url,
+            fixture.workspace,
+            update.head_oid,
+            "permit",
+            encode_head_permit_request(proof, controls),
+            opener=opener,
+        )
+        if status != 200 or not permit:
+            raise RuntimeError(f"cross-device permit issuance {status}")
+        permits.append((actor, update, permit))
+        issue_evidence.append(evidence)
+    clear_status, clear_permit, clear_issue_evidence = _post_control(
+        url,
+        fixture.workspace,
+        clear_update.head_oid,
+        "permit",
+        encode_head_permit_request(clear_proof, (clear_control,)),
+        opener=opener,
+    )
+    if clear_status != 200 or not clear_permit:
+        raise RuntimeError(f"cross-device clear permit {clear_status}")
+
+    barrier = threading.Barrier(2)
+
+    def commit(item):
+        _actor, update, permit = item
+        barrier.wait()
+        return _post_control(
+            url,
+            fixture.workspace,
+            update.head_oid,
+            "commit",
+            encode_head_commit_request(permit),
+            retry_conflict=True,
+            opener=opener,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        simultaneous = tuple(pool.map(commit, permits[:2]))
+    delayed = []
+    for _actor, update, permit in permits[2:]:
+        delayed.append(_post_control(
+            url,
+            fixture.workspace,
+            update.head_oid,
+            "commit",
+            encode_head_commit_request(permit),
+            retry_conflict=True,
+            opener=opener,
+        ))
+    if any(status not in {201, 204}
+           for status, _body, _evidence in (*simultaneous, *delayed)):
+        raise RuntimeError("cross-device removal commit failed")
+
+    stale_clear_status, _body, stale_clear_evidence = _post_control(
+        url,
+        fixture.workspace,
+        clear_update.head_oid,
+        "commit",
+        encode_head_commit_request(clear_permit),
+        opener=opener,
+    )
+    if stale_clear_status != 409:
+        raise RuntimeError("stale CLEAR permit crossed removal root")
+
+    replay = []
+    for _actor, update, permit in permits:
+        replay.append(_post_control(
+            url,
+            fixture.workspace,
+            update.head_oid,
+            "commit",
+            encode_head_commit_request(permit),
+            opener=opener,
+        )[0])
+    if replay != [204] * len(permits):
+        raise RuntimeError("cross-device removal replay was not exact noop")
+
+    final_pin = _run(AccessGate(
+        fixture.workspace, store).state.pin())
+    if final_pin is None:
+        raise RuntimeError("cross-device final removal root absent")
+    active = {}
+    for target, action_fid in actions:
+        sid = scoped_id("device", target)
+        proof = _run(final_pin.proof(sid))
+        value = None if proof is None else final_pin.verify(sid, proof)
+        expected = suppression_slot(action_fid)
+        if value != expected:
+            raise RuntimeError("cross-device removal did not converge")
+        active[target] = value["action"]
+    new_sid = scoped_id("member", new_member)
+    new_proof = _run(final_pin.proof(new_sid))
+    if new_proof is not None:
+        raise RuntimeError("stale CLEAR permit introduced device authority")
+
+    for actor, update, _permit in permits:
+        key = head_slot_key(fixture.workspace, actor.device)
+        opened = store.read_versioned(key)
+        if not isinstance(opened, Versioned) \
+                or decode_slot_at(key, opened.value).head \
+                != update.head_oid:
+            raise RuntimeError("cross-device control head missing")
+    clear_key = head_slot_key(fixture.workspace, clear_actor.device)
+    clear_opened = store.read_versioned(clear_key)
+    if not isinstance(clear_opened, Versioned) \
+            or decode_slot_at(clear_key, clear_opened.value).head \
+            != slot_before[clear_actor.device]:
+        raise RuntimeError("stale CLEAR head became visible")
+
+    commit_evidence = [
+        evidence for _status, _body, evidence
+        in (*simultaneous, *delayed)
+    ]
+    return {
+        "issue_statuses": [200] * (len(permits) + 1),
+        "issue_attempt_statuses": [
+            item["attempt_statuses"]
+            for item in (*issue_evidence, clear_issue_evidence)
+        ],
+        "simultaneous_terminal_statuses": [
+            status for status, _body, _evidence in simultaneous],
+        "delayed_terminal_statuses": [
+            status for status, _body, _evidence in delayed],
+        "commit_attempt_statuses": [
+            item["attempt_statuses"] for item in commit_evidence],
+        "commit_latency_ms": [item["latency_ms"]
+                              for item in commit_evidence],
+        "active_removals_expected": len(actions),
+        "active_removals_present": len(active),
+        "mutual_removals_land": len(active) == len(actions),
+        "exact_replay_statuses": replay,
+        "stale_clear_terminal_status": stale_clear_status,
+        "stale_clear_attempt_statuses": stale_clear_evidence[
+            "attempt_statuses"],
+        "stale_clear_absent": new_proof is None,
+        "final_removal_root": final_pin.root_oid,
+    }
+
+
 def _health(url, opener):
     try:
         with opener(Request(
@@ -908,6 +1271,8 @@ def live_run(
                 url,
                 Path(directory) / "cold-receiver",
             )
+            cross_device = cross_device_controls(
+                store, fixture, url)
             wrong_status = _wrong_workspace(url, fixture)
             if wrong_status != 404:
                 raise RuntimeError("wrong workspace was not denied")
@@ -924,6 +1289,7 @@ def live_run(
                 "http": performance,
                 "correctness": correctness,
                 "same_writer_recovery": recovery,
+                "cross_device_controls": cross_device,
                 "wrong_workspace_status": wrong_status,
             }
         except Exception as error:  # noqa: BLE001 - preserve cleanup evidence

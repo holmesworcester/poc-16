@@ -39,8 +39,10 @@ from core.writer_repository import (
     OwnerPublisher,
     WriterLog,
 )
+from facts.auth.admin import admin
 from facts.auth.head_request import head_request
 from facts.auth.removal import removal
+from facts.auth.request import request
 from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
@@ -437,7 +439,7 @@ def test_generic_permit_joins_multiple_control_sinks_once(tmp_path):
     run(scenario())
 
 
-def test_commit_rejects_a_permit_whose_issue_root_is_no_longer_live(
+def test_stale_removal_permit_joins_after_another_device_advances_root(
         tmp_path):
     async def scenario():
         founder_secret, founder, root = founder_world()
@@ -473,6 +475,57 @@ def test_commit_rejects_a_permit_whose_issue_root_is_no_longer_live(
             scoped_id("member", founder),
             suppression_slot(concurrent_action),
         ),))).status == "applied"
+        result = await gate.commit_head_permit(
+            OpaqueHeadGate(store, gate.authorize_head),
+            permit,
+            proposed,
+            PERMIT_SECRET,
+        )
+        assert result.status == "applied"
+        assert (await value_at(
+            gate, scoped_id("member", founder))) == suppression_slot(
+                concurrent_action)
+        assert (await value_at(
+            gate, scoped_id("member", member))) == suppression_slot(
+                action.fid)
+        assert store.read_versioned(
+            head_slot_key(root.fid, founder)) is not ABSENT
+
+    run(scenario())
+
+
+def test_stale_clear_permit_cannot_introduce_authority(tmp_path):
+    async def scenario():
+        founder_secret, founder, root = founder_world()
+        _member_secret, member, membership = joined_member(
+            founder_secret, founder, root, 1)
+        store = FsStore(str(tmp_path / "stale-clear"))
+        gate = AccessGate(root.fid, store)
+        assert (await gate.state.bootstrap(signed(
+            founder_secret, founder, root, (root,)))).status == "applied"
+        path = (await gate.state.pin()).root_oid
+        control = signed(founder_secret, founder, root, membership)
+        proposed = await establish_control_head(
+            tmp_path,
+            store,
+            founder_secret,
+            founder,
+            root,
+            (control,),
+            "stale-clear-candidate",
+        )
+        proof = exact_head_proof(
+            founder_secret, founder, root, (root,), path, proposed)
+        permit = await gate.issue_head_permit(
+            proof, proposed, (control,), 10, PERMIT_SECRET)
+        decoded = decode_permit(permit, PERMIT_SECRET)
+        assert any(value["state"] == "clear"
+                   for _sid, value in decoded.updates)
+
+        assert (await gate.state.tree.apply(((
+            scoped_id("member", h(b"concurrent removal target")),
+            suppression_slot(h(b"concurrent removal action")),
+        ),))).status == "applied"
         with pytest.raises(ControlHeadRetry, match="root is stale"):
             await gate.commit_head_permit(
                 OpaqueHeadGate(store, gate.authorize_head),
@@ -480,12 +533,115 @@ def test_commit_rejects_a_permit_whose_issue_root_is_no_longer_live(
                 proposed,
                 PERMIT_SECRET,
             )
-        assert (await value_at(
-            gate, scoped_id("member", founder))) == suppression_slot(
-                concurrent_action)
         assert await value_at(gate, scoped_id("member", member)) is None
         assert store.read_versioned(
             head_slot_key(root.fid, founder)) is ABSENT
+
+    run(scenario())
+
+
+def test_two_device_mutual_removals_both_land_after_delayed_commit(
+        tmp_path):
+    async def scenario():
+        founder_secret, founder, root = founder_world()
+        second_secret, second, membership = joined_member(
+            founder_secret, founder, root, 1)
+        elevated = admin(root.fid, founder, second, 200)
+        elevated_signature = signature(
+            founder_secret, founder, elevated, elevated.ts)
+        second_authority = (
+            *membership, elevated_signature, elevated)
+        store = FsStore(str(tmp_path / "mutual-removal"))
+        gate = AccessGate(root.fid, store)
+        assert (await gate.state.bootstrap(signed(
+            founder_secret, founder, root, (root,)))).status == "applied"
+        admission = request(
+            root.fid, second, second, "sync", 1_000, "", 210)
+        admission_signature = signature(
+            second_secret, second, admission, admission.ts)
+        admitted = await gate.authorize_access(signed(
+            second_secret,
+            second,
+            root,
+            (*second_authority, admission_signature, admission),
+        ), 220)
+        assert admitted is not None
+        basis = (await gate.state.pin()).root_oid
+
+        founder_action = removal(
+            root.fid, founder, second, 300)
+        founder_action_signature = signature(
+            founder_secret, founder, founder_action, founder_action.ts)
+        founder_control = signed(
+            founder_secret,
+            founder,
+            root,
+            (*membership, founder_action_signature, founder_action),
+        )
+        second_action = removal(
+            root.fid, second, founder, 301)
+        second_action_signature = signature(
+            second_secret, second, second_action, second_action.ts)
+        second_control = signed(
+            second_secret,
+            second,
+            root,
+            (*second_authority, second_action_signature, second_action),
+        )
+        proposed = (
+            await establish_control_head(
+                tmp_path, store, founder_secret, founder, root,
+                (founder_control,), "founder-mutual-removal"),
+            await establish_control_head(
+                tmp_path, store, second_secret, second, root,
+                (second_control,), "second-mutual-removal"),
+        )
+        proofs = (
+            exact_head_proof(
+                founder_secret, founder, root, (root,), basis,
+                proposed[0]),
+            exact_head_proof(
+                second_secret, second, root, second_authority, basis,
+                proposed[1]),
+        )
+        permits = (
+            await gate.issue_head_permit(
+                proofs[0], proposed[0], (founder_control,), 220,
+                PERMIT_SECRET),
+            await gate.issue_head_permit(
+                proofs[1], proposed[1], (second_control,), 220,
+                PERMIT_SECRET),
+        )
+        for permit in permits:
+            decoded = decode_permit(permit, PERMIT_SECRET)
+            assert decoded.removal_root == basis
+            assert all(value["state"] == "active"
+                       for _sid, value in decoded.updates)
+
+        head_gate = OpaqueHeadGate(store, gate.authorize_head)
+        first = await gate.commit_head_permit(
+            head_gate, permits[0], proposed[0], PERMIT_SECRET)
+        # This commit deliberately begins only after the first root and head
+        # are durable. It exercises stale-root recovery, not an overlapping
+        # CAS whose in-turn retry happens to hide the schedule.
+        second_result = await gate.commit_head_permit(
+            head_gate, permits[1], proposed[1], PERMIT_SECRET)
+        assert (first.status, second_result.status) == (
+            "applied", "applied")
+        assert (await value_at(
+            gate, scoped_id("member", second))) == suppression_slot(
+                founder_action.fid)
+        assert (await value_at(
+            gate, scoped_id("member", founder))) == suppression_slot(
+                second_action.fid)
+        for device, head, accepted in zip(
+                (founder, second), proposed, (first, second_result)):
+            slot = decode_slot_at(
+                head_slot_key(root.fid, device),
+                store.get(head_slot_key(root.fid, device)),
+            )
+            assert slot.head == head
+            assert slot.removal_root == accepted.slot.removal_root
 
     run(scenario())
 

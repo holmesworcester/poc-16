@@ -77,6 +77,46 @@ def production_text():
     return "\n".join((ROOT / path).read_text() for path in source_paths())
 
 
+def semantic_store_mutations():
+    """Name every protocol-layer external create/CAS completion call."""
+    found = set()
+    roots = {"core", "full_peer", "notifications", "peerlog"}
+    peerlog_paths = tuple(
+        path.relative_to(ROOT)
+        for path in (ROOT / "peerlog").rglob("*.py")
+        if not EXCLUDED_PARTS.intersection(path.relative_to(ROOT).parts)
+        and not path.name.startswith("test_")
+    )
+    for path in (*source_paths(), *peerlog_paths):
+        if path.parts[0] not in roots:
+            continue
+        tree = parsed(path)
+        parents = {}
+        for item in ast.walk(tree):
+            for child in ast.iter_child_nodes(item):
+                parents[child] = item
+        for item in ast.walk(tree):
+            if not isinstance(item, ast.Call) \
+                    or not isinstance(item.func, ast.Attribute) \
+                    or item.func.attr not in {
+                        "cas", "complete_multipart", "create",
+                        "put_if_absent",
+                    }:
+                continue
+            function = class_name = None
+            current = item
+            while current in parents:
+                current = parents[current]
+                if function is None and isinstance(
+                        current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    function = current.name
+                elif class_name is None and isinstance(current, ast.ClassDef):
+                    class_name = current.name
+            found.add((
+                path.as_posix(), class_name, function, item.func.attr))
+    return found
+
+
 def flat(path):
     return re.sub(r"\s+", " ", (ROOT / path).read_text())
 
@@ -132,6 +172,74 @@ def test_documents_describe_the_running_writer_forest_and_access_gate():
         "After cutover, no workspace-global mutable content root remains",
     )
     assert all(claim not in joined for claim in stale_claims)
+
+
+def test_every_protocol_store_mutation_has_a_concurrency_owner():
+    """Adding a durable write door requires classifying its shared target.
+
+    Provider adapters are mechanics below this inventory. Fact-family
+    ``delete`` commands mutate the local authored log rather than an external
+    key. These are all protocol-layer calls that can create/replace provider
+    state, partitioned by the identity class allowed to race them.
+    """
+    multi_device_or_relay = {
+        ("core/object_store.py", None, "ensure_object_async",
+         "put_if_absent"),
+        ("core/removal_tree.py", "RemovalTree", "apply_at", "cas"),
+        ("core/removal_tree.py", None, "_ensure_node",
+         "put_if_absent"),
+        ("core/writer_layout.py", None, "publish_placements", "cas"),
+        ("core/writer_repository.py", None, "ensure_pile_async",
+         "put_if_absent"),
+        ("core/writer_repository.py", "RepositoryMirror", "_sync_slot",
+         "cas"),
+        ("peerlog/cloud.py", "CloudQueue", "repair_directory", "cas"),
+    }
+    per_writer_identity = {
+        ("core/writer_repository.py", "OpaqueHeadGate", "_advance_slot",
+         "cas"),
+        ("peerlog/cloud.py", "CloudQueue", "publish", "create"),
+        ("peerlog/cloud.py", "CloudQueue", "publish", "cas"),
+        ("peerlog/cloud.py", "CloudQueue", "readmit_orphan", "cas"),
+        ("peerlog/cloud.py", "CloudQueue", "_write_segment", "create"),
+        ("peerlog/cloud.py", "CloudQueue", "_append_mono",
+         "complete_multipart"),
+        ("peerlog/cloud.py", "CloudQueue", "fold_idle", "cas"),
+    }
+    isolated_service_state = {
+        ("notifications/discovery.py", "NotificationState", "complete",
+         "cas"),
+        ("notifications/discovery.py", "NotificationDiscovery",
+         "_cas_exact", "cas"),
+    }
+    mechanical_passthrough = {
+        ("core/object_store.py", "SyncStoreAdapter", "put_if_absent",
+         "put_if_absent"),
+        ("core/object_store.py", "SyncStoreAdapter", "cas", "cas"),
+        ("core/writer_repository.py", "CandidateSource", "put_if_absent",
+         "put_if_absent"),
+        ("core/writer_repository.py", "CandidateSource", "cas", "cas"),
+    }
+    classes = (
+        multi_device_or_relay,
+        per_writer_identity,
+        isolated_service_state,
+        mechanical_passthrough,
+    )
+    assert not any(left & right for index, left in enumerate(classes)
+                   for right in classes[index + 1:])
+    assert semantic_store_mutations() == set().union(*classes)
+
+    # Every low-level mutable namespace is accounted for above: removal is
+    # multi-device, cursor is isolated service state, heads split by owner vs
+    # validated relay route, and layouts are multi-relay hints.
+    from core.object_store import SINGLETON_CAS_KEYS, mutable_key
+
+    assert SINGLETON_CAS_KEYS == frozenset({"removal", "cursor"})
+    assert mutable_key("heads/" + "0" * 64 + "/" + "1" * 64)
+    assert mutable_key(
+        "layouts/" + "0" * 64 + "/" + "1" * 64
+        + "/0000000000000001")
 
 
 def test_retired_aggregate_repository_cannot_return():

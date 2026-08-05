@@ -308,6 +308,43 @@ def test_contention_retries_only_transient_http_outcomes(
     }
 
 
+def test_control_conflict_retries_only_for_exact_commit_recovery(
+        monkeypatch):
+    calls = []
+
+    def opener(_request, timeout):
+        assert timeout == contention.HTTP_TIMEOUT_SECONDS
+        calls.append(1)
+        return HttpResponse(409)
+
+    monkeypatch.setattr(contention.time, "sleep", lambda _seconds: None)
+    status, _body, evidence = contention._post_control(
+        "https://worker.example",
+        "a" * 64,
+        "b" * 64,
+        "commit",
+        b"permit",
+        opener=opener,
+    )
+    assert status == 409
+    assert evidence["attempt_statuses"] == [409]
+    assert len(calls) == 1
+
+    calls.clear()
+    status, _body, evidence = contention._post_control(
+        "https://worker.example",
+        "a" * 64,
+        "b" * 64,
+        "commit",
+        b"permit",
+        retry_conflict=True,
+        opener=opener,
+    )
+    assert status == 409
+    assert evidence["attempt_statuses"] == [409] * contention.HTTP_MAX_ATTEMPTS
+    assert len(calls) == contention.HTTP_MAX_ATTEMPTS
+
+
 def test_wrong_workspace_requires_a_response_from_the_running_worker(
         tmp_path, monkeypatch):
     fixture = contention.build_fixture(

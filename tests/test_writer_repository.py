@@ -63,6 +63,42 @@ def run(awaitable):
     return asyncio.run(awaitable)
 
 
+class OverlapOneKeyCas:
+    """Force two awaited recipient slot replacements to share one base."""
+
+    def __init__(self, backing, key):
+        self.backing = backing
+        self.key = key
+        self.arrivals = 0
+        self.release = asyncio.Event()
+
+    def __getattr__(self, name):
+        return getattr(self.backing, name)
+
+    async def get_bounded(self, key, maximum):
+        return self.backing.get_bounded(key, maximum)
+
+    async def copy_pile_object(self, oid, maximum, write):
+        return self.backing.copy_pile_object(oid, maximum, write)
+
+    async def read_versioned(self, key):
+        return self.backing.read_versioned(key)
+
+    async def put_if_absent(self, key, value):
+        return self.backing.put_if_absent(key, value)
+
+    async def cas(self, key, token, value):
+        if key == self.key and not self.release.is_set():
+            self.arrivals += 1
+            if self.arrivals == 2:
+                self.release.set()
+            await self.release.wait()
+        return self.backing.cas(key, token, value)
+
+    async def list_page(self, prefix, cursor=None, limit=256):
+        return self.backing.list_page(prefix, cursor, limit)
+
+
 def world():
     secret, public = keypair()
     root = workspace_fact(secret, public, "alice", 1)
@@ -421,6 +457,109 @@ def test_same_writer_objects_converge_through_normal_and_opaque_cloud_modes(
         # Equal directories are a no-op and fetch no pile for semantic work.
         again = await via_cloud.sync_from(cloud_store)
         assert again.changed == again.piles == again.facts == 0
+
+    run(scenario())
+
+
+def test_distinct_relays_racing_one_origin_slot_cannot_roll_it_back(
+        tmp_path):
+    async def scenario():
+        secret, public, root, device_signature, device = world()
+        source = FsStore(str(tmp_path / "relay-source"))
+        target_backing = FsStore(str(tmp_path / "relay-target"))
+        binding = writer_store_binding(root.fid, public)
+        writer = WriterLog(
+            root.fid, public, public, binding, secret, source)
+        gate = OpaqueHeadGate(
+            source,
+            mechanical_head_authorizer(root.fid, h(b"source removal")),
+        )
+        slots = []
+        fork_update = None
+        for timestamp, text in ((10, "older"), (11, "newer")):
+            item = message_fact(
+                root.fid, public, "general", text, timestamp)
+            item_signature = signature_fact(
+                secret, public, item, timestamp)
+            update = await writer.prepare(((
+                root, device_signature, device,
+                item_signature, item,
+            ),))
+            await writer.establish(update)
+            outcome = await gate.advance(
+                proof_for(
+                    secret,
+                    public,
+                    root,
+                    device_signature,
+                    device,
+                    update.head_oid,
+                    update.base_head,
+                ),
+                update.head_oid,
+                100,
+            )
+            assert outcome.status == "applied"
+            slots.append(source.get(head_slot_key(root.fid, public)))
+            if text == "older":
+                fork_item = message_fact(
+                    root.fid, public, "general", "competing fork", 12)
+                fork_signature = signature_fact(
+                    secret, public, fork_item, 12)
+                fork_update = await writer.prepare(((
+                    root, device_signature, device,
+                    fork_signature, fork_item,
+                ),))
+
+        for key in source.list("obj/"):
+            target_backing.put_if_absent(key, source.get(key))
+        assert fork_update is not None
+        await writer.establish(fork_update, target_backing)
+        key = head_slot_key(root.fid, public)
+        target = OverlapOneKeyCas(target_backing, key)
+        consumer = FactConsumer(root.fid)
+        mirror = RepositoryMirror(
+            root.fid,
+            target,
+            binding_for(root.fid, public, binding),
+            consumer,
+        )
+
+        raced = await asyncio.gather(
+            mirror.accept_slot(slots[0]),
+            mirror.accept_slot(slots[1]),
+            return_exceptions=True,
+        )
+        assert target.arrivals == 2
+        assert sum(isinstance(result, ValueError) for result in raced) == 1
+        assert sum(not isinstance(result, BaseException)
+                   for result in raced) == 1
+
+        visible = decode_slot_at(key, target_backing.get(key)).head
+        newer = decode_slot_at(key, slots[1]).head
+        older = decode_slot_at(key, slots[0]).head
+        if visible == older:
+            repaired = await mirror.accept_slot(slots[1])
+            assert repaired.changed == 1
+        else:
+            assert visible == newer
+            stale = await mirror.accept_slot(slots[0])
+            assert stale.changed == 0
+            assert decode_slot_at(
+                key, target_backing.get(key)).head == newer
+        exact = await mirror.accept_slot(slots[1])
+        assert exact.changed == 0
+        assert decode_slot_at(key, target_backing.get(key)).head == newer
+        removal_root = decode_slot_at(key, slots[0]).removal_root
+        fork_slot = encode_slot(HeadSlot(
+            root.fid,
+            public,
+            fork_update.head_oid,
+            removal_root,
+        ))
+        with pytest.raises(ValueError, match="writer head fork"):
+            await mirror.accept_slot(fork_slot)
+        assert decode_slot_at(key, target_backing.get(key)).head == newer
 
     run(scenario())
 

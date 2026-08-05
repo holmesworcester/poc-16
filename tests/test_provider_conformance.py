@@ -1,7 +1,9 @@
 """Deterministic provider contract and adapter fault probes."""
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from itertools import count
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -17,6 +19,14 @@ from core.object_store import (
     VersionToken,
 )
 from core.store import FsStore
+from core.writer_layout import (
+    LayoutPage,
+    PackPlacement,
+    decode_layout_page_at,
+    encode_layout_page,
+    layout_page_key,
+    publish_placements,
+)
 from tests.provider_conformance import (
     ConformanceRun,
     exercise_async_store,
@@ -38,6 +48,24 @@ from tests.test_provider_live import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+class _FirstCasBarrier:
+    """Make distinct sync adapter handles replace one layout base."""
+
+    def __init__(self, store, barrier):
+        self.store = store
+        self.barrier = barrier
+        self.first = True
+
+    def __getattr__(self, name):
+        return getattr(self.store, name)
+
+    def cas(self, key, token, value):
+        if self.first:
+            self.first = False
+            self.barrier.wait()
+        return self.store.cas(key, token, value)
 
 
 def _s3_config(**changes):
@@ -122,6 +150,74 @@ def test_native_r2_binding_runs_the_awaited_shared_contract():
     ]) >= 4
     assert bucket.conditional_barrier.arrivals == 2
     assert bucket.conditional_barrier.released
+
+
+@pytest.mark.parametrize("provider", ("fs", "s3", "r2-s3"))
+def test_distinct_layout_publishers_merge_on_every_sync_provider_contract(
+        tmp_path, provider):
+    if provider == "fs":
+        backing = FsStore(str(tmp_path / "layout-provider"))
+        stores = (backing, backing)
+    else:
+        bucket = FakeS3Bucket()
+        adapter = S3Store if provider == "s3" else R2S3Store
+        config = _s3_config() if provider == "s3" else _r2_config()
+        stores = tuple(adapter(
+            config, client=bucket.client(f"{provider}-{index}"))
+            for index in range(2))
+        backing = stores[0]
+    barrier = threading.Barrier(2)
+    stores = tuple(_FirstCasBarrier(store, barrier) for store in stores)
+    workspace, device = h(b"layout workspace"), h(b"layout writer")
+    placements = (
+        PackPlacement(1, h(b"first shared pack"), 1, (1,)),
+        PackPlacement(3, h(b"second shared pack"), 1, (1,)),
+    )
+
+    def publish(item):
+        store, placement = item
+        return asyncio.run(publish_placements(
+            store, workspace, device, 1, (placement,)))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = tuple(pool.map(publish, zip(stores, placements)))
+
+    key = layout_page_key(workspace, device, 1)
+    final = decode_layout_page_at(key, backing.get(key))
+    assert final == LayoutPage(workspace, device, 1, placements)
+    assert final in results
+
+
+def test_distinct_layout_publishers_merge_on_native_r2_contract():
+    async def scenario():
+        bucket = FakeR2Bucket()
+        stores = tuple(R2BindingStore(
+            bucket, "poc16-conformance/run-fixed") for _index in range(2))
+        workspace, device = h(b"layout workspace"), h(b"layout writer")
+        placements = (
+            PackPlacement(1, h(b"first shared pack"), 1, (1,)),
+            PackPlacement(3, h(b"second shared pack"), 1, (1,)),
+        )
+        key = layout_page_key(workspace, device, 1)
+        seeded = await stores[0].cas(
+            key,
+            ABSENT,
+            encode_layout_page(LayoutPage(workspace, device, 1, ())),
+        )
+        assert isinstance(seeded, Applied)
+        bucket.conditional_barrier = OneShotAsyncBarrier(2)
+        results = await asyncio.gather(*(
+            publish_placements(
+                store, workspace, device, 1, (placement,))
+            for store, placement in zip(stores, placements)
+        ))
+        final = decode_layout_page_at(key, await stores[0].get(key))
+        assert final == LayoutPage(workspace, device, 1, placements)
+        assert final in results
+        assert bucket.conditional_barrier.arrivals == 2
+        assert bucket.conditional_barrier.released
+
+    asyncio.run(scenario())
 
 
 def test_atomic_s3_response_keeps_body_and_token_from_one_version():
