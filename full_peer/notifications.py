@@ -174,7 +174,7 @@ class FullPeerNotifications:
 
         async def handle(delivery):
             return await handle_carrier_delivery(
-                delivery, workspace, progress, worker)
+                delivery, workspace, progress, worker, wake=self.kick)
 
         return NotificationDiscovery(
             repository, state, workspace, DirectCarrier(handle),

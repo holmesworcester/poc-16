@@ -219,6 +219,9 @@ class FailCompleteOnce:
     async def release(self):
         return await self.service.release()
 
+    async def wake(self):
+        return await self.service.wake()
+
 
 class BarrierStateService:
     def __init__(self, service, parties=2):
@@ -239,6 +242,9 @@ class BarrierStateService:
     async def release(self):
         return await self.service.release()
 
+    async def wake(self):
+        return await self.service.wake()
+
 
 class PausingComplete:
     def __init__(self, service):
@@ -258,6 +264,9 @@ class PausingComplete:
 
     async def release(self):
         return await self.service.release()
+
+    async def wake(self):
+        return await self.service.wake()
 
 
 def _request():
@@ -322,6 +331,9 @@ def test_notification_state_service_rejects_untyped_rpc_results():
 
         async def complete(self, _body_oid):
             return "done"
+
+        async def wake(self):
+            return None
 
     state = NotificationStateService(Malformed(), "a" * 64)
     with pytest.raises(ValueError, match="pending response"):
@@ -414,6 +426,9 @@ class StateService:
 
     async def release(self):
         return scanner.release_state(self.env)
+
+    async def wake(self):
+        return await scanner.scan(self.env)
 
 
 def _scanner_env(
@@ -515,6 +530,47 @@ def test_actual_r2_scanner_and_queue_consumer_share_one_awaited_path(
     assert any(call[0] == "get" for call in state.calls)
     assert run(state_service.pending(h(queue.bodies[0].encode()))) \
         == PENDING_NONCURRENT
+
+
+def test_completion_wake_drains_next_staged_event_without_cron(tmp_path):
+    node, workspace, secret = _world(tmp_path)
+    events = {
+        message.post(node, workspace, "general", text, ts=4 + ordinal)
+        for ordinal, text in enumerate(("first", "second"))
+    }
+    canonical, state, queue = R2Bucket(), R2Bucket(), Queue()
+    _copy_repository(node, workspace, canonical, f"workspaces/{workspace}")
+    canonical_reader = CanonicalReadService(workspace, canonical)
+    scan_env = _scanner_env(
+        workspace, canonical_reader, state, queue)
+    state_service = StateService(scan_env)
+    assert run(_bootstrap(scan_env, "backfill")) == "bootstrapped-backfill"
+    assert run(_scan_until(scan_env, "published")) == "published"
+    first_body, = queue.bodies
+    queue.bodies.clear()
+    fcm = FcmService()
+
+    first = QueueMessage(first_body, "first")
+    run(consumer.consume(
+        _consumer_env(
+            workspace, canonical_reader, state_service, secret, fcm),
+        SimpleNamespace(messages=[first])))
+
+    assert first.action == "ack"
+    second_body, = queue.bodies
+    assert second_body != first_body
+    second = QueueMessage(second_body, "second")
+    run(consumer.consume(
+        _consumer_env(
+            workspace, canonical_reader, state_service, secret, fcm),
+        SimpleNamespace(messages=[second])))
+    delivered = {
+        decode_hint(body.encode()).facts[0]
+        for body in (first_body, second_body)
+    }
+    assert second.action == "ack"
+    assert delivered == events
+    assert len(fcm.documents) == 2
 
 
 def test_expired_queue_wake_is_recreated_from_r2_pending(tmp_path):

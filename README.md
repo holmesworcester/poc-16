@@ -300,7 +300,10 @@ is quarantined and unrelated writers remain discoverable. Once validated, the
 staged authenticated map is paged into ordinary bounded carrier bodies, one
 event per durable pending body. This keeps current-authority matching and
 delivery budgets independent for each event even when one head spans many
-piles.
+piles. A successful completion sends a best-effort private scanner wake so the
+next staged event can become pending immediately; the ordinary cadence repairs
+a lost wake. Decode-only support lets a pending multi-event v1 body finish
+during this hard cut, but scanners never create another one.
 
 Bootstrap is explicit: normal launch validates all current writer heads and
 marks their existing triggers seen, while a deliberate backfill starts with

@@ -190,6 +190,34 @@ def test_current_body_is_acked_only_after_provider_and_progress(tmp_path):
     assert asyncio.run(state.pending(h(body))) == PENDING_NONCURRENT
 
 
+def test_completion_wakes_next_page_and_lost_wake_stays_acked(tmp_path):
+    (_node, workspace, _event, body, _reference,
+     state, provider, worker) = _world(tmp_path)
+    wakes = []
+
+    async def wake():
+        wakes.append("wake")
+
+    result = asyncio.run(handle_carrier_delivery(
+        CarrierDelivery(body, "current", 1),
+        workspace, state, worker, wake=wake))
+    stale = asyncio.run(handle_carrier_delivery(
+        CarrierDelivery(body, "stale", 2),
+        workspace, state, worker, wake=wake))
+
+    assert (result, stale) == (ACK, ACK)
+    assert wakes == ["wake"]
+    assert len(provider.requests) == 1
+
+    node, workspace, _event, body, _reference, state, _provider, worker = \
+        _world(tmp_path / "lost")
+    result = asyncio.run(handle_carrier_delivery(
+        CarrierDelivery(body, "lost-wake", 1), workspace, state, worker,
+        wake=lambda: (_ for _ in ()).throw(OSError("wake unavailable"))))
+    assert result is ACK
+    assert asyncio.run(state.pending(h(body))) == PENDING_NONCURRENT
+
+
 def test_crash_after_fcm_acceptance_retries_until_progress_cas(tmp_path):
     (_node, workspace, _event, body, _reference,
      state, provider, worker) = _world(tmp_path)

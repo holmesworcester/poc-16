@@ -674,6 +674,38 @@ def test_scanner_handler_accepts_only_explicit_bootstrap_event(
     assert calls == [("backfill", {"workspace": workspace})]
 
 
+def test_delivery_wake_invokes_exact_scanner_version_asynchronously(
+        monkeypatch):
+    workspace = "a" * 64
+    scanner = "arn:aws:lambda:us-west-2:123456789012:function:scanner:7"
+    calls = []
+
+    class Lambda:
+        def invoke(self, **request):
+            calls.append(request)
+            return {"StatusCode": 202}
+
+    boto3 = ModuleType("boto3")
+    boto3.client = lambda name, **_kwargs: Lambda() if name == "lambda" \
+        else None
+    monkeypatch.setitem(sys.modules, "boto3", boto3)
+    monkeypatch.setattr(app, "_sdk_config", lambda: object())
+    monkeypatch.setenv("TINYP2P_NOTIFICATION_WORKSPACE_ID", workspace)
+    monkeypatch.setenv(
+        "TINYP2P_NOTIFICATION_SCANNER_VERSION_ARN", scanner)
+
+    app._wake_scanner()
+
+    assert calls == [{
+        "FunctionName": scanner,
+        "InvocationType": "Event",
+        "Payload": app.canon({
+            "schema": "poc16-notification-scan-wake-v1",
+            "workspace": workspace,
+        }),
+    }]
+
+
 @dataclass
 class QueueCarrier:
     bodies: list
@@ -691,18 +723,23 @@ def test_transient_fcm_retries_same_sqs_item_until_acceptance(tmp_path):
     ])
     worker = _worker(node, secret, provider)
     event = {"Records": [_record(raw)]}
+    wakes = []
+
+    async def wake():
+        wakes.append("wake")
 
     first = asyncio.run(app.deliver_batch(
         event, state=state, worker=worker,
-        workspace=workspace, queue_arn=ARN))
+        workspace=workspace, queue_arn=ARN, wake=wake))
     second = asyncio.run(app.deliver_batch(
         event, state=state, worker=worker,
-        workspace=workspace, queue_arn=ARN))
+        workspace=workspace, queue_arn=ARN, wake=wake))
 
     assert first == {
         "batchItemFailures": [{"itemIdentifier": "work"}],
     }
     assert second == {"batchItemFailures": []}
+    assert wakes == ["wake"]
     assert provider.requests[0].delivery_id \
         == provider.requests[1].delivery_id
 

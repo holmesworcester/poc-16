@@ -197,7 +197,7 @@ async def process_carrier_delivery(
 
 
 async def handle_carrier_delivery(
-        delivery, workspace, notification_state, worker):
+        delivery, workspace, notification_state, worker, *, wake=None):
     """Evaluate and complete only the exact durable pending body."""
     read = getattr(notification_state, "get_bounded", None)
     pending = getattr(notification_state, "pending", None)
@@ -209,7 +209,8 @@ async def handle_carrier_delivery(
             or not callable(pending) \
             or not callable(complete) \
             or not valid_fid(owner) \
-            or not isinstance(worker, NotificationWorker):
+            or not isinstance(worker, NotificationWorker) \
+            or wake is not None and not callable(wake):
         raise TypeError("notification carrier handler")
     reference, _reason = _reference(delivery, workspace, owner)
     if reference is None:
@@ -232,7 +233,16 @@ async def handle_carrier_delivery(
         status = await _resolve(complete(body_oid))
     except Exception:
         return CARRIER_RETRY
-    return CARRIER_ACK if status == PENDING_NONCURRENT else CARRIER_RETRY
+    if status != PENDING_NONCURRENT:
+        return CARRIER_RETRY
+    if wake is not None:
+        try:
+            await _resolve(wake())
+        except Exception:
+            # Completion is already durable. The ordinary fair cadence repairs
+            # a dropped optimization wake without replaying accepted FCM work.
+            pass
+    return CARRIER_ACK
 
 
 __all__ = (

@@ -309,8 +309,26 @@ def _delivery_dependencies():
     return _delivery_cache
 
 
+def _wake_scanner():
+    """Best-effort asynchronous continuation after durable completion."""
+    import boto3
+
+    response = boto3.client("lambda", config=_sdk_config()).invoke(
+        FunctionName=_required(
+            "TINYP2P_NOTIFICATION_SCANNER_VERSION_ARN"),
+        InvocationType="Event",
+        Payload=canon({
+            "schema": SCAN_WAKE_SCHEMA,
+            "workspace": _workspace(),
+        }),
+    )
+    if not isinstance(response, dict) or response.get("StatusCode") != 202 \
+            or response.get("FunctionError") is not None:
+        raise OSError("notification scanner wake was not accepted")
+
+
 async def deliver_batch(event, *, state=None, worker=None, workspace=None,
-                        queue_arn=None):
+                        queue_arn=None, wake=None):
     """Decode writer hints, rebuild current authority, and consume a batch."""
     if any(value is None for value in (state, worker, workspace, queue_arn)):
         configured = _delivery_dependencies()
@@ -322,7 +340,7 @@ async def deliver_batch(event, *, state=None, worker=None, workspace=None,
 
     async def handle(delivery):
         return await handle_carrier_delivery(
-            delivery, workspace, state, worker)
+            delivery, workspace, state, worker, wake=wake)
 
     return await consume_sqs_batch(
         event, handle, expected_queue_arn=queue_arn)
@@ -376,7 +394,7 @@ def delivery_handler(event, _context):
     """Handle SQS normally or one private operator direct launch test."""
     if isinstance(event, dict) and event.get("schema") == DIRECT_SMOKE_SCHEMA:
         return asyncio.run(direct_smoke(event))
-    return asyncio.run(deliver_batch(event))
+    return asyncio.run(deliver_batch(event, wake=_wake_scanner))
 
 
 __all__ = (

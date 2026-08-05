@@ -1,6 +1,7 @@
 """FullPeer composition around the shared notification cursor and worker."""
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import threading
 import time
@@ -127,6 +128,33 @@ def test_cursor_owner_binds_firebase_project_not_provider_instance(tmp_path):
     assert changed.owner != service.owner
     with pytest.raises(ValueError, match="bootstrap conflict"):
         changed.bootstrap(workspace, "current")
+
+
+def test_completion_kicks_drain_staged_events_without_cadence(tmp_path):
+    node, workspace, provider, service = _world(tmp_path)
+    service.cadence = 3600
+    expected = {
+        message.post(node, workspace, "general", text, ts=4 + ordinal)
+        for ordinal, text in enumerate(("first", "second"))
+    }
+    for _ in range(10):
+        service.run_once()
+        if len(provider.requests) == 1:
+            break
+    assert len(provider.requests) == 1
+
+    service.start()
+    try:
+        _wait(lambda: len(provider.requests) == len(expected))
+    finally:
+        service.stop()
+        service.join(5)
+
+    assert not service.is_alive()
+    assert {
+        json.loads(request.payload)["event"]
+        for request in provider.requests
+    } == expected
 
 
 def test_transient_fcm_retry_preserves_cursor_and_restart_resumes(

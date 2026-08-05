@@ -8,7 +8,7 @@ import facts
 from adapters.s3 import S3Config, S3Store
 from core.crypto import h, keypair
 from core.fact import canon, encode
-from core.limits import PAGE_BATCH
+from core.limits import MAX_FACT_BYTES, PAGE_BATCH
 from core.object_store import OutcomeUnknown
 from core.store import FsStore
 from core.writer_head import (
@@ -46,6 +46,7 @@ from notifications.discovery import (
 )
 from notifications.hints import (
     EventRef,
+    FORMAT as HINT_FORMAT,
     MAX_HINT_BYTES,
     MAX_HINT_EVENTS,
     NotificationHint,
@@ -799,6 +800,65 @@ def test_rebootstrap_generation_makes_old_delivery_noncurrent(tmp_path):
 
     assert asyncio.run(fresh.state.pending(h(old_raw))) == PENDING_NONCURRENT
     assert asyncio.run(old.state.complete(h(old_raw))) == PENDING_NONCURRENT
+
+
+def test_decode_only_multi_event_pending_finishes_during_cutover(tmp_path):
+    node, workspace = _world(tmp_path)
+    store = FsStore(str(tmp_path / "cursor"))
+    carrier = MemoryCarrier([])
+    discovery = _discovery(node, workspace, store, carrier)
+    asyncio.run(discovery.bootstrap_current())
+    expected = {
+        message.post(node, workspace, "general", text, ts=3 + ordinal)
+        for ordinal, text in enumerate(("legacy one", "legacy two"))
+    }
+    asyncio.run(_until(discovery, {"published"}))
+
+    async def install_legacy_pending():
+        cursor, token = await discovery.state._read()
+        rows, continuation = await discovery._map_page(
+            "scan-events", cursor.scan.events, None, 2)
+        assert continuation is None and len(rows) == 2
+        current = decode_hint(carrier.payloads[-1])
+        raw = canon({
+            "base_head": current.base_head,
+            "device": current.device,
+            "events": [list(row) for row in rows],
+            "format": HINT_FORMAT,
+            "generation": current.generation,
+            "head": current.head,
+            "owner": current.owner,
+            "workspace": current.workspace,
+        })
+        reference = decode_hint(raw)
+        assert reference.legacy is True
+        with pytest.raises(ValueError, match="decode-only"):
+            encode_hint(reference)
+        oid = await discovery._ensure_object(raw, MAX_HINT_BYTES)
+        seen = await discovery._map_update("seen", cursor.seen, rows)
+        desired = replace(
+            cursor,
+            scan=replace(cursor.scan, phase="complete", after=None),
+            pending=Pending(oid, cursor.heads, seen),
+        )
+        assert await discovery._cas_exact(token, desired) is not None
+        return raw
+
+    legacy_raw = asyncio.run(install_legacy_pending())
+    carrier.payloads.clear()
+
+    assert asyncio.run(discovery.run_once()).status == "republished"
+    assert carrier.payloads == [legacy_raw]
+    reference = decode_hint(legacy_raw)
+    raws = tuple(
+        asyncio.run(discovery.state.get_bounded(
+            "obj/" + event.oid, MAX_FACT_BYTES))
+        for event in reference.events
+    )
+    assert set(materialize_hint(reference, raws).facts) == expected
+    assert asyncio.run(_complete(discovery, legacy_raw)) == PENDING_NONCURRENT
+    assert asyncio.run(discovery.run_once()).status == "advanced"
+    assert asyncio.run(discovery.run_once()).status == "idle"
 
 
 def test_hint_and_cursor_codecs_are_canonical_and_reject_old_shape():

@@ -17,7 +17,8 @@ class NotificationStateService:
     def __init__(self, service, owner):
         if not valid_fid(owner) \
                 or not all(callable(getattr(service, name, None))
-                           for name in ("get_bounded", "pending", "complete")):
+                           for name in (
+                               "get_bounded", "pending", "complete", "wake")):
             raise TypeError("Cloudflare notification-state service")
         self.owner = owner
         self.reader = ReadServiceStore(service, versioned=False)
@@ -37,6 +38,9 @@ class NotificationStateService:
         if status not in {PENDING_NONCURRENT, PENDING_RETRY}:
             raise ValueError("notification completion response")
         return status
+
+    async def wake(self):
+        await self.service.wake()
 
 
 __all__ = ("NotificationStateService",)

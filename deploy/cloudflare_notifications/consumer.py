@@ -61,7 +61,7 @@ class Settings:
             raise ValueError("CANONICAL_READER binding")
         if not all(callable(getattr(state, name, None))
                    for name in ("get_bounded", "pending", "complete",
-                                "release")):
+                                "release", "wake")):
             raise ValueError("NOTIFICATION_STATE_SERVICE binding")
         if not callable(getattr(fcm, "send", None)) \
                 or not callable(getattr(fcm, "release", None)):
@@ -132,7 +132,7 @@ async def consume(env, batch):
 
         async def handle(item):
             return await handle_carrier_delivery(
-                item, settings.workspace, state, worker)
+                item, settings.workspace, state, worker, wake=state.wake)
 
         disposition = await delivery_disposition(delivery, handle)
         if disposition is ACK:

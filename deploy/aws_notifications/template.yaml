@@ -235,6 +235,10 @@ Resources:
                   - sqs:GetQueueAttributes
                   - sqs:ReceiveMessage
                 Resource: !GetAtt NotificationQueue.Arn
+              - Sid: ContinueNotificationScan
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Ref NotificationScannerVersion
               - !If
                 - HasRepositoryKmsKey
                 - Sid: DecryptCanonicalRepository
@@ -332,6 +336,7 @@ Resources:
           TINYP2P_NOTIFICATION_SECRET_VERSION_ID: !Ref NotificationSecretVersionId
           TINYP2P_NOTIFICATION_PUSH_NODE_ID: !Ref PushNodeId
           TINYP2P_NOTIFICATION_DELIVERY_DOMAIN_ID: !Ref DeliveryDomainId
+          TINYP2P_NOTIFICATION_SCANNER_VERSION_ARN: !Ref NotificationScannerVersion
           TINYP2P_NOTIFICATION_SOFTWARE_DIGEST: !Ref SoftwareDigest
 
   NotificationScannerVersion:

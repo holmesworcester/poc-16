@@ -488,6 +488,7 @@ def test_template_keeps_roles_narrow_and_traffic_switches_non_destructive():
     assert "TINYP2P_NOTIFICATION_PUSH_NODE_ID" not in scanner_function
     assert "TINYP2P_NOTIFICATION_SECRET_VERSION_ID" in delivery_function
     assert "TINYP2P_NOTIFICATION_PUSH_NODE_ID" in delivery_function
+    assert "TINYP2P_NOTIFICATION_SCANNER_VERSION_ARN" in delivery_function
     assert "TINYP2P_NOTIFICATION_DIRECT_SMOKE_ENABLED" not in template
     assert template.count("TINYP2P_NOTIFICATION_SOFTWARE_DIGEST") == 2
     assert template.count("Type: AWS::Lambda::Version") == 2
@@ -521,6 +522,8 @@ def test_template_keeps_roles_narrow_and_traffic_switches_non_destructive():
     assert "s3:ListBucket" in delivery
     assert delivery.count("s3:PutObject") == 1
     assert "sqs:SendMessage" not in delivery
+    assert "lambda:InvokeFunction" in delivery
+    assert "Resource: !Ref NotificationScannerVersion" in delivery
     assert "secretsmanager:GetSecretValue" in delivery
     assert "kms:EncryptionContext:SecretARN" in delivery
     assert "sqs:ReceiveMessage" in delivery
