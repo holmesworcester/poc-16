@@ -9,12 +9,18 @@ from nacl import signing
 import peerlog.cloud as cloud_module
 from adapters.s3 import S3Config, S3Store
 from peerlog.cloud import (
+    CLOUD_DEMAND_MAX_INTERVALS,
+    CLOUD_DEMAND_MAX_INTERVALS_PER_WRITER,
+    CLOUD_DEMAND_MAX_WRITERS,
     MICRO_TAIL,
     MULTIPART_EDGE,
     CloudCache,
+    CloudClosureLimits,
+    CloudDemand,
     CloudQueue,
     MaintenanceRequired,
     MemoryCloud,
+    WriterDemand,
 )
 from peerlog.cloud import (
     Publication, Segment, Slot, _encode_segment, _micro_key, encode_slot,
@@ -23,6 +29,7 @@ from peerlog.cloud_s3 import S3Cloud
 from peerlog.endpoint import PeerEndpoint, run_key
 from peerlog.fact import Fact, Ref, fid
 from peerlog.ingest import PeerState
+from peerlog.ingest import ingest
 from peerlog.log import WriterLog
 from peerlog.log import encode_head
 from peerlog.proof import carry, prove_run
@@ -45,6 +52,39 @@ def owned(label, count, *, body_size=0):
 
 def entries(log):
     return {(log.fact(seq).ts, fid(log.fact(seq))) for seq in log._facts}
+
+
+def dependency_chain_cloud(label="dependency closure"):
+    """A recent A fact reaches old B and C facts amid unrelated history."""
+    store = MemoryCloud()
+    cloud = CloudQueue(store, h(label))
+    a, b, c = WriterLog.owned(), WriterLog.owned(), WriterLog.owned()
+    for seq in range(5):
+        c.append(Fact("msg", 100 + seq, (), f"c-old:{seq}".encode()))
+    for seq in range(5):
+        refs = (Ref(c.writer, 1),) if seq == 2 else ()
+        b.append(Fact("msg", 200 + seq, refs, f"b-old:{seq}".encode()))
+    for seq in range(5):
+        a.append(Fact("msg", 300 + seq, (), f"a-old:{seq}".encode()))
+    a.append(Fact("msg", 1_000, (Ref(b.writer, 2),), b"recent A"))
+    receipts = {
+        "c": cloud.publish(c, 0, 5, announce=False),
+        "b": cloud.publish(b, 0, 5, announce=False),
+        "a_old": cloud.publish(a, 0, 5, announce=False),
+        "a_recent": cloud.publish(a, 5, 6, announce=False),
+    }
+    cloud.repair_directory()
+    return store, cloud, a, b, c, receipts
+
+
+def assert_ref_closed(state, ref, seen=None):
+    seen = set() if seen is None else seen
+    if ref in seen:
+        return
+    seen.add(ref)
+    fact = state.logs[ref.writer].fact(ref.seq)
+    for dependency in fact.refs:
+        assert_ref_closed(state, dependency, seen)
 
 
 def test_cloud_uses_exact_peer_runs_and_one_round_no_change():
@@ -106,6 +146,150 @@ def test_timestamp_window_uses_directory_footer_and_body_waves():
     assert set(state.logs[log.writer]._facts) == {1}
 
 
+def test_per_writer_tail_clamps_across_hot_medium_and_1000_long_tail_writers():
+    store = MemoryCloud()
+    cloud = CloudQueue(store, h("skewed writer tails"))
+    logs = [owned("hot", 2_000)]
+    logs.extend(owned(f"medium-{ordinal}", 40 + ordinal)
+                for ordinal in range(5))
+    # A quarter are empty/absent; the rest exercise one, two, and three facts.
+    logs.extend(owned(f"quiet-{ordinal}", ordinal % 4)
+                for ordinal in range(1_000))
+    for log in logs:
+        count = len(log)
+        if not count:
+            continue
+        split = max(0, count - 2)
+        if split:
+            cloud.publish(log, 0, split, announce=False)
+        cloud.publish(log, split, count, announce=False)
+    cloud.repair_directory()
+
+    demand = CloudDemand.tails((log.writer for log in logs), 2)
+    state, cache = PeerState(), CloudCache()
+    report = cloud.sync(state, cache, demand=demand)
+    expected = sum(min(2, len(log)) for log in logs)
+    nonempty = sum(bool(len(log)) for log in logs)
+    assert report.interactive_ready and not report.pending
+    assert report.initial_facts == report.facts == expected
+    assert report.initial_segment_gets == nonempty
+    assert report.closure_segment_gets == 0
+    for log in logs:
+        if not len(log):
+            assert log.writer not in state.logs
+            continue
+        assert set(state.logs[log.writer]._facts) == set(
+            range(max(0, len(log) - 2), len(log)))
+
+    # The retired scalar range derived from the hot writer misses every quiet
+    # writer; the per-writer tail above resolves independently at each slot.
+    legacy_lo = len(logs[0]) - 2
+    slots, _tag = cloud.poll()
+    legacy_writers = {
+        writer for writer, slot in slots.items()
+        if any(segment.lo < len(logs[0]) and legacy_lo < segment.hi
+               for segment in slot.segments)
+    }
+    assert legacy_writers == {logs[0].writer}
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        cloud.sync(PeerState(), seq_window=(legacy_lo, len(logs[0])))
+
+    before = store.metrics.copy()
+    noop = cloud.sync(state, cache, demand=demand)
+    delta = store.metrics.delta(before)
+    assert not noop.changed and noop.rounds == 1
+    assert delta.gets == delta.conditional_gets == 1
+    logs[0].append(Fact("msg", 9_000_000, (), b"one hot-writer delta"))
+    cloud.publish(logs[0], 2_000, 2_001, announce=False)
+    cloud.repair_directory()
+    warm = cloud.sync(state, cache, demand=demand)
+    assert warm.initial_segment_gets == warm.object_gets == warm.facts == 1
+    assert warm.closure_segment_gets == 0 and warm.rounds == 2
+
+
+def test_exact_writer_intervals_normalize_and_subtract_coverage_islands():
+    store = MemoryCloud()
+    cloud = CloudQueue(store, h("exact demand coverage"))
+    log = owned("interval writer", 12)
+    receipts = [
+        cloud.publish(log, 0, 4, announce=False),
+        cloud.publish(log, 4, 8, announce=False),
+        cloud.publish(log, 8, 12, announce=False),
+    ]
+    cloud.repair_directory()
+    state = PeerState()
+    ingest(state, prove_run(log, 0, 4))
+    demand = CloudDemand.exact({
+        log.writer: ((8, 10), (2, 6), (1, 3), (2, 6)),
+        h("absent exact writer"): ((0, 10),),
+    })
+    by_writer = {item.writer: item for item in demand.writers}
+    assert by_writer[log.writer].intervals == ((1, 6), (8, 10))
+    assert by_writer[h("absent exact writer")].intervals == ((0, 10),)
+
+    before = store.metrics.copy()
+    report = cloud.sync(state, demand=demand)
+    delta = store.metrics.delta(before)
+    assert report.interactive_ready
+    assert report.initial_segment_gets == 2
+    assert report.initial_bytes == receipts[1].segment.size \
+        + receipts[2].segment.size
+    assert report.object_gets == delta.gets - 1 == 2
+    assert set(state.logs[log.writer]._facts) == set(range(12))
+
+    cache = CloudCache()
+    first = cloud.sync(state, cache, demand=demand)
+    second = cloud.sync(state, cache, demand=demand)
+    assert first.initial_segment_gets == 0
+    assert not second.changed and second.object_gets == 0
+    assert second.rounds == 1
+
+
+def test_cloud_demand_rejects_malformed_and_oversized_shapes():
+    writer = h("demand writer")
+    with pytest.raises(ValueError, match="writer demand"):
+        WriterDemand(b"short", tail=1)
+    with pytest.raises(ValueError, match="writer demand"):
+        WriterDemand(writer, tail=-1)
+    with pytest.raises(ValueError, match="mode"):
+        WriterDemand(writer, tail=1, intervals=((0, 1),))
+    for intervals in (((0, 0),), ((-1, 1),), ([0, 1],)):
+        with pytest.raises(ValueError, match="interval"):
+            WriterDemand(writer, intervals=intervals)
+    with pytest.raises(ValueError, match="writer demand"):
+        WriterDemand(writer, intervals=tuple(
+            (ordinal, ordinal + 1)
+            for ordinal in range(CLOUD_DEMAND_MAX_INTERVALS_PER_WRITER + 1)))
+    with pytest.raises(ValueError, match="map"):
+        CloudDemand.exact(())
+    with pytest.raises(ValueError, match="map"):
+        CloudDemand.exact({writer: None})
+    one = WriterDemand(writer, tail=1)
+    with pytest.raises(ValueError, match="cloud demand"):
+        CloudDemand((one, one))
+    with pytest.raises(ValueError, match="cloud demand"):
+        CloudDemand(tuple(
+            WriterDemand(ordinal.to_bytes(32, "big"), tail=1)
+            for ordinal in range(CLOUD_DEMAND_MAX_WRITERS + 1)))
+    interval_writers = CLOUD_DEMAND_MAX_INTERVALS \
+        // CLOUD_DEMAND_MAX_INTERVALS_PER_WRITER + 1
+    with pytest.raises(ValueError, match="cloud demand"):
+        CloudDemand(tuple(
+            WriterDemand(
+                (ordinal + 1).to_bytes(32, "big"),
+                intervals=tuple((2 * seq, 2 * seq + 1)
+                                for seq in range(
+                                    CLOUD_DEMAND_MAX_INTERVALS_PER_WRITER)))
+            for ordinal in range(interval_writers)))
+
+    empty = CloudDemand(())
+    store = MemoryCloud()
+    cloud = CloudQueue(store, h("empty demand"))
+    cloud.publish(owned("unrequested", 2))
+    report = cloud.sync(PeerState(), demand=empty)
+    assert report.interactive_ready and report.object_gets == report.facts == 0
+
+
 def test_three_players_reach_cloud_and_peer_mesh_convergence():
     store = MemoryCloud()
     cloud = CloudQueue(store, h("three players"))
@@ -147,6 +331,180 @@ def test_rule2_carry_is_adjacent_and_resolves_before_citing_ingest():
     assert report.carries == 1 and report.facts == 1 and not report.pending
     assert state.logs[target.writer].fact(0) == target.fact(0)
     assert state.logs[citing.writer].fact(0) == citing.fact(0)
+
+
+def test_recent_window_fetches_minimal_transitive_out_of_range_segments():
+    store, cloud, a, b, c, receipts = dependency_chain_cloud()
+    directory, _tag = store.get(cloud.directory_key)
+    expected_bodies = sum(receipts[name].segment.size
+                          for name in ("a_recent", "b", "c"))
+    state = PeerState()
+    before = store.metrics.copy()
+    report = cloud.sync(state, demand=CloudDemand.exact({
+        a.writer: ((5, 6),),
+    }))
+    delta = store.metrics.delta(before)
+
+    assert report.interactive_ready and not report.pending
+    assert report.initial_segment_gets == 1
+    assert report.closure_segment_gets == 2
+    assert report.object_gets == delta.gets - 1 == 3
+    assert report.rounds == 4  # directory, recent A, old B, older C
+    assert report.initial_bytes == receipts["a_recent"].segment.size
+    assert report.closure_bytes == (
+        receipts["b"].segment.size + receipts["c"].segment.size)
+    assert report.received_bytes == len(directory) + expected_bodies
+    assert report.initial_facts == 1
+    assert report.closure_facts == 2
+    assert report.facts == 11
+    assert report.segment_overfetch_facts == 8
+    assert report.closure_depth == 2
+    assert set(state.logs[a.writer]._facts) == {5}
+    assert set(state.logs[b.writer]._facts) == set(range(5))
+    assert set(state.logs[c.writer]._facts) == set(range(5))
+    assert_ref_closed(state, Ref(a.writer, 5))
+
+
+def test_dependency_closure_deduplicates_refs_cycles_and_local_targets():
+    store = MemoryCloud()
+    cloud = CloudQueue(store, h("closure cycle"))
+    a, b, c = WriterLog.owned(), WriterLog.owned(), WriterLog.owned()
+    c.append(Fact("msg", 10, (Ref(b.writer, 0),), b"cycle back"))
+    b.append(Fact(
+        "msg", 20, (Ref(c.writer, 0), Ref(c.writer, 0)), b"duplicate"))
+    a.append(Fact("msg", 25, (), b"unrelated old A"))
+    a.append(Fact(
+        "msg", 30, (Ref(b.writer, 0), Ref(b.writer, 0)), b"recent"))
+    cloud.publish(b, announce=False)
+    cloud.publish(c, announce=False)
+    cloud.publish(a, 0, 1, announce=False)
+    cloud.publish(a, 1, 2, announce=False)
+    cloud.repair_directory()
+    state = PeerState()
+    state.add_owned(c)
+
+    report = cloud.sync(state, demand=CloudDemand.exact({
+        a.writer: ((1, 2),),
+    }))
+    assert report.interactive_ready and not report.pending
+    assert report.initial_segment_gets == report.closure_segment_gets == 1
+    assert report.closure_facts == 1
+    assert report.closure_depth == 2
+    assert set(state.logs[a.writer]._facts) == {1}
+    assert set(state.logs[b.writer]._facts) == {0}
+    assert_ref_closed(state, Ref(a.writer, 1))
+
+
+def test_cloud_closes_a_requested_citer_already_held_from_p2p():
+    _store, cloud, a, b, c, _receipts = dependency_chain_cloud(
+        "held p2p citing root")
+    state = PeerState()
+    ingest(state, prove_run(a, 5, 6))
+    report = cloud.sync(state, demand=CloudDemand.exact({
+        a.writer: ((5, 6),),
+    }))
+    assert report.interactive_ready and not report.pending
+    assert report.initial_segment_gets == report.initial_facts == 0
+    assert report.closure_segment_gets == report.closure_facts == 2
+    assert report.closure_depth == 2
+    assert state.logs[b.writer].fact(2) == b.fact(2)
+    assert state.logs[c.writer].fact(1) == c.fact(1)
+
+
+def test_cloud_cache_cannot_hide_downloads_when_reused_with_an_empty_state():
+    store = MemoryCloud()
+    cloud = CloudQueue(store, h("cache state binding"))
+    log = owned("cache writer", 2)
+    cloud.publish(log)
+    cache = CloudCache()
+    first = PeerState()
+    assert cloud.sync(first, cache).facts == 2
+    second = PeerState()
+    report = cloud.sync(second, cache)
+    assert report.changed and report.facts == 2
+    assert set(second.entries()) == entries(log)
+
+
+@pytest.mark.parametrize("limits", [
+    CloudClosureLimits(max_depth=1),
+    CloudClosureLimits(max_refs=1),
+    CloudClosureLimits(max_segments=1),
+    CloudClosureLimits(max_bytes=1),
+])
+def test_dependency_closure_bounds_fail_closed(limits):
+    _store, cloud, a, b, c, _receipts = dependency_chain_cloud(
+        f"closure bound {limits}")
+    state = PeerState()
+    report = cloud.sync(
+        state,
+        demand=CloudDemand.exact({a.writer: ((5, 6),)}),
+        closure_limits=limits)
+    assert report.closure_exhausted
+    assert not report.interactive_ready
+    assert report.pending
+    assert state.logs[a.writer].fact(5) == a.fact(5)
+    assert any(ref in report.pending for ref in (
+        Ref(b.writer, 2), Ref(c.writer, 1)))
+
+
+def test_missing_dependency_stays_pending_and_never_becomes_interactive():
+    store = MemoryCloud()
+    cloud = CloudQueue(store, h("missing dependency"))
+    log = WriterLog.owned()
+    missing = Ref(h("absent writer"), 17)
+    log.append(Fact("msg", 1, (missing,), b"cannot render"))
+    cloud.publish(log)
+    state, cache = PeerState(), CloudCache()
+    report = cloud.sync(state, cache)
+    assert report.pending == (missing,)
+    assert not report.closure_exhausted
+    assert not report.interactive_ready
+    unchanged = cloud.sync(state, cache)
+    assert unchanged.pending == (missing,)
+    assert not unchanged.interactive_ready
+
+
+def test_target_published_after_citer_closes_on_the_next_window_sync():
+    store = MemoryCloud()
+    cloud = CloudQueue(store, h("target after citer"))
+    citing, target = WriterLog.owned(), WriterLog.owned()
+    target.append(Fact("msg", 1, (), b"late cloud target"))
+    citing.append(Fact("msg", 1, (), b"old citing history"))
+    citing.append(Fact(
+        "msg", 2, (Ref(target.writer, 0),), b"recent citing fact"))
+    cloud.publish(citing, 0, 1, announce=False)
+    cloud.publish(citing, 1, 2, announce=False)
+    cloud.repair_directory()
+    state, cache = PeerState(), CloudCache()
+
+    demand = CloudDemand.exact({citing.writer: ((1, 2),)})
+    first = cloud.sync(state, cache, demand=demand)
+    assert first.pending == (Ref(target.writer, 0),)
+    assert not first.interactive_ready
+
+    cloud.publish(target, announce=False)
+    cloud.repair_directory()
+    second = cloud.sync(state, cache, demand=demand)
+    assert second.interactive_ready and not second.pending
+    assert second.initial_segment_gets == 0
+    assert second.closure_segment_gets == second.closure_facts == 1
+    assert state.logs[target.writer].fact(0) == target.fact(0)
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_missing_or_corrupt_dependency_object_fails_without_ready_result(damage):
+    store, cloud, _a, _b, _c, receipts = dependency_chain_cloud(
+        f"dependency object {damage}")
+    key = receipts["b"].segment.key
+    if damage == "missing":
+        del store._objects[key]
+    else:
+        store._objects[key] = store._objects[key][:-1] + b"!"
+    state = PeerState()
+    with pytest.raises(ValueError, match="cloud segment"):
+        cloud.sync(state, demand=CloudDemand.exact({
+            _a.writer: ((5, 6),),
+        }))
 
 
 def test_consumer_rejects_writer_that_bypasses_rule2_publication_check():

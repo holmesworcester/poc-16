@@ -73,6 +73,14 @@ def _tree(rows):
     return tree
 
 
+def test_owned_writer_detects_private_gap_without_rescanning_history():
+    log = WriterLog.owned()
+    log.append(Fact("msg", 1, (), b"first"))
+    del log._facts[0]
+    with pytest.raises(ValueError, match="own writer log gap"):
+        log.append(Fact("msg", 2, (), b"must not hide the gap"))
+
+
 def test_two_partial_peers_converge_to_coverage_union():
     """Arbitrary island/suffix states; after sync both hold the union
     of the coverage intersection, via GET/PUT only."""

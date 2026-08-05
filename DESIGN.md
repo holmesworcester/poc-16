@@ -950,79 +950,77 @@ local trust anchors, and each discarded proof pile.
 
 ## 9. Sync and range behavior
 
-The unit of workspace discovery is a device head. The unit of incremental sync
-is the Merkle difference between two roots of that device's logical pile tree.
-The unit of transfer may be a whole physical pack or an exact range within one.
-The unit of semantic judgment remains one complete writer-device-signed closed
+Canonical residence is a forest of dense, independently advancing device
+logs. A transfer is a contiguous writer-sequence `Run`: canonical fact bytes,
+one signed writer head, and boundary inclusion paths. Verification proves the
+writer, sequence density, fact bytes, head signature, and inclusion before the
+whole run is installed. No page, segment, footer, or discovery index can
+introduce a fact, and a failed run installs no prefix.
+
+Every logical writer-tree leaf is independently closed for authenticated
+admission: accepting its proved run never depends on an unproved neighboring
+range. That admission closure is distinct from materializing ordinary render
+refs, which the bounded dependency pump below may fetch after the citing fact
+is resident.
+
+For the separate ephemeral gate codec, no range or page boundary splits a pile;
+each signed closed request is judged whole and then discarded.
+
+P2P discovery uses range-based set reconciliation (RBSR) over the peer-local
+`(ts, fid)` Merkle treap. One initiator walks
+the responder's immutable pages, computes the symmetric difference, and both
+pulls and pushes missing facts in the same session. Complete timestamp ranges
+may be fingerprint-pruned; partial coverage islands travel as exact sets.
+Selected facts are then grouped into proved original-writer runs. The treap is
+derived local discovery state, not canonical residence and not a cloud object.
+This is one session over the symmetric difference, not one sync session per
 pile.
 
-Here, an RBSR "range" is a range of writer-local publication sequences, not a
-claim about semantic timestamps inside the facts. A late or deliberately
-backdated fact appends at the current end of its writer log. It therefore never
-reopens an older physical layout window. A peer may fetch the newest
-publication ranges first for progressive operation because every selected leaf
-is independently closed; semantic time queries remain ordinary fact-index
-queries after validation.
+Cloud discovery is one conditional read of the derived workspace directory.
+The directory contains each signed writer slot and its contiguous immutable
+segment spans. It is LIST-repairable and grants no authority. A client request
+is either a timestamp hint or one bounded canonical `CloudDemand`. Each writer
+in a `CloudDemand` independently requests either:
+
+- its newest `N` facts, resolved as `[max(0, writer_hi - N), writer_hi)`; or
+- normalized exact half-open sequence intervals.
+
+There is no workspace-wide scalar sequence window. The client subtracts its
+held coverage intervals per writer and opens only segments intersecting the
+remaining demand. A segment is the physical read unit: suffix range GETs read
+timestamp footers, but selected bodies are fetched whole. Facts neighboring a
+logical interval are authenticated and ingested as measured segment overfetch;
+they do not silently widen the logical request.
+
+Requested segment bodies are read with bounded 64-way concurrency and ingested
+as each completes. Physical arrival therefore need not be topological. Once
+the requested roots are resident, the client closes their exact transitive
+`(writer, seq)` references with a deduplicated breadth pump:
 
 ```text
-LIST/open one bounded page of independent workspace head slots
-    -> compare every writer's remote head oid with its local head oid
-    -> known head oid: no immutable fetch
-    -> unknown head oid: RBSR missing logical closed-pile leaves
-    -> use the current layout to fetch whole packs for dense missing history
-       or exact closed-pile ranges for sparse/resumed history
-    -> receiver verifies and evaluates every new signed closed pile
-    -> durable facts join that peer's local validated set
+directory -> requested segments -> referenced containing segments -> repeat
 ```
 
-The first sync visits all registered writer slots. Later sync cost is the fixed
-directory scan plus unknown head OIDs and missing tree ranges, not the entire
-workspace fact corpus. Every consuming peer retains mirrored head OIDs and
-Merkle objects in its ordinary object store. A full peer may retain traversal
-frontiers outside SQL so deleting the presentation database does not destroy
-sync correctness.
+Each dependency segment uses the same signed `Run` decoder and atomic
+publication ingest as the initial range. Adjacent Rule-2 carries are installed
+with their citing publication. A cloud-visible out-of-window target is located
+from its writer's authenticated slot span; absent writers and refs above the
+visible head remain explicit pending refs rather than speculative failed GETs.
+Cycles and duplicate refs terminate by address deduplication. Depth, ref,
+segment, and byte ceilings bound the pump.
 
-P2P uses the same forest and range-based set reconciliation (RBSR), not one sync
-session per pile and not a second combined content log. Peers first exchange
-their per-device head directories. For each device root that differs, they
-compare logical pile-tree range fingerprints, prune equal subtrees, and descend
-only differing leaf ranges. Running the diff in both directions reconciles
-arbitrary overlap rather than assuming either peer has a prefix of the other.
-Each receiver verifies and evaluates every missing pile independently before
-serving it in a later sync.
+A recent view is interactive only when its pending set is empty and no closure
+ceiling was exhausted. Reports separate initial segment GETs/bytes and logical
+facts from closure GETs/bytes/facts, segment-granularity overfetch, closure
+depth, total rounds, and exhaustion. Corrupt proofs, missing advertised
+objects, forks, and containing segments that omit their addressed target fail
+closed and never produce an interactive-ready result. A conditional no-change
+poll preserves an incomplete cache result; it cannot turn pending into ready.
 
-One two-way turn reuses the remote per-writer slots opened during its pull when
-deciding what to offer back. It does not probe every unchanged remote slot a
-second time. This observation is only a disposable optimization: `/mirror`
-reopens the receiver's current slot and acknowledges success only when the
-proposed exact bytes are installed. A receiver advance after the directory
-scan therefore produces an exact no-op, a stale/retry result, or validation
-against the newer head—never an overwrite authorized by the cache.
-
-This per-device RBSR forest is the initial and only required P2P index. Measure
-directory exchange and per-changed-device turns before adding a combined peer
-inventory tree. If such an index is ever justified, it remains a rebuildable,
-untrusted discovery accelerator and cannot become a publication root,
-validation certificate, or second pile format.
-
-Thus a full peer participates in sync for all validated writers it knows, not
-merely its own writer log. Repeated ordinary sync is the entire propagation
-mechanism; there is no separate gossip, broadcast, queue, or propagation
-protocol. The cloud path remains owner-push-only. Both paths deliver the same
-directly signed pile, signed head, and Merkle evidence to the same consumer;
-only discovery and eligibility to upload differ.
-
-Logical tree rows and pack locators index only complete pile boundaries. Range
-pagination and pack byte ranges therefore stop between independently closed
-evaluations; no receiver must chase a dependency into an adjacent slice or
-retain a preceding slice to validate the next one. Tree fingerprints, expected
-pile OIDs, and layout pages prune or locate identical ranges; they never stand
-in for evaluating the returned pile bytes.
-
-Facts with large payloads, Bao slices, key wraps, and history-key material may
-be co-packed for S3/R2. P2P peers may transfer the same individual verified
-objects. Both paths recover identical canonical closed-pile bytes for the same
-logical leaves and feed them to the same evaluator.
+Full catchup is the same demand with all visible writer intervals. Repeated
+sync is the propagation mechanism. There is no combined canonical P2P log,
+shared cloud content index, cloud treap, per-fact session, or stored closed-pile
+format. Signed closed piles remain only the ephemeral gate-proof boundary.
 
 ## 10. Object-store contract
 
@@ -1251,19 +1249,20 @@ existing `fid`. Unknown predecessor protocol values remain rejected.
 3. Hosted and full peers use the same database-free `AccessGate`, removal-
    path verifier, request-family queries, object contract, and HTTP routes;
    local SQL is never an authority shortcut.
-4. Every accepted writer-tree leaf contains a pile signed directly by that
-   tree's writer device and has a valid inclusion path to its canonical signed
-   head.
-5. Every logical writer-tree leaf is independently closed, and no range or
-   page boundary splits a pile or requires neighboring receiver state.
+4. Every accepted writer-log fact is canonical, occupies its original writer's
+   dense sequence, and is authenticated by a valid boundary path to that
+   writer's signed head.
+5. Writer-sequence runs are verified and installed atomically. Physical range
+   and diff pagination stops between facts and never makes a partial run
+   resident; render refs may remain explicitly pending until demand closure.
 6. Cloud publication grants let a device populate and advance only its own
    writer log; hosted content storage need not validate those opaque bytes.
-7. A full peer serves a remote pile only after successful consumption,
-   preserves its original pile signature, signed head, and writer identity, and
-   never treats the sender's prior judgment as an admission certificate.
-8. Every consuming peer mirrors the same independently rooted per-device trees
-   and runs RBSR per changed device through the same core object protocol. No
-   combined P2P inventory tree exists until measurements justify one.
+7. A full peer serves remote facts only from accepted original-writer runs,
+   preserves their writer identity and signed-head evidence, and never treats
+   the sender's prior judgment as an admission certificate.
+8. Every full peer files accepted facts into independently rooted per-device
+   log copies and uses one peer-local `(ts, fid)` treap only for one-sided RBSR
+   discovery. No combined canonical P2P content log exists.
 9. Every ordinary content update mutates at most one device head slot.
 10. Different device writers share no mutable content key.
 11. Immutable objects exist before a writer advertises a head that names them.
@@ -1280,8 +1279,9 @@ existing `fid`. Unknown predecessor protocol values remain rejected.
     Ordinary publication requires an empty delta, a permit accepts exactly the
     declared delta, and every consuming peer recomputes the declaration from
     its independently validated main-tree suffix.
-17. Every consuming peer validates pile signature, head signature, tree
-    inclusion, and closed-pile semantics before using mirrored content as state.
+17. Every consuming peer validates canonical fact bytes, writer-head signature,
+   sequence density, boundary inclusion, control signatures, and Rule-2
+   adjacency before using a received run as state.
 18. Mixed head observations may delay facts but cannot fabricate or invalidate
     them.
 19. Removal governs current publication and access without rewriting validated

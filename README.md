@@ -681,6 +681,32 @@ fid; that envelope also carries the exact source value needed to reproduce a
 signed closure. Queries and the generic index see only the current vocabulary.
 There are no table migrations, version graphs, or generic old-protocol codecs.
 
+## Passive writer-forest sync
+
+P2P and cloud transfers carry canonical facts in authenticated contiguous
+original-writer `Run`s. P2P finds a symmetric difference with the initiator's
+peer-local `(ts, fid)` treap. The cloud conditionally reads one derived writer
+directory, then fetches whole immutable queue segments with at most 64 body
+GETs in flight. Both paths verify and atomically file the same run codec into
+per-writer local copies.
+
+Cloud sequence requests use `CloudDemand`, never one workspace-wide numeric
+window. `CloudDemand.tails(writers, n)` resolves the newest `n` facts against
+each named writer's own signed slot head. `CloudDemand.exact({...})` accepts
+bounded per-writer half-open interval sets, normalizes overlap, clamps to the
+visible head, and subtracts local coverage islands before selecting segments.
+Timestamp requests remain footer-guided hints.
+
+A selected body is read whole, so facts outside the logical intervals are
+authenticated segment overfetch. Only requested facts become roots of the
+bounded dependency pump. Their exact `(writer, seq)` refs are deduplicated,
+located from authenticated directory spans, fetched through ordinary run
+segments, and followed transitively. `CloudSyncReport.interactive_ready` is
+true only when `pending` is empty and no depth/ref/segment/byte closure limit
+was exhausted. The report separates initial and closure GETs, bytes, logical
+facts, closure depth, and segment overfetch. Missing advertised objects,
+corrupt proofs, forks, and omitted addressed targets fail closed.
+
 ## Hosted owner publication
 
 Peers do not proxy large immutable bodies through Lambda or a Worker. Under
@@ -1051,10 +1077,27 @@ python3 -m deploy.aws_notifications.manage remove \
 
 ## Current performance status
 
-The current P2P benchmark measures `WriterLog -> RepositoryMirror ->
-FactConsumer`: listed heads, changed-tree RBSR, exact pile transfer, and full
-receiver validation. Hosted owner publication uses the same writer-tree diff
-without receiver validation.
+The current peerlog benchmark measures signed `WriterLog` construction,
+authenticated cloud `Run` publication, bounded concurrent body download, and
+semantic ingest into `PeerState`. A dependency-closed 1,000-fact recent view
+over equal 1,000-writer histories used exactly 1,002 body GETs and 19 rounds at
+10k, 100k, and 1M total facts. Local pending-empty TTI was
+0.746/0.962/1.063 seconds; transferred bytes were
+1,563,376/1,696,948/2,071,136. The increase is the two whole old segments
+containing the fixed A-to-B-to-C chain and is reported as closure overfetch.
+
+The skew profile uses one hot writer, five medium writers, and 1,000 long-tail
+writers distributed across zero through three facts. A tail-2 request names
+1,006 writers and selects 1,262 facts. At 10k/100k/1M total history it stayed at
+756 initial segment GETs, two closure GETs, and 15 rounds; local TTI was
+0.709/1.566/11.852 seconds. At 1M facts the hot writer held 748,875 entries;
+the 16,381,810 transferred bytes were dominated by the two deliberately old
+medium-writer dependency segments, not the hot writer's sequence number.
+
+These are local `MemoryCloud` execution measurements. Projected times using the
+decision-record 90 ms RTT and 2.5 MB/s link are models, not real-link evidence.
+The corresponding projections for equal-fanout 10k/100k/1M were
+2.335/2.389/2.538 seconds and for skew were 1.919/2.464/7.903 seconds.
 
 No 50k/200k fact-rate or file-throughput number is asserted here until the
 benchmark is rerun. The corresponding bead requires facts/s at both sizes and

@@ -5,6 +5,7 @@ from bench.peerlog_cloud_scale import (
     measure_fanout,
     measure_interactive,
     measure_range,
+    measure_skewed_interactive,
 )
 from peerlog.cloud import CLOUD_GET_CONCURRENCY
 
@@ -51,9 +52,36 @@ def test_recent_window_cost_is_independent_of_cold_history_size():
         history_facts=10_000, recent_facts=100, writers=10)
     for report in (small, large):
         assert report.recent_facts == 100
-        assert report.object_gets == 10
-        assert report.rounds == 2
-        assert report.received_bytes < 128 * 1024
-        assert report.projected_network_s < 0.25
-    # History changes segment payload size, but neither old payload is read.
-    assert abs(small.received_bytes - large.received_bytes) < 4 * 1024
+        assert report.initial_segment_gets == 10
+        assert report.closure_segment_gets == 2
+        assert report.object_gets == 12
+        assert report.rounds == 4
+        assert report.closure_facts == report.closure_depth == 2
+        assert report.interactive_ready
+        assert report.initial_bytes < 128 * 1024
+        assert report.semantic_facts_per_s > 0
+    # Initial recent-view cost stays fixed. Only the two containing old
+    # segments grow with history; unrelated old segments remain unopened.
+    assert abs(small.initial_bytes - large.initial_bytes) < 4 * 1024
+    assert large.closure_bytes > small.closure_bytes
+    assert large.segment_overfetch_facts > small.segment_overfetch_facts
+
+
+def test_skewed_recent_view_cost_tracks_writer_tails_not_hot_sequence():
+    small = measure_skewed_interactive(history_facts=10_000)
+    large = measure_skewed_interactive(history_facts=20_000)
+    for report in (small, large):
+        assert report.long_tail_writers == 1_000
+        assert report.requested_writers == 1_006
+        assert report.selected_facts == 1_262
+        assert report.initial_segment_gets == 756
+        assert report.closure_segment_gets == report.closure_facts == 2
+        assert report.object_gets == 758
+        assert report.closure_depth == 2
+        assert report.hot_facts > report.selected_facts
+        assert report.interactive_ready
+        assert report.semantic_facts_per_s > 0
+    assert small.initial_segment_gets == large.initial_segment_gets
+    assert small.rounds == large.rounds
+    assert abs(small.initial_bytes - large.initial_bytes) < 8 * 1024
+    assert large.closure_bytes > small.closure_bytes

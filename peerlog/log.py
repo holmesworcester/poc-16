@@ -93,6 +93,7 @@ class WriterLog:
         self._head = None
         self._tree = IncrementalTree() if secret is not None else None
         self._control_tree = IncrementalTree() if secret is not None else None
+        self._next_owned_seq = 0 if secret is not None else None
 
     @classmethod
     def owned(cls, secret=None):
@@ -105,14 +106,15 @@ class WriterLog:
             raise ValueError("foreign writer log")
         if not isinstance(fact, Fact):
             raise ValueError("fact")
-        seq = len(self._facts)
-        if self._facts and set(self._facts) != set(range(seq)):
+        seq = self._next_owned_seq
+        if len(self._facts) != seq:
             raise ValueError("own writer log gap")
         self._facts[seq] = fact
         raw = canonical(fact)
         self._tree.append(raw)
         if is_control(fact):
             self._control_tree.append(raw)
+        self._next_owned_seq += 1
         self._sign_head()
         return seq
 

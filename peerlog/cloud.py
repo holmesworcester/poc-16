@@ -41,6 +41,13 @@ MULTIPART_EDGE = 5 * 1024 * 1024
 EPOCH_CAP = 64 * 1024 * 1024
 FOOTER_READ = 64 * 1024
 CLOUD_GET_CONCURRENCY = 64
+CLOUD_CLOSURE_MAX_DEPTH = 32
+CLOUD_CLOSURE_MAX_REFS = 8 * 1024
+CLOUD_CLOSURE_MAX_SEGMENTS = 2 * 1024
+CLOUD_CLOSURE_MAX_BYTES = 256 * 1024 * 1024
+CLOUD_DEMAND_MAX_WRITERS = 4 * 1024
+CLOUD_DEMAND_MAX_INTERVALS_PER_WRITER = 64
+CLOUD_DEMAND_MAX_INTERVALS = 8 * 1024
 SEGMENT_MAGIC = b"P16Q1\x00"
 FOOTER_MAGIC = b"P16F"
 SLOT_FORMAT = "poc16-cloud-writer-slot-v1"
@@ -278,6 +285,113 @@ class PublicationReceipt:
 @dataclass
 class CloudCache:
     directory_tag: str | None = None
+    request_key: object | None = None
+    pending: tuple[Ref, ...] = ()
+    closure_exhausted: bool = False
+    interactive_ready: bool = True
+    state: object | None = None
+
+
+@dataclass(frozen=True)
+class WriterDemand:
+    """One writer's tail-relative or exact sequence demand."""
+
+    writer: bytes
+    tail: int | None = None
+    intervals: tuple[tuple[int, int], ...] = ()
+
+    def __post_init__(self):
+        if not valid_writer(self.writer) \
+                or self.tail is not None and (
+                    type(self.tail) is not int or self.tail < 0) \
+                or not isinstance(self.intervals, tuple) \
+                or len(self.intervals) > CLOUD_DEMAND_MAX_INTERVALS_PER_WRITER:
+            raise ValueError("cloud writer demand")
+        if self.tail is not None and self.intervals:
+            raise ValueError("cloud writer demand mode")
+        validated = []
+        for interval in self.intervals:
+            if not isinstance(interval, tuple) or len(interval) != 2 \
+                    or any(type(item) is not int for item in interval) \
+                    or interval[0] < 0 or interval[1] <= interval[0] \
+                    or interval[1] >= 1 << 63:
+                raise ValueError("cloud demand interval")
+            validated.append(interval)
+        normalized = []
+        for lo, hi in sorted(validated):
+            if normalized and lo <= normalized[-1][1]:
+                normalized[-1] = (
+                    normalized[-1][0], max(normalized[-1][1], hi))
+            else:
+                normalized.append((lo, hi))
+        object.__setattr__(self, "intervals", tuple(normalized))
+        object.__setattr__(self, "_input_interval_count", len(validated))
+
+    def resolve(self, hi):
+        if type(hi) is not int or hi < 0:
+            raise ValueError("cloud writer demand head")
+        if self.tail is not None:
+            return () if not self.tail or not hi else ((max(0, hi - self.tail), hi),)
+        return tuple((lo, min(stop, hi)) for lo, stop in self.intervals
+                     if lo < hi)
+
+
+@dataclass(frozen=True)
+class CloudDemand:
+    """Canonical bounded collection of independent writer requests."""
+
+    writers: tuple[WriterDemand, ...]
+
+    def __post_init__(self):
+        if not isinstance(self.writers, tuple) \
+                or len(self.writers) > CLOUD_DEMAND_MAX_WRITERS \
+                or any(not isinstance(item, WriterDemand)
+                       for item in self.writers) \
+                or len({item.writer for item in self.writers}) \
+                != len(self.writers) \
+                or sum(item._input_interval_count for item in self.writers) \
+                > CLOUD_DEMAND_MAX_INTERVALS:
+            raise ValueError("cloud demand")
+        object.__setattr__(
+            self, "writers", tuple(sorted(
+                self.writers, key=lambda item: item.writer)))
+
+    @classmethod
+    def tails(cls, writers, count):
+        try:
+            writers = tuple(writers)
+        except TypeError as error:
+            raise ValueError("cloud demand writers") from error
+        return cls(tuple(WriterDemand(writer, tail=count)
+                         for writer in writers))
+
+    @classmethod
+    def exact(cls, intervals_by_writer):
+        if not isinstance(intervals_by_writer, dict):
+            raise ValueError("cloud demand map")
+        try:
+            writers = tuple(
+                WriterDemand(writer, intervals=tuple(intervals))
+                for writer, intervals in intervals_by_writer.items())
+        except TypeError as error:
+            raise ValueError("cloud demand map") from error
+        return cls(writers)
+
+
+@dataclass(frozen=True)
+class CloudClosureLimits:
+    """Resource bounds for transitively closing one requested cloud view."""
+
+    max_depth: int = CLOUD_CLOSURE_MAX_DEPTH
+    max_refs: int = CLOUD_CLOSURE_MAX_REFS
+    max_segments: int = CLOUD_CLOSURE_MAX_SEGMENTS
+    max_bytes: int = CLOUD_CLOSURE_MAX_BYTES
+
+    def __post_init__(self):
+        if any(type(value) is not int or value < 0 for value in (
+                self.max_depth, self.max_refs, self.max_segments,
+                self.max_bytes)):
+            raise ValueError("cloud closure limits")
 
 
 @dataclass(frozen=True)
@@ -290,6 +404,16 @@ class CloudSyncReport:
     carries: int
     pending: tuple[Ref, ...]
     directory_tag: str | None
+    initial_segment_gets: int = 0
+    closure_segment_gets: int = 0
+    initial_bytes: int = 0
+    closure_bytes: int = 0
+    initial_facts: int = 0
+    closure_facts: int = 0
+    segment_overfetch_facts: int = 0
+    closure_depth: int = 0
+    closure_exhausted: bool = False
+    interactive_ready: bool = True
 
 
 def _segment_document(segment):
@@ -890,31 +1014,57 @@ class CloudQueue:
                         return encode_run(run)
         return None
 
-    def sync(self, state, cache=None, *, seq_window=None, ts_window=None):
-        """Head/sequence diff plus one demand-pump object round."""
+    def sync(self, state, cache=None, *, demand=None, ts_window=None,
+             closure_limits=None):
+        """Fetch a requested view and its bounded transitive ref closure.
+
+        Segment bodies remain the atomic authenticated transport unit.  Facts
+        neighboring a requested fact are honest overfetch, but only logical
+        window members and their exact ``(writer, seq)`` dependencies widen
+        the closure traversal.
+        """
         if not isinstance(state, PeerState):
             raise ValueError("cloud sync state")
-        if seq_window is not None and ts_window is not None:
+        if demand is not None and ts_window is not None:
             raise ValueError("one cloud sync window")
-        if seq_window is not None and (
-                not isinstance(seq_window, tuple) or len(seq_window) != 2
-                or any(type(item) is not int for item in seq_window)
-                or seq_window[0] < 0 or seq_window[1] <= seq_window[0]):
-            raise ValueError("cloud sequence window")
+        if demand is not None and not isinstance(demand, CloudDemand):
+            raise ValueError("cloud demand")
         if ts_window is not None and (
                 not isinstance(ts_window, tuple) or len(ts_window) != 2
                 or any(type(item) is not int for item in ts_window)
                 or ts_window[1] <= ts_window[0]):
             raise ValueError("cloud timestamp window")
+        if closure_limits is None:
+            closure_limits = CloudClosureLimits()
+        if not isinstance(closure_limits, CloudClosureLimits):
+            raise ValueError("cloud closure limits")
         cache = cache or CloudCache()
+        if cache.state is not state:
+            cache.directory_tag = None
+            cache.request_key = None
+            cache.pending = ()
+            cache.closure_exhausted = False
+            cache.interactive_ready = True
+            cache.state = state
+        request_key = (demand, ts_window, closure_limits)
+        same_request = cache.request_key == request_key
         before = self.store.metrics.copy()
-        slots, tag = self.poll(cache.directory_tag)
+        conditional_tag = cache.directory_tag \
+            if same_request and cache.interactive_ready else None
+        slots, tag = self.poll(conditional_tag)
         if slots is None:
             return CloudSyncReport(False, 1, 0,
                                    self.store.metrics.downloaded_bytes
                                    - before.downloaded_bytes,
-                                   0, 0, (), tag)
+                                   0, 0, cache.pending, tag,
+                                   closure_exhausted=cache.closure_exhausted,
+                                   interactive_ready=cache.interactive_ready)
         cache.directory_tag = tag
+        if not same_request:
+            cache.pending = ()
+            cache.closure_exhausted = False
+            cache.interactive_ready = True
+        cache.request_key = request_key
         selected = []
         all_segments = tuple(
             segment for slot in slots.values() for segment in slot.segments)
@@ -922,21 +1072,29 @@ class CloudQueue:
         if ts_window is not None:
             footers = dict(zip(
                 all_segments, self._parallel(all_segments, self.footer)))
+        demand_by_writer = None if demand is None else {
+            item.writer: item for item in demand.writers}
+        resolved = {}
         for writer, slot in slots.items():
+            if demand_by_writer is not None and writer not in demand_by_writer:
+                continue
+            resolved[writer] = ((0, slot.hi),) if demand_by_writer is None \
+                else demand_by_writer[writer].resolve(slot.hi)
             held = state.logs.get(writer)
             coverage = () if held is None else held.coverage()
+            missing = _subtract_coverage(resolved[writer], coverage)
             for segment in slot.segments:
                 lo, hi = segment.lo, segment.hi
-                if seq_window is not None:
-                    window_lo, window_hi = seq_window
-                    if hi <= window_lo or lo >= window_hi:
-                        continue
                 if ts_window is not None:
                     footer = footers[segment]
                     if footer["ts_max"] < ts_window[0] \
                             or footer["ts_min"] >= ts_window[1]:
                         continue
-                if not _covered(coverage, lo, hi):
+                elif not _intersects(missing, lo, hi):
+                    continue
+                if ts_window is not None and _covered(coverage, lo, hi):
+                    continue
+                if ts_window is not None or missing:
                     selected.append(segment)
         # The demand pump makes a partial view useful before old history:
         # submit newest sequence ranges first while retaining per-publication
@@ -944,14 +1102,15 @@ class CloudQueue:
         selected.sort(key=lambda segment: (segment.hi, segment.lo),
                       reverse=True)
         facts = carries = 0
-        pending = set()
+        initial_addresses = set()
+        initial_refs = set()
+        visible = {writer: slot.hi for writer, slot in slots.items()}
         for publications in self._parallel_completed(
-                selected, self._read_segment):
+                selected,
+                lambda segment: (segment, self._read_segment(segment))):
+            segment, publications = publications
             for publication in publications:
-                self._validate_publication(
-                    publication,
-                    {writer: slot.hi for writer, slot in slots.items()},
-                )
+                self._validate_publication(publication, visible)
                 main_facts = decode_slice(
                     publication.main.facts,
                     publication.main.hi - publication.main.lo)
@@ -962,26 +1121,165 @@ class CloudQueue:
                 for carried in publication.carries:
                     carries += carried.hi - carried.lo
                 facts += len(main_facts)
-                for fact in main_facts:
-                    for ref in fact.refs:
-                        target = state.logs.get(ref.writer)
-                        if target is None or ref.seq not in target._facts:
-                            pending.add(ref)
+                for offset, fact in enumerate(main_facts):
+                    seq = publication.main.lo + offset
+                    requested = ts_window is None \
+                        and _contains(resolved[publication.main.writer], seq)
+                    if ts_window is not None:
+                        requested = ts_window[0] <= fact.ts < ts_window[1]
+                    if requested:
+                        initial_addresses.add((publication.main.writer, seq))
+                        initial_refs.update(fact.refs)
+
+        # Close only the logical requested roots.  Downloaded neighbors are
+        # filed because runs are indivisible, but following their refs would
+        # turn one range request into an accidental history-wide crawl.
+        # A fresh request may begin from facts obtained over P2P. Fully held
+        # root segments need no cloud GET, but their refs still seed closure.
+        root_addresses = set(initial_addresses)
+        for writer, intervals in resolved.items():
+            held = state.logs.get(writer)
+            if held is None:
+                continue
+            for seq, fact in held._facts.items():
+                requested = ts_window is None and _contains(intervals, seq)
+                if ts_window is not None:
+                    requested = ts_window[0] <= fact.ts < ts_window[1]
+                if requested:
+                    root_addresses.add((writer, seq))
+                    initial_refs.update(fact.refs)
+        visited = {Ref(writer, seq) for writer, seq in root_addresses}
+        initial_refs.update(cache.pending)
+        frontier = {ref: 1 for ref in initial_refs if ref not in visited}
+        pending = set()
+        closure_segments = set()
+        closure_target_addresses = set()
+        closure_bytes = 0
+        closure_depth = 0
+        closure_exhausted = False
+        refs_examined = 0
+        closure_rounds = 0
+
+        def resident(ref):
+            log = state.logs.get(ref.writer)
+            return None if log is None else log._facts.get(ref.seq)
+
+        while frontier:
+            next_frontier = {}
+            needed = {}
+            for ref, depth in sorted(
+                    frontier.items(), key=lambda item: (
+                        item[1], item[0].writer, item[0].seq)):
+                if ref in visited:
+                    continue
+                if refs_examined >= closure_limits.max_refs:
+                    pending.add(ref)
+                    closure_exhausted = True
+                    continue
+                refs_examined += 1
+                visited.add(ref)
+                if depth > closure_limits.max_depth:
+                    pending.add(ref)
+                    closure_exhausted = True
+                    continue
+                fact = resident(ref)
+                if fact is not None:
+                    closure_depth = max(closure_depth, depth)
+                    for dependency in fact.refs:
+                        if dependency not in visited:
+                            next_frontier[dependency] = max(
+                                next_frontier.get(dependency, 0), depth + 1)
+                    continue
+                slot = slots.get(ref.writer)
+                if slot is None or ref.seq >= slot.hi:
+                    pending.add(ref)
+                    continue
+                segment = next((item for item in slot.segments
+                                if item.lo <= ref.seq < item.hi), None)
+                if segment is None:
+                    pending.add(ref)
+                    continue
+                if segment in closure_segments:
+                    # A verified containing run must have installed the target.
+                    raise ValueError("cloud dependency segment omitted target")
+                needed.setdefault(segment, []).append((ref, depth))
+
+            allowed = []
+            for segment in sorted(
+                    needed, key=lambda item: (item.key, item.lo, item.hi)):
+                if len(closure_segments) + len(allowed) \
+                        >= closure_limits.max_segments \
+                        or closure_bytes + sum(item.size for item in allowed) \
+                        + segment.size > closure_limits.max_bytes:
+                    pending.update(ref for ref, _depth in needed[segment])
+                    closure_exhausted = True
+                else:
+                    allowed.append(segment)
+            if allowed:
+                closure_rounds += math.ceil(
+                    len(allowed) / CLOUD_GET_CONCURRENCY)
+            for result in self._parallel_completed(
+                    allowed,
+                    lambda segment: (segment, self._read_segment(segment))):
+                segment, publications = result
+                closure_segments.add(segment)
+                closure_bytes += segment.size
+                for publication in publications:
+                    self._validate_publication(publication, visible)
+                    main_facts = decode_slice(
+                        publication.main.facts,
+                        publication.main.hi - publication.main.lo)
+                    ingest_batch(
+                        state, (*publication.carries, publication.main))
+                    carries += sum(carried.hi - carried.lo
+                                   for carried in publication.carries)
+                    facts += len(main_facts)
+                for ref, depth in needed[segment]:
+                    fact = resident(ref)
+                    if fact is None:
+                        raise ValueError("cloud dependency segment omitted target")
+                    closure_target_addresses.add((ref.writer, ref.seq))
+                    closure_depth = max(closure_depth, depth)
+                    for dependency in fact.refs:
+                        if dependency not in visited:
+                            next_frontier[dependency] = max(
+                                next_frontier.get(dependency, 0), depth + 1)
+            frontier = next_frontier
+
         pending = {
-            ref for ref in pending
-            if state.logs.get(ref.writer) is None
-            or ref.seq not in state.logs[ref.writer]._facts
+            ref for ref in pending if resident(ref) is None
         }
         delta = self.store.metrics.delta(before)
         # Directory, bounded footer waves, then bounded immutable-body waves.
         footer_gets = len(all_segments) if ts_window is not None else 0
         rounds = 1 + math.ceil(footer_gets / CLOUD_GET_CONCURRENCY) \
-            + math.ceil(len(selected) / CLOUD_GET_CONCURRENCY)
-        return CloudSyncReport(True, rounds, footer_gets + len(selected),
+            + math.ceil(len(selected) / CLOUD_GET_CONCURRENCY) \
+            + closure_rounds
+        initial_facts = len(initial_addresses)
+        closure_facts = len(closure_target_addresses)
+        report = CloudSyncReport(True, rounds,
+                               footer_gets + len(selected)
+                               + len(closure_segments),
                                delta.downloaded_bytes, facts, carries,
                                tuple(sorted(pending,
                                             key=lambda ref: (ref.writer, ref.seq))),
-                               tag)
+                               tag,
+                               initial_segment_gets=len(selected),
+                               closure_segment_gets=len(closure_segments),
+                               initial_bytes=sum(item.size for item in selected),
+                               closure_bytes=closure_bytes,
+                               initial_facts=initial_facts,
+                               closure_facts=closure_facts,
+                               segment_overfetch_facts=max(
+                                   0, facts - initial_facts - closure_facts),
+                               closure_depth=closure_depth,
+                               closure_exhausted=closure_exhausted,
+                               interactive_ready=(
+                                   not pending and not closure_exhausted))
+        cache.pending = report.pending
+        cache.closure_exhausted = report.closure_exhausted
+        cache.interactive_ready = report.interactive_ready
+        return report
 
     def redeem_handoff(self, ticket, recipient, state):
         """Consume an explicitly delivered handoff capability out of band."""
@@ -1006,12 +1304,44 @@ def _covered(coverage, lo, hi):
     return any(start <= lo and hi <= stop for start, stop in coverage)
 
 
+def _contains(intervals, seq):
+    return any(lo <= seq < hi for lo, hi in intervals)
+
+
+def _intersects(intervals, lo, hi):
+    return any(start < hi and lo < stop for start, stop in intervals)
+
+
+def _subtract_coverage(intervals, coverage):
+    """Return canonical parts of intervals not already held locally."""
+    result = []
+    for lo, hi in intervals:
+        cursor = lo
+        for held_lo, held_hi in coverage:
+            if held_hi <= cursor:
+                continue
+            if held_lo >= hi:
+                break
+            if cursor < held_lo:
+                result.append((cursor, min(held_lo, hi)))
+            cursor = max(cursor, held_hi)
+            if cursor >= hi:
+                break
+        if cursor < hi:
+            result.append((cursor, hi))
+    return tuple(result)
+
+
 __all__ = (
-    "CLOUD_GET_CONCURRENCY", "CloudCache", "CloudMetrics", "CloudObjectStore",
-    "CloudQueue", "CloudSyncReport",
+    "CLOUD_CLOSURE_MAX_BYTES", "CLOUD_CLOSURE_MAX_DEPTH",
+    "CLOUD_CLOSURE_MAX_REFS", "CLOUD_CLOSURE_MAX_SEGMENTS",
+    "CLOUD_DEMAND_MAX_INTERVALS", "CLOUD_DEMAND_MAX_INTERVALS_PER_WRITER",
+    "CLOUD_DEMAND_MAX_WRITERS", "CLOUD_GET_CONCURRENCY", "CloudCache",
+    "CloudClosureLimits", "CloudDemand",
+    "CloudMetrics", "CloudObjectStore", "CloudQueue", "CloudSyncReport",
     "EPOCH_CAP", "FOOTER_READ", "HANDOFF_FAMILIES", "HandoffTicket",
     "MICRO_TAIL", "MULTIPART_EDGE", "MaintenanceRequired", "MemoryCloud",
     "PartCopyUnavailable",
-    "PublicationReceipt", "Segment", "decode_footer", "decode_slot",
-    "encode_slot",
+    "PublicationReceipt", "Segment", "WriterDemand", "decode_footer",
+    "decode_slot", "encode_slot",
 )
