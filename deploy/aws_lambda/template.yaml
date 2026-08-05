@@ -19,7 +19,7 @@ Parameters:
   StorePrefix:
     Type: String
     MinLength: 1
-    MaxLength: 869
+    MaxLength: 811
     AllowedPattern: '^[a-z0-9:_-][a-z0-9:._-]*(?:/[a-z0-9:_-][a-z0-9:._-]*)*$'
   ExpectedBucketOwner:
     Type: String

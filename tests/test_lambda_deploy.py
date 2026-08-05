@@ -922,10 +922,11 @@ def test_cloudformation_bucket_and_prefix_constraints_refine_s3_config():
         with pytest.raises(ValueError):
             S3Config(bucket="test-bucket", prefix=prefix)
 
-    # The longest protocol key is one fixed-window writer layout; this is
+    # The longest protocol key is one passive-cloud writer object; this is
     # exactly the provider's physical-key ceiling at the prefix maximum.
     assert MAX_LOGICAL_KEY_BYTES \
-        == len("layouts/") + 64 + 1 + 64 + 1 + 16
+        == len("cloud/") + 64 + len("/writers/") + 64 \
+        + len("/obj/") + 64
     assert MAX_STORE_PREFIX_LENGTH + 1 + MAX_LOGICAL_KEY_BYTES \
         == MAX_PROVIDER_KEY_BYTES
 

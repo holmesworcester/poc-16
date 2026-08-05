@@ -166,8 +166,9 @@ SIGINT and SIGTERM stop and reap every child. Add `--iroh-loopback` only for
 a single-machine test; normal mode enables Iroh's production reachability
 preset.
 
-An invite created by this daemon is a bounded encrypted bearer artifact. It
-carries the complete signed invite closure plus an out-of-band peer record:
+An invite created by this daemon is a compact, compressed, encrypted bearer
+artifact bounded to one standard version-40 QR code. It carries the complete
+signed invite closure plus an out-of-band peer record:
 
 ```json
 {"kind":"iroh","endpoint":"ENDPOINT_ID","ticket":"TICKET"}

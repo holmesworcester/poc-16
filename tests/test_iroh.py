@@ -19,6 +19,7 @@ import pytest
 
 import facts
 from core.crypto import h
+from core.limits import MAX_INVITE_LINK_BYTES
 from core.pack_access import MAX_OBJECT_OPEN_BYTES
 from full_peer.daemon import FullPeerService
 from full_peer.iroh_forwarders import IrohForwarders
@@ -592,14 +593,15 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
         )
         assert status == 200
         link = json.loads(body)
-        invite = json.loads(base64.urlsafe_b64decode(link))
-        assert set(invite) == {"b", "p", "s", "ws"}
-        assert invite["p"] == {
+        assert len(link.encode("ascii")) <= MAX_INVITE_LINK_BYTES
+        _seed, invite_peer, encrypted = \
+            facts.auth.user_invite.decode_artifact(link)
+        assert encrypted
+        assert invite_peer == {
             "kind": "iroh",
             "endpoint": ready["endpoint_id"],
             "ticket": ready["peer"],
         }
-        assert "u" not in invite
         after_invite = repository_bytes(state, workspace)
         assert after_invite == baseline
 
@@ -669,8 +671,10 @@ def test_two_supervised_full_peers_schedule_only_through_iroh_and_reap(
             alice_ready, "auth.workspace.create", "alice")
         link = control_command(
             alice_ready, "auth.user_invite.create", workspace)
-        invitation = json.loads(base64.urlsafe_b64decode(link))
-        assert invitation["p"] == {
+        assert len(link.encode("ascii")) <= MAX_INVITE_LINK_BYTES
+        _seed, invitation_peer, _encrypted = \
+            facts.auth.user_invite.decode_artifact(link)
+        assert invitation_peer == {
             "kind": "iroh",
             "endpoint": alice_ready["endpoint_id"],
             "ticket": alice_ready["peer"],
@@ -716,7 +720,7 @@ def test_two_supervised_full_peers_schedule_only_through_iroh_and_reap(
         persisted = json.loads(
             (bob_state / "keyring.json").read_text())
         assert persisted["workspaces"][workspace]["peers"] == [
-            invitation["p"]]
+            invitation_peer]
         assert urlparse(alice_ready["data"]).hostname == "127.0.0.1"
         assert urlparse(bob_ready["data"]).hostname == "127.0.0.1"
         first = connection(bob_ready, workspace)
@@ -797,7 +801,7 @@ def test_two_supervised_full_peers_schedule_only_through_iroh_and_reap(
         persisted = json.loads(
             (bob_state / "keyring.json").read_text())
         assert persisted["workspaces"][workspace]["peers"] == [{
-            **invitation["p"],
+            **invitation_peer,
             "ticket": alice_ready["peer"],
         }]
 

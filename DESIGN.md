@@ -771,8 +771,9 @@ only the authenticated permit fields and performs no fact-family dispatch.
 
 ### 7.1 Admission creates the exact subject row once
 
-The initial handoff is entirely out of band. The bounded encrypted QR/link
-artifact carries the invitation facts together with their signature facts and
+The initial handoff is entirely out of band. One compact compressed binary
+frame, base64url-encoded within the standard version-40 QR byte capacity,
+carries the invitation facts together with their signature facts and
 peer reachability. It is never uploaded as a recipient-addressed cloud object,
 and acceptance performs no author or cloud read. The beneficiary validates the
 closed pile, then first publishes those exact bytes in its own writer log along

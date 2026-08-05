@@ -191,8 +191,8 @@ not a failed-GET event. Validity-critical control refs cite visible targets or
 carry exact proof material inline beside the citing fact (Rule 2); render refs
 arriving over P2P may remain pending, while cloud publication rejects a missing
 cross-writer annex. Handoff uses a separate bounded carry: the invite artifact
-contains the signed closure, and the
-beneficiary first publishes those unchanged facts in its own writer log. The
+contains the signed closure, and the beneficiary first publishes those
+unchanged facts in its own writer log. The
 cloud has no recipient-addressed handoff object or redemption operation; after
 homing, invite and device facts follow ordinary Rule-2 closure.
 

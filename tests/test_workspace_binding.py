@@ -4,6 +4,7 @@ import ast
 import base64
 import json
 import sqlite3
+import zlib
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,11 @@ from core.crypto import h, keypair
 from core.fact import Fact, canon
 from core.grants import make_token
 from core.close import ClosedPileEvaluator, InvalidPile
-from core.limits import MAX_INVITE_BYTES, PayloadTooLarge
+from core.limits import (
+    MAX_INVITE_BYTES,
+    MAX_INVITE_LINK_BYTES,
+    PayloadTooLarge,
+)
 from full_peer.node import FullPeer
 from full_peer import sql_store
 from facts.auth import user as user_family
@@ -26,12 +31,9 @@ from facts.content.message import message
 
 
 def inline_invite_link(workspace, encrypted=b"encrypted", peer="offline"):
-    return base64.urlsafe_b64encode(canon({
-        "b": base64.b64encode(encrypted).decode(),
-        "p": peer,
-        "s": "01" * 32,
-        "ws": workspace,
-    })).decode()
+    del workspace
+    return user_invite_family._encode_artifact(
+        b"\x01" * 32, peer, encrypted)
 
 
 def two_workspaces(tmp_path):
@@ -165,11 +167,7 @@ def test_invite_bootstrap_is_workspace_complete_before_keyring_mutation(
     invitation = user_invite(
         inner_workspace, inviter, invite_public, 1)
     pile = signed_pile_bytes([invitation], workspace=inner_workspace)
-    blob = canon({
-        "pile": base64.b64encode(pile).decode(),
-        "isk": invite_secret.encode().hex(),
-        "ws": expected,
-    })
+    blob = user_invite_family.encode_blob(expected, invite_secret, pile)
     link = inline_invite_link(expected)
     monkeypatch.setattr(
         user_family, "box_decrypt",
@@ -221,11 +219,7 @@ def test_invite_redemption_selects_current_form_but_retains_source_fid(
     )
 
     pile = signed_pile_bytes((source,), workspace=workspace)
-    blob = canon({
-        "pile": base64.b64encode(pile).decode(),
-        "isk": invite_secret.encode().hex(),
-        "ws": workspace,
-    })
+    blob = user_invite_family.encode_blob(workspace, invite_secret, pile)
     link = inline_invite_link(workspace)
 
     class SelectedInvite(RuntimeError):
@@ -252,42 +246,64 @@ def test_invite_redemption_selects_current_form_but_retains_source_fid(
     assert node.workspaces() == []
 
 
-def test_invite_redemption_bounds_inline_ciphertext_before_crypto(
+def test_invite_redemption_bounds_inline_artifact_before_crypto(
         tmp_path, monkeypatch):
     node = FullPeer(str(tmp_path / "joiner"))
     workspace = "0" * 64
     link = inline_invite_link(workspace, b"x" * 9)
-    monkeypatch.setattr(user_family, "MAX_INVITE_BYTES", 8)
+    monkeypatch.setattr(user_invite_family, "MAX_INVITE_ARTIFACT_BYTES", 8)
     monkeypatch.setattr(
         user_family, "box_decrypt",
-        lambda *_args: pytest.fail("oversize ciphertext reached crypto"),
+        lambda *_args: pytest.fail("oversize artifact reached crypto"),
     )
 
-    with pytest.raises(PayloadTooLarge, match="invite too large"):
+    with pytest.raises(PayloadTooLarge, match="invite artifact too large"):
         user_family.accept(node, link, "new member")
 
 
 def test_invite_redemption_bounds_outer_link_before_base64(
         tmp_path, monkeypatch):
     node = FullPeer(str(tmp_path / "joiner"))
-    monkeypatch.setattr(user_family, "MAX_INVITE_LINK_BYTES", 8)
+    monkeypatch.setattr(user_invite_family, "MAX_INVITE_LINK_BYTES", 8)
     with pytest.raises(PayloadTooLarge, match="invite link too large"):
         user_family.accept(node, "a" * 9, "new member")
 
-def test_exact_bound_inline_invite_reaches_crypto(
+def test_well_formed_inline_invite_reaches_crypto(
         tmp_path, monkeypatch):
     node = FullPeer(str(tmp_path / "joiner"))
     workspace = "0" * 64
     link = inline_invite_link(workspace, b"x" * 8)
-    monkeypatch.setattr(user_family, "MAX_INVITE_BYTES", 8)
+    invite_secret, _public = keypair()
 
     def decrypt(_key, encrypted):
         assert encrypted == b"x" * 8
-        return b"{}"
+        return user_invite_family.encode_blob(
+            workspace, invite_secret, b"not a signed pile")
 
     monkeypatch.setattr(user_family, "box_decrypt", decrypt)
-    with pytest.raises(ValueError, match="invite workspace"):
+    with pytest.raises(ValueError):
         user_family.accept(node, link, "new member")
+
+
+@pytest.mark.parametrize("damage", ("invalid", "trailing", "expanded"))
+def test_invite_compression_fails_bounded_and_closed(
+        tmp_path, monkeypatch, damage):
+    node = FullPeer(str(tmp_path / "joiner"))
+    link = inline_invite_link("0" * 64)
+    if damage == "invalid":
+        compressed = b"not-zlib"
+    elif damage == "trailing":
+        compressed = zlib.compress(b"small") + b"trailing"
+    else:
+        compressed = zlib.compress(b"x" * 9)
+        monkeypatch.setattr(user_invite_family, "MAX_INVITE_BYTES", 8)
+    monkeypatch.setattr(
+        user_family, "box_decrypt", lambda *_args: compressed)
+
+    expected = PayloadTooLarge if damage == "expanded" else ValueError
+    with pytest.raises(expected):
+        user_family.accept(node, link, "new member")
+    assert node.workspaces() == []
 
 
 def test_invite_creation_checks_encrypted_size_without_store(
@@ -303,8 +319,9 @@ def test_invite_creation_checks_encrypted_size_without_store(
 
     link = user_invite_family.make(node, workspace)
     store = node.store(workspace)
-    artifact = json.loads(base64.urlsafe_b64decode(link))
-    assert base64.b64decode(artifact["b"], validate=True) == b"x" * 8
+    _seed, peer, encrypted = user_invite_family.decode_artifact(link)
+    assert peer == "https://invite.example"
+    assert encrypted == b"x" * 8
     assert store.list("invite/") == []
 
     monkeypatch.setattr(
@@ -315,6 +332,32 @@ def test_invite_creation_checks_encrypted_size_without_store(
         user_invite_family.make(node, workspace)
     assert store.list("invite/") == []
 
+
+def test_chained_members_invite_offline_and_fit_one_qr(tmp_path, monkeypatch):
+    alice = FullPeer(str(tmp_path / "alice"))
+    alice.peer_address = "https://alice.invalid"
+    workspace = facts.auth.workspace.create(alice, "alice", ts=1)
+    bob_link = user_invite_family.make(alice, workspace)
+    assert len(bob_link.encode("ascii")) <= MAX_INVITE_LINK_BYTES
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *_args, **_kwargs: pytest.fail("invite acceptance used network"),
+    )
+    bob = FullPeer(str(tmp_path / "bob"))
+    bob.peer_address = "https://bob.invalid"
+    assert user_family.accept(bob, bob_link, "bob") == workspace
+
+    # Bob's closure contains Alice's earlier invitation as authority. The
+    # one-time invite public key selects Bob's new invitation unambiguously.
+    carol_link = user_invite_family.make(bob, workspace)
+    assert len(carol_link.encode("ascii")) <= MAX_INVITE_LINK_BYTES
+    carol = FullPeer(str(tmp_path / "carol"))
+    assert user_family.accept(carol, carol_link, "carol") == workspace
+    assert carol.local_writer_binding(workspace).device \
+        == carol.identity(workspace)[1]
+    assert {row["name"] for row in user_family.members(carol, workspace)} \
+        >= {"alice", "bob", "carol"}
 
 def test_incompatible_projection_is_deleted_instead_of_migrated(tmp_path):
     workspace = "0" * 64

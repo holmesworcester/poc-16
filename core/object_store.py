@@ -26,6 +26,10 @@ The protocol uses these namespaces:
     mutation policy, but their bodies use the separate streaming data plane
     rather than the bounded semantic-object methods in this trait.
 
+``cloud/<workspace>/writers/<writer>/obj/<sha256>``
+    The longest passive-cloud queue key. The queue has a narrower storage
+    interface, but may use the same S3/R2 prefix and physical-key budget.
+
 Provider and POSIX implementations live outside this module so the
 database-free authorization path can import integrity helpers in runtimes
 without files, locks, threads, or SQLite.
@@ -64,6 +68,7 @@ MAX_LOGICAL_KEY_BYTES = max(
     len(REMOVAL_NODE_PREFIX) + 64,
     len("heads/") + 64 + 1 + 64,
     len("layouts/") + 64 + 1 + 64 + 1 + 16,
+    len("cloud/") + 64 + len("/writers/") + 64 + len("/obj/") + 64,
 )
 MAX_STORE_PREFIX_BYTES = (
     MAX_PROVIDER_KEY_BYTES - 1 - MAX_LOGICAL_KEY_BYTES)

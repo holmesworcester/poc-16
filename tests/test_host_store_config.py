@@ -154,16 +154,16 @@ def test_every_logical_namespace_fits_before_provider_client_creation():
         {**S3, "base_prefix": maximum_base},
         client_factory=lambda *args: clients.append(args) or object())
     store = factory("0" * 64)
-    layout = "layouts/" + "0" * 64 + "/" + "1" * 64 \
-        + "/0000000000000001"
-    assert MAX_LOGICAL_KEY_BYTES == len(layout)
-    assert len(store._physical(layout).encode("ascii")) \
+    cloud_object = "cloud/" + "0" * 64 + "/writers/" + "1" * 64 \
+        + "/obj/" + "2" * 64
+    assert MAX_LOGICAL_KEY_BYTES == len(cloud_object)
+    assert len(store._physical(cloud_object).encode("ascii")) \
         == MAX_PROVIDER_KEY_BYTES
     for key in (
             "removal",
             "cursor",
             "obj/" + "0" * 64,
-            layout):
+            cloud_object):
         assert len(store._physical(key).encode("ascii")) \
             <= MAX_PROVIDER_KEY_BYTES
     assert len(clients) == 1
